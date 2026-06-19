@@ -6,6 +6,83 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ---
 
 
+
+## [0.1.2] - 2026-06-16 - Add Rust loaders for risk.yaml and routing.yaml; normalize line endings with .gitattributes
+
+### Summary
+Resolves the remaining two Cartographer findings after the Decimal migration.
+Issue #4 is fixed by adding first-class Rust config loaders for config/risk.yaml
+and config/routing.yaml inside core/src/config.rs, with validation and direct
+public re-exports from core/src/lib.rs. Issue #5 is fixed by adding a repository
+.gitattributes file that normalizes text files to LF in git, preventing repeated
+CRLF warning noise on Windows checkouts.
+
+### Changed
+
+#### core/src/config.rs
+- Added RiskConfig with direct YAML loader and validation for:
+  - max_loss_eth: Decimal
+  - min_profit: Decimal
+  - auto_halt_reverts: u32
+  - max_gas_gwei: u64
+  - slippage_max_bps: u32
+  - simulation_timeout_ms: u64
+  - l1_fee_scalar_buffer: Decimal
+  - sequencer_stall_ms: u64
+  - audit_max_contracts_per_day: u32
+  - bounty_min_severity: String
+- Added RoutingConfig with direct YAML loader and validation for:
+  - primary: String
+  - fallbacks: Vec<String>
+  - submission_style: String
+  - venues: Vec<VenueEntry>
+  - forensic_tag_sources: Vec<String>
+- Added VenueEntry with serde mapping for YAML `type` -> Rust `venue_type`
+- Added validation guards:
+  - min_profit >= 2.0
+  - slippage_max_bps <= 200
+  - l1_fee_scalar_buffer >= 1.0
+  - simulation_timeout_ms > 0
+  - routing.primary non-empty
+  - submission_style restricted to single_atomic_tx or bundle
+  - kyc: true venues rejected
+  - liquidity_usd_min < 50000 venues rejected
+- Added 11 tests covering:
+  - successful parsing of synthetic risk/routing YAML
+  - default alignment for risk config
+  - invalid risk thresholds
+  - invalid routing submission style
+  - KYC venue rejection
+  - low-liquidity venue rejection
+  - chain-specific venue filtering
+  - parsing of on-disk config/risk.yaml
+  - parsing of on-disk config/routing.yaml
+- Fixed latent env-test concurrency issue by serializing env-mutating tests with
+  a global Mutex; this prevents parallel-test races around std::env
+
+#### core/src/lib.rs
+- Re-exported RiskConfig, RoutingConfig, and VenueEntry
+
+#### .gitattributes
+- Added repository-wide line ending normalization:
+  - * text=auto eol=lf
+  - explicit LF rules for Rust, TOML, YAML, JSON, Markdown, Python, shell,
+    Solidity, and Yul
+  - explicit binary handling for PNG/JPG/ICO/WASM/ZIP/GZ
+- This keeps LF in the repo and suppresses repeated CRLF warning noise on Windows
+
+### Verification
+- cargo test (WSL Ubuntu, rustc 1.96.0 stable): 81 passed, 0 failed
+  - 77 unit tests
+  - 2 config-sync tests
+  - 2 integration tests
+- On-disk config/risk.yaml parses successfully as RiskConfig
+- On-disk config/routing.yaml parses successfully as RoutingConfig
+- Existing pacing invariant tests remain green
+
+### Result
+- Issue #4 resolved: risk.yaml and routing.yaml now have Rust loaders
+- Issue #5 resolved: repository line endings normalized through .gitattributes
 ## [0.1.1] - 2026-06-16 - Fix: f64 to Decimal for all monetary config fields (AGENTS.md Invariant #3)
 
 ### Summary
@@ -253,4 +330,5 @@ staged.
   currently consumed only by Python scripts
 - CRLF line-ending warnings on all files ΓÇö Windows Git autocrlf; cosmetic only,
   no functional impact; resolve with a `.gitattributes` if needed
+
 

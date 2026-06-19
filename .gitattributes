@@ -1,0 +1,33 @@
+﻿# Project Chimera ΓÇö Git line-ending normalization
+# Ensures consistent LF in the repository on all platforms.
+# Windows checkouts get CRLF via core.autocrlf; the repo always stores LF.
+
+# Default: normalize all text files to LF in the repo
+* text=auto eol=lf
+
+# Rust source
+*.rs     text eol=lf
+*.toml   text eol=lf
+
+# Web / config / docs
+*.yaml   text eol=lf
+*.yml    text eol=lf
+*.json   text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+
+# Shell / Python
+*.sh     text eol=lf
+*.py     text eol=lf
+
+# Solidity / Yul
+*.sol    text eol=lf
+*.yul    text eol=lf
+
+# Explicitly binary ΓÇö never mangle
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.wasm   binary
+*.zip    binary
+*.gz     binary

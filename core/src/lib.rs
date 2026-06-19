@@ -1,4 +1,4 @@
-//! Chimera Core - Sovereign L2 MEV Engine
+﻿//! Chimera Core - Sovereign L2 MEV Engine
 //! Local-first, flash-loan atomic execution with strict pacing & risk controls.
 
 pub mod config;
@@ -15,7 +15,7 @@ pub mod state;
 pub use simulator::golden;
 pub use simulator::prewarm;
 
-pub use config::PacingConfig;
+pub use config::{PacingConfig, RiskConfig, RoutingConfig, VenueEntry};
 pub use detector::liquidation::{LiquidationDetector, MarketSnapshot};
 pub use error::ChimeraError;
 pub use executor::{
@@ -27,3 +27,4 @@ pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use oracle::{AaveOracle, ChainlinkOracle, OraclePrice, PriceOracle};
 pub use pacing_engine::{BreakerReason, Opportunity, PacingDecision, PacingEngine};
 pub use simulator::{LiquidationCandidate, LiquidationSimulator, SimulationResult};
+

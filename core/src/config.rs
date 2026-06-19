@@ -223,8 +223,11 @@ impl PacingConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::NamedTempFile;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn valid_yaml() -> String {
         r#"
@@ -279,8 +282,11 @@ pools_toml_path: config/pools.toml
 
     #[test]
     fn test_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "{}", valid_yaml()).unwrap();
+        std::env::remove_var("CHIMERA_CHAIN_ID");
+        std::env::remove_var("CHIMERA_MAX_WEEKLY_NET_USD");
         std::env::set_var("CHIMERA_MAX_WEEKLY_NET_USD", "4999");
         std::env::set_var("CHIMERA_CHAIN_ID", "1");
         let cfg = PacingConfig::load_with_env(tmp.path()).unwrap();
@@ -338,6 +344,7 @@ pools_toml_path: config/pools.toml
 
     #[test]
     fn test_reload() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("CHIMERA_MAX_DAILY_NET_USD");
         std::env::remove_var("CHIMERA_CHAIN_ID");
         let mut tmp = NamedTempFile::new().unwrap();
@@ -351,3 +358,357 @@ pools_toml_path: config/pools.toml
         assert_eq!(cfg.max_daily_net_usd, Decimal::from(1000));
     }
 }
+
+// ---------------------------------------------------------------------------
+// RiskConfig ΓÇö loaded from config/risk.yaml
+// ---------------------------------------------------------------------------
+
+/// Risk and safety thresholds. Loaded from `config/risk.yaml`.
+///
+/// All monetary values use `Decimal` (Invariant #3).
+/// Fields mirror the YAML keys exactly so serde_yaml deserializes them directly.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RiskConfig {
+    /// Daily realized loss ceiling in ETH before full halt.
+    pub max_loss_eth: Decimal,
+    /// Minimum profit multiplier over (gas + priority + L1 data fee).
+    pub min_profit: Decimal,
+    /// Consecutive bundle reverts before auto-halt.
+    pub auto_halt_reverts: u32,
+    /// L2 gas price ceiling in gwei.
+    pub max_gas_gwei: u64,
+    /// Maximum acceptable slippage on any single leg, in basis points.
+    pub slippage_max_bps: u32,
+    /// Hard timeout for REVM full-path simulations, in milliseconds.
+    pub simulation_timeout_ms: u64,
+    /// Buffer multiplier applied on top of eth_getL1Fee result (e.g. 1.15 = +15%).
+    pub l1_fee_scalar_buffer: Decimal,
+    /// If the sequencer feed is silent for this many ms, pause new candidates.
+    pub sequencer_stall_ms: u64,
+    /// Maximum number of contracts to audit per day (bounty/audit risk gate).
+    pub audit_max_contracts_per_day: u32,
+    /// Minimum severity to treat a bounty finding as blocking (e.g. "MEDIUM").
+    pub bounty_min_severity: String,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            max_loss_eth: Decimal::from_str("0.005").expect("valid literal"),
+            min_profit: Decimal::from_str("2.5").expect("valid literal"),
+            auto_halt_reverts: 3,
+            max_gas_gwei: 300,
+            slippage_max_bps: 50,
+            simulation_timeout_ms: 1500,
+            l1_fee_scalar_buffer: Decimal::from_str("1.15").expect("valid literal"),
+            sequencer_stall_ms: 500,
+            audit_max_contracts_per_day: 50,
+            bounty_min_severity: "MEDIUM".into(),
+        }
+    }
+}
+
+impl RiskConfig {
+    /// Load from YAML file and validate.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ChimeraError> {
+        let contents = std::fs::read_to_string(path)?;
+        let cfg: RiskConfig = serde_yaml::from_str(&contents)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), ChimeraError> {
+        if self.min_profit < Decimal::from(2) {
+            return Err(ChimeraError::ConfigError(
+                "risk.yaml min_profit below safety floor (2.0x)".into(),
+            ));
+        }
+        if self.slippage_max_bps > 200 {
+            return Err(ChimeraError::ConfigError(
+                "risk.yaml slippage_max_bps exceeds 200bps (2%) safety ceiling".into(),
+            ));
+        }
+        if self.l1_fee_scalar_buffer < Decimal::ONE {
+            return Err(ChimeraError::ConfigError(
+                "risk.yaml l1_fee_scalar_buffer must be >= 1.0".into(),
+            ));
+        }
+        if self.simulation_timeout_ms == 0 {
+            return Err(ChimeraError::ConfigError(
+                "risk.yaml simulation_timeout_ms must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RoutingConfig ΓÇö loaded from config/routing.yaml
+// ---------------------------------------------------------------------------
+
+/// A single DEX/liquidity venue entry.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct VenueEntry {
+    pub name: String,
+    pub chain: String,
+    pub liquidity_usd_min: u64,
+    #[serde(rename = "type")]
+    pub venue_type: String,
+    pub kyc: bool,
+}
+
+/// Routing and venue configuration. Loaded from `config/routing.yaml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RoutingConfig {
+    /// Primary RPC / submission endpoint identifier.
+    pub primary: String,
+    /// Ordered fallback RPC identifiers.
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    /// Submission style (e.g. "single_atomic_tx").
+    pub submission_style: String,
+    /// Active venue list. Rotated weekly via `scripts/update_venues.py`.
+    #[serde(default)]
+    pub venues: Vec<VenueEntry>,
+    /// Forensic tag source URIs (remote URLs or "local:<path>").
+    #[serde(default)]
+    pub forensic_tag_sources: Vec<String>,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            primary: "alchemy-base-private".into(),
+            fallbacks: vec![
+                "public-base-rpc".into(),
+                "public-arbitrum-rpc".into(),
+            ],
+            submission_style: "single_atomic_tx".into(),
+            venues: Vec::new(),
+            forensic_tag_sources: Vec::new(),
+        }
+    }
+}
+
+impl RoutingConfig {
+    /// Load from YAML file and validate.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ChimeraError> {
+        let contents = std::fs::read_to_string(path)?;
+        let cfg: RoutingConfig = serde_yaml::from_str(&contents)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), ChimeraError> {
+        if self.primary.is_empty() {
+            return Err(ChimeraError::ConfigError(
+                "routing.yaml primary RPC must not be empty".into(),
+            ));
+        }
+        if self.submission_style != "single_atomic_tx" && self.submission_style != "bundle" {
+            return Err(ChimeraError::ConfigError(
+                "routing.yaml submission_style must be 'single_atomic_tx' or 'bundle'".into(),
+            ));
+        }
+        for venue in &self.venues {
+            if venue.kyc {
+                return Err(ChimeraError::ConfigError(format!(
+                    "routing.yaml venue '{}' has kyc: true ΓÇö only non-KYC venues allowed",
+                    venue.name
+                )));
+            }
+            if venue.liquidity_usd_min < 50_000 {
+                return Err(ChimeraError::ConfigError(format!(
+                    "routing.yaml venue '{}' liquidity_usd_min {} below $50k floor",
+                    venue.name, venue.liquidity_usd_min
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return only the venues for a specific chain identifier.
+    pub fn venues_for_chain(&self, chain: &str) -> Vec<&VenueEntry> {
+        self.venues.iter().filter(|v| v.chain == chain).collect()
+    }
+}
+
+#[cfg(test)]
+mod risk_routing_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn valid_risk_yaml() -> &'static str {
+        r#"
+max_loss_eth: 0.005
+min_profit: 2.5
+auto_halt_reverts: 3
+max_gas_gwei: 300
+slippage_max_bps: 50
+simulation_timeout_ms: 1500
+l1_fee_scalar_buffer: 1.15
+sequencer_stall_ms: 500
+audit_max_contracts_per_day: 50
+bounty_min_severity: MEDIUM
+"#
+    }
+
+    fn valid_routing_yaml() -> &'static str {
+        r#"
+primary: alchemy-base-private
+fallbacks:
+  - public-base-rpc
+  - public-arbitrum-rpc
+submission_style: single_atomic_tx
+venues:
+  - name: aerodrome-base
+    chain: base
+    liquidity_usd_min: 50000
+    type: dex
+    kyc: false
+  - name: uniswap-v3-base
+    chain: base
+    liquidity_usd_min: 75000
+    type: dex
+    kyc: false
+forensic_tag_sources:
+  - "local:config/forensic_tags.json"
+"#
+    }
+
+    #[test]
+    fn test_risk_config_loads_and_defaults_match() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_risk_yaml()).unwrap();
+        let cfg = RiskConfig::load(tmp.path()).unwrap();
+        let defaults = RiskConfig::default();
+        assert_eq!(cfg.max_loss_eth,           defaults.max_loss_eth);
+        assert_eq!(cfg.min_profit,             defaults.min_profit);
+        assert_eq!(cfg.auto_halt_reverts,      defaults.auto_halt_reverts);
+        assert_eq!(cfg.max_gas_gwei,           defaults.max_gas_gwei);
+        assert_eq!(cfg.slippage_max_bps,       defaults.slippage_max_bps);
+        assert_eq!(cfg.simulation_timeout_ms,  defaults.simulation_timeout_ms);
+        assert_eq!(cfg.l1_fee_scalar_buffer,   defaults.l1_fee_scalar_buffer);
+        assert_eq!(cfg.sequencer_stall_ms,     defaults.sequencer_stall_ms);
+        assert_eq!(cfg.bounty_min_severity,    defaults.bounty_min_severity);
+    }
+
+    #[test]
+    fn test_risk_config_rejects_low_min_profit() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_risk_yaml().replace("min_profit: 2.5", "min_profit: 1.5");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RiskConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_risk_config_rejects_high_slippage() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_risk_yaml().replace("slippage_max_bps: 50", "slippage_max_bps: 300");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RiskConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_risk_config_rejects_low_l1_buffer() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_risk_yaml().replace("l1_fee_scalar_buffer: 1.15", "l1_fee_scalar_buffer: 0.9");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RiskConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_routing_config_loads() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_routing_yaml()).unwrap();
+        let cfg = RoutingConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.primary, "alchemy-base-private");
+        assert_eq!(cfg.submission_style, "single_atomic_tx");
+        assert_eq!(cfg.venues.len(), 2);
+        assert_eq!(cfg.venues[0].name, "aerodrome-base");
+        assert!(!cfg.venues[0].kyc);
+        assert_eq!(cfg.venues[0].liquidity_usd_min, 50_000);
+        assert_eq!(cfg.forensic_tag_sources.len(), 1);
+    }
+
+    #[test]
+    fn test_routing_venues_for_chain() {
+        let yaml = r#"
+primary: alchemy-base-private
+fallbacks:
+  - public-base-rpc
+submission_style: single_atomic_tx
+venues:
+  - name: aerodrome-base
+    chain: base
+    liquidity_usd_min: 50000
+    type: dex
+    kyc: false
+  - name: uniswap-v3-base
+    chain: base
+    liquidity_usd_min: 75000
+    type: dex
+    kyc: false
+  - name: camelot-arbitrum
+    chain: arbitrum
+    liquidity_usd_min: 60000
+    type: dex
+    kyc: false
+forensic_tag_sources:
+  - "local:config/forensic_tags.json"
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", yaml).unwrap();
+        let cfg = RoutingConfig::load(tmp.path()).unwrap();
+        let base_venues = cfg.venues_for_chain("base");
+        assert_eq!(base_venues.len(), 2);
+        let arb_venues = cfg.venues_for_chain("arbitrum");
+        assert_eq!(arb_venues.len(), 1);
+        assert_eq!(arb_venues[0].name, "camelot-arbitrum");
+    }
+
+    #[test]
+    fn test_routing_rejects_kyc_venue() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_routing_yaml().replace("kyc: false", "kyc: true");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_routing_rejects_low_liquidity_venue() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_routing_yaml().replace("liquidity_usd_min: 50000", "liquidity_usd_min: 10000");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_routing_rejects_invalid_submission_style() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_routing_yaml().replace("submission_style: single_atomic_tx", "submission_style: flashbots_bundle");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_disk_risk_yaml_parses() {
+        let path = std::path::Path::new("../config/risk.yaml");
+        let path = if path.exists() { path } else { std::path::Path::new("config/risk.yaml") };
+        if path.exists() {
+            RiskConfig::load(path).expect("config/risk.yaml must parse as RiskConfig");
+        }
+    }
+
+    #[test]
+    fn test_disk_routing_yaml_parses() {
+        let path = std::path::Path::new("../config/routing.yaml");
+        let path = if path.exists() { path } else { std::path::Path::new("config/routing.yaml") };
+        if path.exists() {
+            RoutingConfig::load(path).expect("config/routing.yaml must parse as RoutingConfig");
+        }
+    }
+}
+
+

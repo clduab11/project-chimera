@@ -5,6 +5,65 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+
+## [0.1.1] - 2026-06-16 - Fix: f64 to Decimal for all monetary config fields (AGENTS.md Invariant #3)
+
+### Summary
+Resolves the Invariant #3 violation introduced in the initial commit: six monetary
+fields in PacingConfig were typed as f64, creating floating-point rounding risk in
+financial calculations. All affected fields are now rust_decimal::Decimal. The fix
+touches core/src/config.rs and core/src/pacing_engine.rs. No YAML files required
+changes - serde_yaml + rust_decimal's serde feature deserializes plain numeric YAML
+values into Decimal natively. 70 tests pass (66 unit + 2 config-sync + 2 integration),
+including both 3-way pacing invariant assertions.
+
+### Changed
+
+#### core/src/config.rs
+- max_daily_net_usd: f64        -> Decimal
+- max_weekly_net_usd: f64       -> Decimal
+- max_single_transfer_usd: f64  -> Decimal
+- max_daily_loss_eth: f64       -> Decimal
+- min_profit_multiplier: f64    -> Decimal
+- eth_price_usd_fallback: f64   -> Decimal
+- Default impl: replaced f64 literals with Decimal::from(N) and
+  Decimal::from_str("N").expect("valid literal") for fractional values
+- default_eth_price_usd_fallback() serde default fn: now returns Decimal::from(1800)
+- validate(): all cap comparisons use Decimal directly; no f64 cast anywhere
+- apply_env_overrides(): override_decimal! macro now calls Decimal::from_str() instead
+  of v.parse::<f64>()
+- Unit tests in config::tests: assertions now compare Decimal == Decimal
+
+#### core/src/pacing_engine.rs
+- Removed 27 Decimal::from_f64_retain(self.config.X).unwrap_or(Decimal::MAX) call
+  sites; replaced with direct field access (fields are now native Decimal)
+- estimate_gas_cost_usd(): eth_price_usd_fallback used directly as Decimal
+- Breaker threshold comparisons (max_daily_loss_eth, max_weekly_net_usd,
+  max_single_transfer_usd): direct Decimal field comparisons throughout
+- make_test_config() in tests: all monetary fields use Decimal::from(N) and
+  Decimal::from_str("N").unwrap() instead of bare f64 literals
+- proptest prop_never_exceeds_daily_cap: proptest still generates f64 strategy values
+  (legitimate arbitrary test inputs, not config fields); converted at test boundary
+  via Decimal::from_f64(v).unwrap_or(ZERO)
+- Removed unused use std::str::FromStr import
+- Fixed prop_assert! calls: escaped pattern-match messages to avoid rustc
+  format-string parse errors on the { .. } syntax
+
+### No-change files (verified still correct)
+- config/pacing.yaml -- plain numeric values; Decimal serde handles it natively
+- core/tests/fixtures/pacing_canonical.yaml -- same
+- core/tests/config_sync_test.rs -- already used assert_eq! on struct fields;
+  now compares Decimal == Decimal automatically; no source edit needed
+- core/Cargo.toml -- rust_decimal already present in dependencies with serde feature
+
+### Verification
+- cargo check: clean (0 errors, 0 warnings)
+- cargo test (WSL Ubuntu, rustc 1.96.0 stable): 70 passed, 0 failed
+    - 66 unit tests
+    - 2 config-sync tests (pacing_yaml_matches_rust_defaults, disk_yaml_matches_canonical)
+    - 2 orchestrator integration tests
+- Invariant #1 (3-way pacing sync) confirmed intact
+- Invariant #3 (Decimal not f64) fully resolved
 ## [0.1.0] - 2026-06-16 ΓÇö Initial Repository Commit
 
 ### Summary
@@ -194,3 +253,4 @@ staged.
   currently consumed only by Python scripts
 - CRLF line-ending warnings on all files ΓÇö Windows Git autocrlf; cosmetic only,
   no functional impact; resolve with a `.gitattributes` if needed
+

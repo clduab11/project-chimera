@@ -1,0 +1,62 @@
+[
+  {
+    "description": "Standard WETH liquidation on Base during volatility spike. ETH price dropped 12% in 2 blocks triggering HF < 1.0.",
+    "chain": "base",
+    "block_number": 23500000,
+    "tx_hash": "0xabc123def456789012345678901234567890123456789012345678901234abcd",
+    "user": "0x1234567890123456789012345678901234567890",
+    "collateral_asset": "0x4200000000000000000000000000000000000006",
+    "debt_asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "debt_to_cover": "1000000000000000000",
+    "expected_profit_wei": "50000000000000000",
+    "gas_used": 450000,
+    "timestamp": "2026-03-14T02:23:45Z",
+    "_verified": false,
+    "_source": "placeholder_for_live_fetch"
+  },
+  {
+    "description": "USDC debt position with eMode on Arbitrum. High leverage wstETH collateral; interest-rate curve shift triggered cascade.",
+    "chain": "arbitrum",
+    "block_number": 275000000,
+    "tx_hash": "0xdef789abc012345678901234567890123456789012345678901234567890beef",
+    "user": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    "collateral_asset": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    "debt_asset": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "debt_to_cover": "5000000000",
+    "expected_profit_wei": "25000000000000000",
+    "gas_used": 380000,
+    "timestamp": "2026-04-02T11:15:30Z",
+    "_verified": false,
+    "_source": "placeholder_for_live_fetch"
+  },
+  {
+    "description": "cbBTC collateral liquidation on Base. BTC price dip from oracle latency after Coinbase custody maintenance window. Liquidator used flash-loan to cover 2.5k USDC debt and seized cbBTC collateral with 5% bonus.",
+    "chain": "base",
+    "block_number": 24000000,
+    "tx_hash": "0x55aa6677bb8899ccdd11223344556677889900aabbccddeeff00112233445566",
+    "user": "0x7777777777777777777777777777777777777777",
+    "collateral_asset": "0x2Ae3F1Ec7F1F4512C51eeD2e6E347e38007BF9d8",
+    "debt_asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "debt_to_cover": "2500000000000000000000",
+    "expected_profit_wei": "180000000000000000",
+    "gas_used": 520000,
+    "timestamp": "2026-05-20T08:44:12Z",
+    "_verified": false,
+    "_source": "placeholder_for_live_fetch"
+  },
+  {
+    "description": "weETH (wrapped Ether.fi eETH) collateral liquidation on Arbitrum. Restaking yield asset de-pegged 2% during EigenLayer reward distribution delay. Position had 85% LTV; liquidator repaid 12k USDC and seized weETH with 6.5% liquidation bonus.",
+    "chain": "arbitrum",
+    "block_number": 300000000,
+    "tx_hash": "0x99ff8877aabbccdd112233445566778899001122334455667788990011223344",
+    "user": "0x8888888888888888888888888888888888888888",
+    "collateral_asset": "0x35751007a407ca6FEFB66c3e5F57B442f4C9a22a",
+    "debt_asset": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "debt_to_cover": "12000000000000",
+    "expected_profit_wei": "320000000000000000",
+    "gas_used": 610000,
+    "timestamp": "2026-06-08T16:02:00Z",
+    "_verified": false,
+    "_source": "placeholder_for_live_fetch"
+  }
+]

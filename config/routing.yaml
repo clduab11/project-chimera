@@ -1,0 +1,45 @@
+# Project Chimera - Routing & Venue Configuration (v1.0)
+# L2-focused: no Flashbots eth_sendBundle assumption.
+# Primary path = low-latency private RPC or direct sequencer submission.
+# All venues must be non-KYC, >$50k liquidity, unregulated.
+
+primary: "alchemy-base-private"          # or "arbitrum-sequencer" / "direct-rpc"
+fallbacks:
+  - "public-base-rpc"
+  - "public-arbitrum-rpc"
+
+# Submission style for L2 (atomic single-tx via Executor contract)
+submission_style: "single_atomic_tx"     # NOT bundle
+
+# Allowed venues (3-5 only, rotated). Update weekly via scripts.
+venues:
+  - name: "aerodrome-base"
+    chain: "base"
+    liquidity_usd_min: 50000
+    type: "dex"
+    kyc: false
+  - name: "uniswap-v3-base"
+    chain: "base"
+    liquidity_usd_min: 50000
+    type: "dex"
+    kyc: false
+  - name: "sushi-base"
+    chain: "base"
+    liquidity_usd_min: 50000
+    type: "dex"
+    kyc: false
+  - name: "camelot-arbitrum"
+    chain: "arbitrum"
+    liquidity_usd_min: 50000
+    type: "dex"
+    kyc: false
+  - name: "uniswap-v3-arbitrum"
+    chain: "arbitrum"
+    liquidity_usd_min: 50000
+    type: "dex"
+    kyc: false
+
+# Forensic hard filter (addresses from public tag lists + custom)
+forensic_tag_sources:
+  - "https://raw.githubusercontent.com/ethereum-lists/chains/main/_data/ens/tokens.json"  # example; use real curated lists
+  - "local:config/forensic_tags.json"

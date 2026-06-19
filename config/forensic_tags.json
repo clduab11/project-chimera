@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "updated_at": "2026-06-17T00:00:00Z",
+  "_comment": "Publicly tagged high-risk addresses from blockchain explorers and security researchers. These labels are for simulation/scoring only and do not constitute legal findings. No OFAC/SDN addresses are intentionally included.",
+  "entries": [
+    {
+      "address": "0x00000f312c54d0dd25888ee9CDC3DEE988700000",
+      "tag": "PINK_DRAINER_CONTRACT",
+      "reason": "Wallet-drainer-as-a-service contract tied to the Pink Drainer phishing campaign. Reported by ScamSniffer and flagged on Etherscan as involved in wallet-draining attacks.",
+      "added_at": "2024-05-01T00:00:00Z",
+      "source": "scamsniffer_etherscan",
+      "source_url": "https://etherscan.io/address/0x00000f312c54d0dd25888ee9CDC3DEE988700000"
+    },
+    {
+      "address": "0x000056c346441ef8065e56b0CDDd43fdEC100000",
+      "tag": "INFERNO_DRAINER_CONTRACT",
+      "reason": "Phishing contract associated with the Inferno Drainer toolkit, used in multi-chain wallet-draining attacks. Documented by Check Point Research.",
+      "added_at": "2024-06-01T00:00:00Z",
+      "source": "checkpoint_research",
+      "source_url": "https://research.checkpoint.com/2025/inferno-drainer-reloaded-deep-dive-into-the-return-of-the-most-sophisticated-crypto-drainer/"
+    },
+    {
+      "address": "0x00000c07575Bb4e64457687A0382b4D3Ea470000",
+      "tag": "FAKE_PHISHING184810",
+      "reason": "Address reported by ScamSniffer and tagged on Etherscan as Fake_Phishing184810 / fake-phishing.eth. Used in phishing scams to steal wallet assets.",
+      "added_at": "2026-03-10T00:00:00Z",
+      "source": "scamsniffer_etherscan",
+      "source_url": "https://etherscan.io/address/0x00000c07575Bb4e64457687A0382b4D3Ea470000"
+    },
+    {
+      "address": "0x2B022b3dFf934b9fF5A82Ed949970B129eC555fC",
+      "tag": "FAKE_PHISHING608048",
+      "reason": "Address reported by ScamSniffer and tagged on Etherscan as Fake_Phishing608048. Associated with active phishing operations.",
+      "added_at": "2026-04-22T00:00:00Z",
+      "source": "scamsniffer_etherscan",
+      "source_url": "https://etherscan.io/address/0x2B022b3dFf934b9fF5A82Ed949970B129eC555fC"
+    },
+    {
+      "address": "0x34C6211621f2763c60Eb007dC2aE91090A2d22f6",
+      "tag": "HONEYPOT_TOKEN",
+      "reason": "ERC-20 token reported as a honeypot on Etherscan: transfers or sells are disabled for non-owner holders, trapping buyer funds.",
+      "added_at": "2026-05-15T00:00:00Z",
+      "source": "etherscan_community",
+      "source_url": "https://etherscan.io/address/0x34C6211621f2763c60Eb007dC2aE91090A2d22f6"
+    }
+  ]
+}

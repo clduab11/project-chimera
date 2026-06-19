@@ -1,0 +1,16 @@
+# Project Chimera - Risk & Safety Configuration (v1.0)
+
+max_loss_eth: 0.005          # Daily realized loss (gas + negative outcomes) before full halt
+min_profit: 2.5              # Minimum multiplier over (gas + priority + L1 data fee)
+auto_halt_reverts: 3         # Consecutive bundle reverts
+max_gas_gwei: 300            # L2 gas price ceiling (prevents bidding wars)
+slippage_max_bps: 50         # 0.5% max acceptable slippage on any leg (L2 adjusted)
+simulation_timeout_ms: 1500  # Hard timeout for REVM full-path sims
+
+# L2-specific (Base/Arbitrum)
+l1_fee_scalar_buffer: 1.15   # Always add 15% buffer to eth_getL1Fee result
+sequencer_stall_ms: 500      # If feed silent > this, pause new candidates
+
+# Bounty / audit risk
+audit_max_contracts_per_day: 50
+bounty_min_severity: "MEDIUM"

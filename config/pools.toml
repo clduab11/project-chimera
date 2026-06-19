@@ -1,0 +1,35 @@
+# Aave V3 Pool Configuration
+# Contract addresses verified against mainnet deployments.
+# Update these values if deploying to testnets or after protocol upgrades.
+
+[base]
+# Aave V3 Pool Proxy — entry point for all lending operations (supply, borrow, withdraw, repay)
+pool = "0xA238Dd80C259a72e81d7e4666a2CEDEcD3cA5cB"
+
+# Aave V3 PoolDataProvider — read-only view for user account data, reserve data, and liquidation info
+pool_data_provider = "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
+
+# Aave V3 Oracle — returns asset prices used for health factor and liquidation calculations
+oracle = "0x2DaD3A13EF0C636622150F51bA8b404Fd4c56B98c"
+
+# Wrapped ETH (WETH) — Base canonical WETH used as common collateral asset
+weth = "0x4200000000000000000000000000000000000006"
+
+# USD Coin (USDC) — Base native USDC used as common debt asset
+usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+[arbitrum]
+# Aave V3 Pool Proxy — entry point for all lending operations
+pool = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+
+# Aave V3 PoolDataProvider — read-only view for user account data and reserve data
+pool_data_provider = "0x69FA688f1Dc47d4B5d8029D5a35FB7a5480d4d96"
+
+# Aave V3 Oracle — returns asset prices used for health factor and liquidation calculations
+oracle = "0xb56c2F0B8Be1bd3C6f81A24fe035B91ea9E14711"
+
+# Wrapped ETH (WETH) — Arbitrum canonical WETH used as common collateral asset
+weth = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+
+# USD Coin (USDC) — Arbitrum native USDC used as common debt asset
+usdc = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"

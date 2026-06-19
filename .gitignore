@@ -1,0 +1,91 @@
+# Chimera - Sovereign, local-first (never commit secrets or large traces)
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Node / Go (if used)
+node_modules/
+vendor/
+
+# Secrets & keys (CRITICAL - forensic safety)
+.env
+secrets.env
+*.pem
+*.key
+wallets/
+clean_eoa_seeds.txt
+private_keys/
+
+# Large data / traces (local only)
+*.parquet
+*.csv
+traces/
+historical/
+revm_cache/
+*.db
+*.sqlite*
+
+# Docker / monitoring data
+docker/data/
+monitoring/grafana/data/
+prometheus/data/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Foundry
+cache/
+out/
+broadcast/
+
+# Ollama / models (large)
+ollama/models/
+
+# Misc
+*.log
+*.bak
+
+# Project Chimera - state & audit artifacts
+core/state/
+core/snapshots/
+ai-audit/queue/
+ai-audit/.daily_counter.json
+research/raw/
+*.flag
+
+
+# Python virtual environment
+.venv/
+
+# Scratch / temp artifacts
+temp_executor.yul
+
+# Misplaced duplicate (canonical copy lives at core/tests/fixtures/)
+tests/fixtures/golden_replays.json

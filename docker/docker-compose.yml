@@ -1,0 +1,50 @@
+version: "3.9"
+services:
+  chimera-core:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rust
+    environment:
+      - BASE_RPC_URL=${BASE_RPC_URL}
+      - ARB_RPC_URL=${ARB_RPC_URL}
+      - CHIMERA_EXECUTE_MODE=shadow
+      - RUST_LOG=chimera=info
+    volumes:
+      - chimera-state:/app/core/state
+      - ../config:/app/config:ro
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+
+  grafana:
+    image: grafana/grafana:11.5.0
+    ports:
+      - "3002:3002"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    environment:
+      - GF_SERVER_HTTP_PORT=3002
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-chimera}
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  chimera-state:
+  grafana-data:
+  qdrant-data:

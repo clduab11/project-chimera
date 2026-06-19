@@ -1,0 +1,18 @@
+{
+  "dashboard": {
+    "title": "Chimera Overview",
+    "time": { "from": "now-1h", "to": "now" },
+    "panels": [
+      {
+        "title": "Pacing Decisions",
+        "type": "stat",
+        "targets": [{ "expr": "chimera_pacing_decisions_total" }]
+      },
+      {
+        "title": "Breaker State",
+        "type": "gauge",
+        "targets": [{ "expr": "chimera_breaker_active" }]
+      }
+    ]
+  }
+}

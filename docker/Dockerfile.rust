@@ -1,0 +1,13 @@
+FROM rust:1.82-slim AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY core/ core/
+RUN cargo build --release -p chimera-core
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/chimera /usr/local/bin/chimera
+COPY config/ /app/config/
+WORKDIR /app
+EXPOSE 9100
+ENTRYPOINT ["chimera"]

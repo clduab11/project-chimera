@@ -1,0 +1,8 @@
+# Prometheus scrape config for Chimera
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'chimera'
+    static_configs:
+      - targets: ['chimera-core:9100']

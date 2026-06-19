@@ -1,0 +1,9 @@
+Scanning dir .
+scan failed for git repository, /mnt/c/Users/cld-main/Desktop/github-projects/project-chimera/.git: reference not found
+Scanned /mnt/c/Users/cld-main/Desktop/github-projects/project-chimera/.kilo/package-lock.json file and found 30 packages
+Scanned /mnt/c/Users/cld-main/Desktop/github-projects/project-chimera/Cargo.lock file and found 552 packages
+Scanned /mnt/c/Users/cld-main/Desktop/github-projects/project-chimera/requirements.txt file and found 4 packages
+Scanning dir --format=json
+Unable to parse git ignores: stat --format=json: no such file or directory
+Failed to walk --format=json: lstat --format=json: no such file or directory
+lstat --format=json: no such file or directory

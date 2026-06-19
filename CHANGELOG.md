@@ -7,6 +7,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 
 
+
+## [0.1.3] - 2026-06-16 - Add first-run onboarding guide
+
+### Summary
+Adds docs/first-run-onboarding.md ΓÇö a click-by-click, beginner-friendly guide
+grounded in a two-pass recursive code analysis using Mission Control subagents.
+Every claim in the document was verified against the actual current repo state
+before writing. Mismatches between existing docs and the code are explicitly
+called out rather than repeated as truth.
+
+### Added
+
+#### docs/first-run-onboarding.md (340 lines)
+- What Chimera is and how it makes money (flash-loan liquidation model)
+- Pacing guardrail table from config/pacing.yaml defaults
+- Shadow mode vs live mode explanation with 7-day enforcement note
+- Required toolchain and account prerequisites
+- Step-by-step first-run walkthrough (13 steps):
+  1. Clone and verify repo
+  2. Build the Rust binary
+  3. Review pacing config
+  4. Prepare EOA pool
+  5. Generate mock snapshot
+  6. Set RPC URL env var
+  7. Start binary
+  8. Verify startup (3 grounded checks)
+  9. Start monitoring stack
+  10. What healthy looks like (metrics table)
+  11. How to fund worker EOAs (with mismatch warning)
+  12. What is not yet fully wired (honest status table)
+  13. Safety rules and useful commands at a glance
+- Monitoring port table grounded in docker-compose.yml (3002, not 3003)
+- Explicit "not yet wired" table documenting:
+  - Multi-chain RPC env var mismatch (BASE_RPC_URL vs RPC_URL)
+  - JSONL audit trail not wired in main.rs
+  - EOA pool not loaded at startup
+  - fund_eoa.py workers/wallets JSON shape mismatch
+  - check_balances.py does not exist
+- Safety rules section (8 rules)
+- Quick-reference commands table
+- Where to go next cross-reference table
+
+### Analysis method
+- Subagent 1 (Codebase Cartographer): recursive repo inventory, doc/code
+  mismatch analysis, funding path grounding, monitoring port verification
+- Subagent 2 (Codebase Cartographer): targeted pass on main.rs, metrics.rs,
+  orchestrator.rs, state/persistence.rs to verify runtime observability claims
+- All claims in the doc trace to one of these two verified sources
 ## [0.1.2] - 2026-06-16 - Add Rust loaders for risk.yaml and routing.yaml; normalize line endings with .gitattributes
 
 ### Summary
@@ -330,5 +378,6 @@ staged.
   currently consumed only by Python scripts
 - CRLF line-ending warnings on all files ΓÇö Windows Git autocrlf; cosmetic only,
   no functional impact; resolve with a `.gitattributes` if needed
+
 
 

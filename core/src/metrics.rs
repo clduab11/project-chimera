@@ -9,6 +9,8 @@
 //! - `chimera_breaker_state`: Gauge of breaker state (0=ok, 1=tripped)
 //! - `chimera_gas_used`: Histogram of gas used per liquidation
 //! - `chimera_l1_fee_wei`: Gauge of L1 data fee in wei
+//! - `chimera_daily_net_usd`: Gauge of rolling 24h net USD
+//! - `chimera_weekly_net_usd`: Gauge of rolling 7d net USD
 
 use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 
@@ -21,6 +23,8 @@ pub struct Metrics {
     pub breaker_state: Gauge,
     pub gas_used: HistogramVec,
     pub l1_fee_wei: Gauge,
+    pub daily_net_usd: Gauge,
+    pub weekly_net_usd: Gauge,
 }
 
 impl Metrics {
@@ -75,6 +79,10 @@ impl Metrics {
         )
         .unwrap();
         let l1_fee_wei = Gauge::new("chimera_l1_fee_wei", "L1 data fee in wei").unwrap();
+        let daily_net_usd =
+            Gauge::new("chimera_daily_net_usd", "Rolling 24h net USD").unwrap();
+        let weekly_net_usd =
+            Gauge::new("chimera_weekly_net_usd", "Rolling 7d net USD").unwrap();
 
         // Register all metrics
         r.register(Box::new(candidates_seen.clone())).ok();
@@ -85,6 +93,8 @@ impl Metrics {
         r.register(Box::new(breaker_state.clone())).ok();
         r.register(Box::new(gas_used.clone())).ok();
         r.register(Box::new(l1_fee_wei.clone())).ok();
+        r.register(Box::new(daily_net_usd.clone())).ok();
+        r.register(Box::new(weekly_net_usd.clone())).ok();
 
         Self {
             candidates_seen,
@@ -95,6 +105,8 @@ impl Metrics {
             breaker_state,
             gas_used,
             l1_fee_wei,
+            daily_net_usd,
+            weekly_net_usd,
         }
     }
 
@@ -127,6 +139,14 @@ impl Metrics {
 
     pub fn set_breaker_state(&self, tripped: bool) {
         self.breaker_state.set(if tripped { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_daily_net_usd(&self, v: f64) {
+        self.daily_net_usd.set(v);
+    }
+
+    pub fn set_weekly_net_usd(&self, v: f64) {
+        self.weekly_net_usd.set(v);
     }
 }
 

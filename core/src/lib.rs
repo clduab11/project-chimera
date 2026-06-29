@@ -26,5 +26,6 @@ pub use metrics::{start_metrics_server, Metrics};
 pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use oracle::{AaveOracle, ChainlinkOracle, OraclePrice, PriceOracle};
 pub use pacing_engine::{BreakerReason, Opportunity, PacingDecision, PacingEngine};
-pub use simulator::{LiquidationCandidate, LiquidationSimulator, SimulationResult};
+pub use simulator::{L2ChainType, LiquidationCandidate, LiquidationSimulator, SimulationResult};
+pub use state::{JsonlPersistence, StatePersistence};
 

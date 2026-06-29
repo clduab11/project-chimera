@@ -178,6 +178,19 @@ class Reserve:
     price_usd: float = 0.0
     a_token: str = "0x0000000000000000000000000000000000000000"
     variable_debt_token: str = "0x0000000000000000000000000000000000000000"
+    # --- Aave V3 edge-case fields. All optional with serde defaults on the Rust side,
+    #     so older snapshots still parse. Keep field names in sync with
+    #     docs/snapshot-schema.md, prewarm::ReserveData, and detector::RawReserve. ---
+    active: bool = True
+    frozen: bool = False
+    paused: bool = False
+    siloed_borrowing: bool = False
+    liquidation_protocol_fee: int = 0  # bps (bits 152-167)
+    emode_category: int = 0  # bits 168-175
+    emode_liquidation_threshold: int = 0  # bps; carried for schema parity (not packed on-chain here)
+    emode_liquidation_bonus: int = 0  # bps; carried for schema parity
+    is_isolated: bool = False
+    debt_ceiling: str = "0"  # decimal string (bits 212-251); string avoids JSON int precision loss
 
 
 def load_pool_config(chain: str, path: str = "config/pools.toml") -> dict[str, str]:
@@ -195,6 +208,7 @@ class UserPosition:
     collateral: dict[str, str]  # asset_address -> scaled balance string
     debt: dict[str, str]      # asset_address -> scaled debt string
     emode_category: int = 0
+    is_in_isolation: bool = False  # optional (serde default false on the Rust side)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +309,20 @@ def fetch_reserves(
             # Attempt to resolve symbol via ERC20
             symbol = _resolve_symbol(w3, asset)
 
+            # getReserveConfigurationData layout:
+            #   [0] decimals, [1] ltv, [2] liquidationThreshold, [3] liquidationBonus,
+            #   [4] reserveFactor, [5] usageAsCollateralEnabled, [6] borrowingEnabled,
+            #   [7] stableBorrowRateEnabled, [8] isActive, [9] isFrozen
+            is_active = bool(config[8])
+            is_frozen = bool(config[9])
+
+            # NOTE: `paused`, `siloed_borrowing`, `is_isolated`, `debt_ceiling`,
+            # `liquidation_protocol_fee`, and the eMode fields are NOT exposed by the
+            # minimal getReserveConfigurationData ABI used here. A complete live
+            # implementation reads Pool.getConfiguration(asset) and decodes the packed
+            # ReserveConfigurationMap bitmap (protocol fee = bits 152-167, eMode = bits
+            # 168-175, debtCeiling = bits 212-251, paused = bit 60, siloed = bit 62).
+            # Until that is wired, these fall back to the safe serde defaults below.
             reserves.append(
                 Reserve(
                     address=asset,
@@ -309,6 +337,9 @@ def fetch_reserves(
                     price_usd=0.0,  # Would require oracle call
                     a_token=token_addresses[0],
                     variable_debt_token=token_addresses[2],
+                    active=is_active,
+                    frozen=is_frozen,
+                    # The remaining edge-case fields default; see note above.
                 )
             )
             logger.debug("[%d/%d] %s (%s)", idx, len(reserve_list), symbol, asset)
@@ -464,6 +495,17 @@ def _mock_reserves(chain: str) -> list[Reserve]:
                 price_usd=2500.0,
                 a_token="0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7",
                 variable_debt_token="0x24e6e0795b3c7c71D965fCc4f371803d1c1DcA1E",
+                active=True,
+                frozen=False,
+                paused=False,
+                siloed_borrowing=False,
+                liquidation_protocol_fee=1000,  # 10% of the bonus
+                # Exercise eMode: WETH sits in eMode category 1 with a higher LT/bonus.
+                emode_category=1,
+                emode_liquidation_threshold=9300,
+                emode_liquidation_bonus=10200,
+                is_isolated=False,
+                debt_ceiling="0",
             ),
             Reserve(
                 address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -478,6 +520,16 @@ def _mock_reserves(chain: str) -> list[Reserve]:
                 price_usd=1.0,
                 a_token="0x4e65fE4DbA92790696d040ac24Aa414708F5c0AB",
                 variable_debt_token="0x59dca05b6c26dbd64b5381374aAaC5CD05644C28",
+                active=True,
+                frozen=False,
+                paused=False,
+                siloed_borrowing=False,
+                liquidation_protocol_fee=1000,  # 10%
+                emode_category=0,
+                emode_liquidation_threshold=0,
+                emode_liquidation_bonus=0,
+                is_isolated=False,
+                debt_ceiling="0",
             ),
         ]
     # Arbitrum defaults
@@ -495,6 +547,17 @@ def _mock_reserves(chain: str) -> list[Reserve]:
             price_usd=2500.0,
             a_token="0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8",
             variable_debt_token="0x0c84331e39d6658Cd6e6b9ba04736cC4c4734351",
+            active=True,
+            frozen=False,
+            paused=False,
+            siloed_borrowing=False,
+            liquidation_protocol_fee=1000,  # 10% of the bonus
+            # Exercise eMode: WETH sits in eMode category 1 with a higher LT/bonus.
+            emode_category=1,
+            emode_liquidation_threshold=9300,
+            emode_liquidation_bonus=10200,
+            is_isolated=False,
+            debt_ceiling="0",
         ),
         Reserve(
             address="0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
@@ -509,6 +572,16 @@ def _mock_reserves(chain: str) -> list[Reserve]:
             price_usd=1.0,
             a_token="0x724dc807b04555b71ed48a6896b6F41593b8C637",
             variable_debt_token="0xf611aEb5013fD2c0511c9CD55c7dc5C1140741A6",
+            active=True,
+            frozen=False,
+            paused=False,
+            siloed_borrowing=False,
+            liquidation_protocol_fee=1000,  # 10%
+            emode_category=0,
+            emode_liquidation_threshold=0,
+            emode_liquidation_bonus=0,
+            is_isolated=False,
+            debt_ceiling="0",
         ),
     ]
 
@@ -522,6 +595,7 @@ def _mock_user_positions(chain: str) -> dict[str, UserPosition]:
                 collateral={"0x4200000000000000000000000000000000000006": "2000000000000000000"},
                 debt={"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913": "4500000000"},
                 emode_category=0,
+                is_in_isolation=False,
             )
         }
     return {
@@ -529,6 +603,7 @@ def _mock_user_positions(chain: str) -> dict[str, UserPosition]:
             collateral={"0x82aF49447D8a07e3bd95BD0d56f35241523fBab1": "2000000000000000000"},
             debt={"0xaf88d065e77c8cC2239327C5EDb3A432268e5831": "4500000000"},
             emode_category=0,
+            is_in_isolation=False,
         )
     }
 

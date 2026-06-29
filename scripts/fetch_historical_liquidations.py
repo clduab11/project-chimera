@@ -28,8 +28,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from web3 import Web3
-from web3.middleware import geth_poa_middleware
+try:
+    from web3 import Web3
+    from web3.middleware import geth_poa_middleware
+except ImportError:  # web3 is an optional dependency (AGENTS.md invariant #5)
+    Web3 = None
+    geth_poa_middleware = None
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -210,6 +214,11 @@ class LiquidationEvent:
 # ---------------------------------------------------------------------------
 def get_w3(chain: str, rpc_url: str | None = None) -> Web3:
     """Initialize a Web3 provider for the specified chain."""
+    if Web3 is None:
+        raise RuntimeError(
+            "web3 is not installed; cannot connect to an RPC. Install web3.py to "
+            "fetch historical liquidations."
+        )
     url = rpc_url or RPC_URLS.get(chain)
     if not url:
         raise ValueError(f"No RPC URL configured for chain: {chain}")
@@ -470,6 +479,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     logger.setLevel(getattr(logging, args.log_level))
+
+    if Web3 is None:
+        logger.error("web3 is not installed; cannot fetch liquidations. Install web3.py.")
+        return 2
 
     if args.from_block > args.to_block:
         logger.error("--from-block must be <= --to-block")

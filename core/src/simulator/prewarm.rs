@@ -20,6 +20,12 @@ pub struct MarketSnapshot {
     pub users: HashMap<Address, UserPosition>,
 }
 
+/// Default for serde `active`: snapshots predating the edge-case fields imply an active
+/// reserve, so an absent `active` key must deserialize to `true` (backward compatible).
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ReserveData {
     pub symbol: String,
@@ -38,6 +44,39 @@ pub struct ReserveData {
     /// Variable debt token address for this reserve. Defaults to ZERO if not present in JSON.
     #[serde(default)]
     pub variable_debt_token: Address,
+    // --- Aave V3 edge-case fields. ALL serde-default so existing snapshots still parse.
+    //     This struct MUST stay in sync with docs/snapshot-schema.md (invariant #2). ---
+    /// Reserve active flag (bit 56). Default true for backward compatibility.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Frozen flag (bit 57). Default false.
+    #[serde(default)]
+    pub frozen: bool,
+    /// Paused flag (bit 60). Default false.
+    #[serde(default)]
+    pub paused: bool,
+    /// Siloed-borrowing flag (bit 62). Default false.
+    #[serde(default)]
+    pub siloed_borrowing: bool,
+    /// Liquidation protocol fee in bps (bits 152-167). Default 0.
+    #[serde(default)]
+    pub liquidation_protocol_fee: u16,
+    /// Reserve eMode category (bits 168-175). Default 0.
+    #[serde(default)]
+    pub emode_category: u8,
+    /// eMode-category liquidation threshold (bps). Carried for schema parity / detector
+    /// use; NOT packed into the bitmap (on-chain eMode LT/bonus live in a separate struct).
+    #[serde(default)]
+    pub emode_liquidation_threshold: u16,
+    /// eMode-category liquidation bonus (bps). Carried for schema parity; NOT packed.
+    #[serde(default)]
+    pub emode_liquidation_bonus: u16,
+    /// Isolation-mode asset flag. Drives the borrowableInIsolation bit (61) in the mock.
+    #[serde(default)]
+    pub is_isolated: bool,
+    /// Isolation debt ceiling as a decimal string (bits 212-251). "" / absent => 0.
+    #[serde(default)]
+    pub debt_ceiling: String,
 }
 
 /// Pack reserve configuration parameters into Aave V3's `ReserveConfigurationMap` bitmap.
@@ -60,10 +99,54 @@ pub fn pack_reserve_configuration_map(reserve: &ReserveData) -> U256 {
         + (U256::from(reserve.liquidation_threshold) << 16)
         + (U256::from(reserve.liquidation_bonus) << 32)
         + (U256::from(reserve.decimals) << 48);
-    word |= U256::from(1) << 56; // active
-    word |= U256::from(1) << 58; // borrowingEnabled
+
+    // Flag bits. For snapshots predating the edge-case fields, `active` defaults true and
+    // frozen/paused/siloed/is_isolated default false, so the packed word is byte-identical
+    // to the previous behaviour (active + borrowing + flashloan only).
+    if reserve.active {
+        word |= U256::from(1) << 56; // active
+    }
+    if reserve.frozen {
+        word |= U256::from(1) << 57; // frozen
+    }
+    word |= U256::from(1) << 58; // borrowingEnabled (mock assumption)
+    if reserve.paused {
+        word |= U256::from(1) << 60; // paused
+    }
+    if reserve.is_isolated {
+        // borrowableInIsolation (bit 61) is a distinct on-chain flag; for the mock we
+        // approximate it from `is_isolated`. The on-chain "asset is isolated" property is
+        // actually derived from `debt_ceiling > 0`.
+        word |= U256::from(1) << 61;
+    }
+    if reserve.siloed_borrowing {
+        word |= U256::from(1) << 62; // siloedBorrowing
+    }
     word |= U256::from(1) << 63; // flashLoanEnabled
+
+    // Liquidation protocol fee: bits 152-167 (16 bits).
+    word |= (U256::from(reserve.liquidation_protocol_fee) & U256::from(0xFFFFu64)) << 152;
+
+    // eMode category: bits 168-175 (8 bits). NOTE: the eMode liquidation threshold/bonus
+    // are NOT packed here — on-chain they live in a separate eMode-category struct, not in
+    // the ReserveConfigurationMap. For the prewarm mock, setting the category id is enough.
+    word |= (U256::from(reserve.emode_category) & U256::from(0xFFu64)) << 168;
+
+    // Debt ceiling: bits 212-251 (40 bits).
+    let debt_ceiling = parse_debt_ceiling(&reserve.debt_ceiling);
+    let mask_40 = (U256::from(1u64) << 40) - U256::from(1u64);
+    word |= (U256::from(debt_ceiling) & mask_40) << 212;
+
     word
+}
+
+/// Parse a decimal debt-ceiling string to `u128`. Empty/invalid => 0.
+fn parse_debt_ceiling(s: &str) -> u128 {
+    if s.is_empty() {
+        0
+    } else {
+        s.parse::<u128>().unwrap_or(0)
+    }
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -293,6 +376,16 @@ mod tests {
             total_variable_debt: 700_000_000_000_000_000_000_000_000_000u128,
             a_token: address!("0xe50fA9b3c56FfB159cB0FCA61F5c9D750e8128c8"),
             variable_debt_token: address!("0x0c84331e39d6658Cd6e6b9ba04736cC4c4734351"),
+            active: true,
+            frozen: false,
+            paused: false,
+            siloed_borrowing: false,
+            liquidation_protocol_fee: 1000,
+            emode_category: 0,
+            emode_liquidation_threshold: 0,
+            emode_liquidation_bonus: 0,
+            is_isolated: false,
+            debt_ceiling: String::new(),
         };
 
         let user = address!("0x1234567890123456789012345678901234567890");
@@ -389,6 +482,16 @@ mod tests {
             total_variable_debt: 0,
             a_token: Address::ZERO,
             variable_debt_token: Address::ZERO,
+            active: true,
+            frozen: false,
+            paused: false,
+            siloed_borrowing: false,
+            liquidation_protocol_fee: 0,
+            emode_category: 0,
+            emode_liquidation_threshold: 0,
+            emode_liquidation_bonus: 0,
+            is_isolated: false,
+            debt_ceiling: String::new(),
         };
         let _a_token_addr = reserve.a_token;
         let _debt_token_addr = reserve.variable_debt_token;

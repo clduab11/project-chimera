@@ -259,9 +259,9 @@ object "Executor" {
                         returndatacopy(0, 0, 32)
                         if iszero(mload(0)) {
                             success := 0
-            }
-    }
-}
+                        }
+                    }
+                }
 
             }
             // G==G== callLiquidation G==G==

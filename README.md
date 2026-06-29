@@ -86,9 +86,9 @@ flowchart TB
     classDef money fill:#1a3a1a,stroke:#4ade80,stroke-width:2px,color:#d1fae5
     classDef guard fill:#3a1a1a,stroke:#f87171,stroke-width:2px,color:#fee2e2
     classDef brain fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#dbeafe
-    class EXEC FIRE,KEEP,EOA,T money
-    class G GUARDRAILS guard
-    class BRAIN SIM,S,CB
+    class EXEC,FIRE,KEEP,EOA,T money
+    class G,GUARDRAILS guard
+    class BRAIN,SIM,S,CB brain
 ```
 
 ---

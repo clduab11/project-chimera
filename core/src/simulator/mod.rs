@@ -87,13 +87,22 @@ pub struct LiquidationCandidate {
     pub receive_a_token: bool,
     pub current_hf: U256,
     pub chain_id: u64,
+    /// Edge case 3 (bad debt): set when the position's seizable collateral value is
+    /// below its debt value. The detector does not emit bad-debt candidates (they are
+    /// unprofitable for a searcher), but the flag lets the orchestrator/simulator
+    /// defensively skip any candidate that ever carries it set.
+    pub bad_debt: bool,
 }
 
 /// Result of a full REVM simulation of a liquidation (or flash + liquidation bundle).
+///
+/// Invariant #3: monetary values are `Decimal`, never `f64`. The simulator computes
+/// profit internally in `f64` (REVM/oracle math) and converts at the single boundary
+/// where this struct is constructed via `Decimal::from_f64_retain(..).unwrap_or(ZERO)`.
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
     pub profitable: bool,
-    pub expected_profit_usd: f64,
+    pub expected_profit_usd: Decimal,
     pub gas_used: u64,
     pub l1_data_fee_wei: U256,
     pub revert_reason: Option<String>,
@@ -213,7 +222,7 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
                 .unwrap_or_default();
             return Ok(SimulationResult {
                 profitable: false,
-                expected_profit_usd: 0.0,
+                expected_profit_usd: Decimal::ZERO,
                 gas_used,
                 l1_data_fee_wei: U256::ZERO,
                 revert_reason: Some(revert),
@@ -243,7 +252,8 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
 
         Ok(SimulationResult {
             profitable,
-            expected_profit_usd: profit_usd,
+            // Invariant #3 boundary: convert the internal f64 profit to Decimal here.
+            expected_profit_usd: Decimal::from_f64_retain(profit_usd).unwrap_or(Decimal::ZERO),
             gas_used,
             l1_data_fee_wei: l1_data_fee,
             revert_reason: None,
@@ -353,13 +363,25 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         let bonus_bps = self.fetch_reserve_bonus(candidate.collateral_asset).await?;
         let bonus_multiplier = U256::from(bonus_bps); // 1e4 scale
 
+        // Edge case 2 (liquidation protocol fee): Aave V3 takes a protocol fee on the
+        // BONUS portion of a liquidation. Fetch it from the packed reserve config (bits
+        // 152-167); fall back to 0 bps on RPC failure (no fee = conservative for "is it
+        // profitable", since it overstates our net profit only when the fee is unknown).
+        let protocol_fee_bps = self
+            .fetch_reserve_protocol_fee(candidate.collateral_asset)
+            .await?;
+
         // Profit in debt units: (liquidatedCollateral * bonus_bps / 10000) - actualDebtCovered
         let gross_bonus = liquidated_collateral * bonus_multiplier / U256::from(10000);
+        // `profit_in_collateral` is the bonus over the repaid base, i.e. the bonus portion.
         let profit_in_collateral = gross_bonus.saturating_sub(liquidated_collateral);
-        let profit_in_debt = if actual_debt_covered > profit_in_collateral {
+        // Protocol fee is assessed on the bonus portion: net = bonus - bonus * fee / 10000.
+        let protocol_cut = profit_in_collateral * U256::from(protocol_fee_bps) / U256::from(10000);
+        let net_profit_in_collateral = profit_in_collateral.saturating_sub(protocol_cut);
+        let profit_in_debt = if actual_debt_covered > net_profit_in_collateral {
             U256::ZERO
         } else {
-            profit_in_collateral - actual_debt_covered
+            net_profit_in_collateral - actual_debt_covered
         };
 
         // Convert to USD using live oracle price.
@@ -425,6 +447,23 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         }
     }
 
+    /// Fetch the liquidation protocol fee (in basis points, 1e4 scale) for a reserve from
+    /// on-chain data. Falls back to `0` if the RPC call fails (no fee subtracted).
+    async fn fetch_reserve_protocol_fee(&self, collateral: Address) -> Result<u16, ChimeraError> {
+        let contract = IAavePool::new(self.aave_pool, &*self.provider);
+        match contract.getReserveData(collateral).call().await {
+            Ok(result) => Ok(parse_protocol_fee(result.configuration)),
+            Err(e) => {
+                tracing::warn!(
+                    "getReserveData RPC failed for {} (protocol fee): {}, using 0 bps",
+                    collateral,
+                    e
+                );
+                Ok(0)
+            }
+        }
+    }
+
     /// Fetch the current ETH/USD price from the configured oracle.
     async fn fetch_eth_price(&self) -> Result<Decimal, ChimeraError> {
         self.oracle.get_price(self.eth_oracle_asset).await
@@ -455,6 +494,14 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
 fn parse_liquidation_bonus(configuration: U256) -> u16 {
     let masked = (configuration >> 32) & U256::from(0xFFFF);
     u16::try_from(masked).unwrap_or(DEFAULT_LIQUIDATION_BONUS_BPS)
+}
+
+/// Extract the liquidation protocol fee (in basis points) from the packed Aave V3 reserve
+/// configuration. The protocol fee occupies bits 152-167 of the `configuration` word
+/// (mirrors [`parse_liquidation_bonus`]). Defaults to `0` on overflow.
+fn parse_protocol_fee(configuration: U256) -> u16 {
+    let masked = (configuration >> 152) & U256::from(0xFFFF);
+    u16::try_from(masked).unwrap_or(0)
 }
 
 fn checked_u256_to_u64(v: U256) -> Result<u64, ChimeraError> {
@@ -511,6 +558,38 @@ mod tests {
         let configuration = (bonus << 32) | (threshold << 16) | ltv;
         assert_eq!(
             parse_liquidation_bonus(U256::from(configuration)),
+            DEFAULT_LIQUIDATION_BONUS_BPS
+        );
+    }
+
+    #[test]
+    fn parse_protocol_fee_zero_when_unset() {
+        // No fee bits set => 0.
+        let configuration = U256::from(DEFAULT_LIQUIDATION_BONUS_BPS as u64) << 32;
+        assert_eq!(parse_protocol_fee(configuration), 0);
+    }
+
+    #[test]
+    fn parse_protocol_fee_reads_bits_152_167() {
+        // 1000 bps (10%) placed at bits 152-167.
+        let fee = 1000u16;
+        let configuration = U256::from(fee) << 152;
+        assert_eq!(parse_protocol_fee(configuration), fee);
+    }
+
+    #[test]
+    fn parse_protocol_fee_isolated_from_bonus_and_threshold() {
+        // Set LTV, liquidationThreshold, liquidationBonus AND protocol fee; the parser
+        // must read ONLY bits 152-167 and ignore the lower fields.
+        let ltv = U256::from(8000u64);
+        let threshold = U256::from(8250u64) << 16;
+        let bonus = U256::from(DEFAULT_LIQUIDATION_BONUS_BPS as u64) << 32;
+        let fee = U256::from(800u64) << 152; // 8%
+        let configuration = ltv | threshold | bonus | fee;
+        assert_eq!(parse_protocol_fee(configuration), 800);
+        // And the bonus parser is unaffected by the fee bits.
+        assert_eq!(
+            parse_liquidation_bonus(configuration),
             DEFAULT_LIQUIDATION_BONUS_BPS
         );
     }

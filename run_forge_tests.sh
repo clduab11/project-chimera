@@ -1,4 +1,12 @@
 #!/bin/bash
+set -euo pipefail
 
-# Source Rust and Foundry environment variables
-source " C:Userscld-main/.cargo/envsource
+cd "$(dirname "$0")"
+
+echo "=== Chimera Foundry Test Suite ==="
+echo "Working directory: $(pwd)"
+
+# Run forge tests
+forge test --root contracts/ -vvv
+
+echo "=== All Foundry tests passed ==="

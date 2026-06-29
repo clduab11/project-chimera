@@ -42,7 +42,8 @@ object "Executor" {
             switch sig
             // G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--
             // CASE A: Aave V3 Flash Loan Callback (executeOperation)
-            case 0x1b11d0ff { // SEL_EXECUTE_OPERATION
+            // ======================================================================
+            case 0x1b11d0ff {
                 // Calldata layout (ABI-encoded by Aave Pool):
                 //   [0x00:0x04)  function selector
                 //   [0x04:0x24)  asset            (address, padded to 32)
@@ -57,7 +58,8 @@ object "Executor" {
                 let amount    := calldataload(36)
                 let premium   := calldataload(68)
                 let initiator := calldataload(100)
-                // Decode dynamic bytes (params)
+
+                // -- Decode dynamic bytes (params) --
                 let paramsOffset    := add(calldataload(132), 4)
                 let paramsLen       := calldataload(paramsOffset)
                 let paramsDataStart := add(paramsOffset, 32)
@@ -70,12 +72,12 @@ object "Executor" {
                 //   [0x00:0x20)  collateralAsset   (address, left-padded)
                 //   [0x20:0x40)  userToLiquidate   (address, left-padded)
                 //   [0x40:0x60)  debtToCover       (uint256)
-                //   [0x60:0x80)  receiveAToken       (uint256, 0 or 1)
-                //   [0x80:0xA0)  dexRouter           (address, left-padded)
+                //   [0x60:0x80)  receiveAToken     (uint256, 0 or 1)
+                //   [0x80:0xA0)  dexRouter         (address, left-padded)
                 //   [0xA0:0xC0)  amountOutMin      (uint256)
-                //   [0xC0:0xE0)  minProfit           (uint256)
-                //   [0xE0:0x100) tip                 (uint256)
-                //   [0x100:0x120) deadline           (uint256)
+                //   [0xC0:0xE0)  minProfit         (uint256)
+                //   [0xE0:0x100) tip               (uint256)
+                //   [0x100:0x120) deadline          (uint256)
                 let collateralAsset := calldataload(paramsDataStart)
                 let userToLiquidate := calldataload(add(paramsDataStart, 32))
                 let debtToCover     := calldataload(add(paramsDataStart, 64))
@@ -95,24 +97,20 @@ object "Executor" {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
                 // Call liquidationCall on Aave Pool.
-                // This seizes collateral from the target user.
                 if iszero(callLiquidation(pool, collateralAsset, asset, userToLiquidate, debtToCover, receiveAToken)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
                 // G--G-- Step 2: DEX SWAP G--G--
                 // Swap seized collateral back into the debt token.
-                // Skip if collateral is already the debt token (rare but possible).
+                // Skip if collateral is already the debt token.
                 if iszero(eq(collateralAsset, asset)) {
                     if iszero(dexRouter) {
                         revertWithError(ERR_INVALID_ROUTER)
                     }
-                    // Query seized collateral balance.
                     let collateralBal := callBalanceOf(collateralAsset, self)
-                    // Approve DEX router to spend seized collateral.
                     if iszero(callApprove(collateralAsset, dexRouter, collateralBal)) {
                         revertWithError(ERR_ATOMIC_FAIL)
                     }
-                    // Execute swap: collateralAsset -> asset (debt token).
                     if iszero(callSwapExactTokens(dexRouter, collateralBal, amountOutMin, collateralAsset, asset, self, deadline)) {
                         revertWithError(ERR_ATOMIC_FAIL)
                     }
@@ -128,7 +126,14 @@ object "Executor" {
                 // Profit check: balanceAfter > balanceBefore + minProfit + tip.
                 // minProfit should be set off-chain to cover gas, slippage, etc.
                 let balanceAfter := callBalanceOf(asset, self)
-                let requiredBalance := add(add(balanceBefore, minProfit), tip)
+                let _sum1 := add(balanceBefore, minProfit)
+                if lt(_sum1, balanceBefore) {
+                    revertWithError(ERR_PROFIT_GATE)
+                }
+                let requiredBalance := add(_sum1, tip)
+                if lt(requiredBalance, _sum1) {
+                    revertWithError(ERR_PROFIT_GATE)
+                }
                 if iszero(gt(balanceAfter, requiredBalance)) {
                     revertWithError(ERR_PROFIT_GATE)
                 }
@@ -141,18 +146,23 @@ object "Executor" {
                 mstore(0, 1)
                 return(0, 32)
             }
-            // CASE B: Direct Execution Entry (EIP-7702 compatible)
-            case 0x55f86501 { // SEL_EXEC
-                // This path allows an EOA (with EIP-7702 code delegation)
-                // or an external controller to execute a strategy directly
-                // without going through Aave's flash-loan callback.
-                // The caller must have already arranged token balances.
-                //
+
+            // ======================================================================
+            // CASE B: Direct Execution Entry (EIP-7702 compatible, owner only)
+            // ======================================================================
+            case 0x55f86501 {
+                // -- Owner auth: only owner can call exec --
+                if iszero(eq(caller(), sload(0))) {
+                    mstore(0, shl(224, ERR_UNAUTHORIZED))
+                    revert(0, 4)
+                }
+
                 // Calldata layout:
                 //   [0x00:0x04)  selector
                 //   [0x04:0x24)  strategyData.offset  (relative to 0x04)
                 //   [0x24:0x44)  strategyData.length
                 //   [0x44:...)   strategyData
+                //
                 // strategyData tightly packed (12 * 32 = 384 bytes):
                 //   [0x00:0x20)  asset
                 //   [0x20:0x40)  amount
@@ -172,18 +182,19 @@ object "Executor" {
                 if lt(dataLen, 384) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
-                let d_asset       := calldataload(dataStart)
-                let d_amount      := calldataload(add(dataStart, 32))
-                let d_pool        := calldataload(add(dataStart, 64))
-                let d_collateral  := calldataload(add(dataStart, 96))
-                let d_user        := calldataload(add(dataStart, 128))
-                let d_debtToCover := calldataload(add(dataStart, 160))
+                let d_asset         := calldataload(dataStart)
+                let d_amount        := calldataload(add(dataStart, 32))
+                let d_pool          := calldataload(add(dataStart, 64))
+                let d_collateral    := calldataload(add(dataStart, 96))
+                let d_user          := calldataload(add(dataStart, 128))
+                let d_debtToCover   := calldataload(add(dataStart, 160))
                 let d_receiveAToken := calldataload(add(dataStart, 192))
-                let d_dexRouter   := calldataload(add(dataStart, 224))
-                let d_amountOutMin := calldataload(add(dataStart, 256))
-                let d_minProfit   := calldataload(add(dataStart, 288))
-                let d_tip         := calldataload(add(dataStart, 320))
-                let d_deadline    := calldataload(add(dataStart, 352))
+                let d_dexRouter     := calldataload(add(dataStart, 224))
+                let d_amountOutMin  := calldataload(add(dataStart, 256))
+                let d_minProfit     := calldataload(add(dataStart, 288))
+                let d_tip           := calldataload(add(dataStart, 320))
+                let d_deadline      := calldataload(add(dataStart, 352))
+
                 let self := address()
                 let balanceBefore := callBalanceOf(d_asset, self)
                 // G--G-- Liquidation G--G--
@@ -208,7 +219,14 @@ object "Executor" {
                 }
                 // G--G-- Profit Gate G--G--
                 let balanceAfter := callBalanceOf(d_asset, self)
-                let required := add(add(balanceBefore, d_minProfit), d_tip)
+                let _sum1 := add(balanceBefore, d_minProfit)
+                if lt(_sum1, balanceBefore) {
+                    revertWithError(ERR_PROFIT_GATE)
+                }
+                let required := add(_sum1, d_tip)
+                if lt(required, _sum1) {
+                    revertWithError(ERR_PROFIT_GATE)
+                }
                 if iszero(gt(balanceAfter, required)) {
                     revertWithError(ERR_PROFIT_GATE)
                 }
@@ -218,23 +236,19 @@ object "Executor" {
                 log1(0, 32, EVT_PROFIT_TOPIC0)
                 stop()
             }
-            // DEFAULT: Reject unknown selectors & plain ETH transfers
+
+            // -------------------- DEFAULT: reject --------------------
             default {
-                revertWithError(ERR_UNAUTHORIZED)
+                mstore(0, shl(224, ERR_UNAUTHORIZED))
+                revert(0, 4)
             }
             // SECTION 2: INTERNAL HELPER FUNCTIONS
             // G--G-- callBalanceOf G--G--
             // Queries ERC20 balanceOf for a given token and account.
             // Uses staticcall (read-only). Reverts on failure.
-            //
-            // @param token   Token contract address
-            // @param account Address to query balance for
-            // @return bal    Token balance (uint256)
             function callBalanceOf(token, account) -> bal {
-                // Encode: balanceOf(address)
-                mstore(0, shl(224, 0x70a08231)) // SEL_BALANCE_OF
+                mstore(0, shl(224, 0x70a08231))
                 mstore(4, account)
-                // staticcall: gas(), token, inOffset=0, inSize=36, outOffset=0, outSize=32
                 if iszero(staticcall(gas(), token, 0, 36, 0, 32)) {
                     revert(0, 0)
                 }
@@ -244,16 +258,11 @@ object "Executor" {
             // Calls ERC20 approve. Handles tokens that return nothing (e.g. USDT)
             // or return bool. Returns true only if the call succeeded AND
             // the return data (if any) is true.
-            // @param spender Address to approve
-            // @param amount  Allowance amount
-            // @return success true if approval succeeded
             function callApprove(token, spender, amount) -> success {
-                mstore(0, shl(224, 0x095ea7b3)) // SEL_APPROVE
+                mstore(0, shl(224, 0x095ea7b3))
                 mstore(4, spender)
                 mstore(36, amount)
                 success := call(gas(), token, 0, 0, 68, 0, 32)
-                // Some ERC20s (USDT) don't return a bool. If returndatasize == 0,
-                // assume success if the call itself succeeded.
                 if success {
                     if returndatasize() {
                         returndatacopy(0, 0, 32)
@@ -265,40 +274,24 @@ object "Executor" {
             }
             // G--G-- callLiquidation G--G--
             // Calls Aave V3 Pool.liquidationCall.
-            // Reverts on this level are handled by the caller checking `success`.
-            // @param pool            Aave Pool address
-            // @param collateralAsset Asset to seize
-            // @param debtAsset       Debt to repay
-            // @param user            User being liquidated
-            // @param debtToCover     Amount of debt to cover
-            // @param receiveAToken   true = receive aTokens, false = receive underlying
-            // @return success        true if liquidationCall succeeded
             function callLiquidation(pool, collateralAsset, debtAsset, user, debtToCover, receiveAToken) -> success {
-                // liquidationCall(address,address,address,uint256,bool)
-                mstore(0, shl(224, 0x00a718a9)) // SEL_LIQUIDATION_CALL
+                mstore(0, shl(224, 0x00a718a9))
                 mstore(4, collateralAsset)
                 mstore(36, debtAsset)
                 mstore(68, user)
                 mstore(100, debtToCover)
-                mstore(132, receiveAToken) // bool encoded as uint256 (0 or 1)
+                mstore(132, receiveAToken)
                 success := call(gas(), pool, 0, 0, 164, 0, 0)
             }
             // G--G-- callSwapExactTokens G--G--
             // Calls Uniswap V2 compatible swapExactTokensForTokens with a 2-hop path.
             // Builds the ABI-encoded calldata in scratch memory and executes the call.
-            // @param router       DEX router address
-            // @param amountIn     Collateral amount to swap
-            // @param amountOutMin Minimum output (slippage protection)
-            // @param tokenIn      Input token (collateral)
-            // @param tokenOut     Output token (debt token)
-            // @param to           Recipient of output tokens
-            // @param deadline     Transaction deadline timestamp
-            // @return success     true if swap succeeded
             function callSwapExactTokens(router, amountIn, amountOutMin, tokenIn, tokenOut, to, deadline) -> success {
-                // Memory layout for swapExactTokensForTokens calldata:
+                // Memory layout:
+                //   [0x00:0x04)  selector
                 //   [0x04:0x24)  amountIn
                 //   [0x24:0x44)  amountOutMin
-                //   [0x44:0x64)  path offset (relative to start of args = 0x04)
+                //   [0x44:0x64)  path offset (160 = 0xA0)
                 //   [0x64:0x84)  to
                 //   [0x84:0xA4)  deadline
                 //   [0xA4:0xC4)  path.length (= 2)
@@ -309,20 +302,17 @@ object "Executor" {
                 mstore(0, shl(224, 0x38ed1739)) // SEL_SWAP_EXACT_TOKENS
                 mstore(4, amountIn)
                 mstore(36, amountOutMin)
-                mstore(68, 160)          // path offset
+                mstore(68, 160)
                 mstore(100, to)
                 mstore(132, deadline)
                 // G-- Write dynamic path array G--
                 mstore(164, 2)           // path.length
                 mstore(196, tokenIn)
                 mstore(228, tokenOut)
-                // Total calldata size: 260 bytes (0x104)
                 success := call(gas(), router, 0, 0, 260, 0, 0)
             }
             // G--G-- revertWithError G--G--
             // Reverts with a 4-byte custom error selector.
-            // Compatible with Solidity custom errors and Foundry testing.
-            // @param selector 4-byte error signature
             function revertWithError(selector) {
                 mstore(0, shl(224, selector))
                 revert(0, 4)

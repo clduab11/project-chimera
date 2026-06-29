@@ -9,7 +9,11 @@ repository = "https://github.com/your-org/project-chimera"
 
 [dependencies]
 # alloy 1.x — the modern all-in-one meta-crate (revm 36 requires alloy ^1.4)
-alloy = { version = "1.7", features = ["full", "providers", "contract", "rpc"] }
+# NOTE: `full` already pulls `signer-local` (via `essentials`), but the keystore
+# decrypt path (`PrivateKeySigner::decrypt_keystore`) requires the `signer-keystore`
+# passthrough feature, which `full` does NOT enable. `signer-local`/`signers` are
+# listed explicitly for clarity (they are real alloy features).
+alloy = { version = "1.7", features = ["full", "providers", "contract", "rpc", "signers", "signer-local", "signer-keystore"] }
 async-trait = "0.1"
 hex = "0.4"
 revm = { version = "36.0", features = ["std", "serde", "alloydb"] }
@@ -17,6 +21,7 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

@@ -55,6 +55,7 @@ pub async fn run_golden_replays<P: alloy::providers::Provider<Ethereum> + Clone 
             receive_a_token: false,
             current_hf: U256::ZERO,
             chain_id: if report.chain == "base" { 8453 } else { 42161 },
+            bad_debt: false,
         };
 
         let result: SimulationResult = simulator
@@ -80,6 +81,27 @@ pub async fn run_golden_replays<P: alloy::providers::Provider<Ethereum> + Clone 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_golden_replays_path() -> std::path::PathBuf {
+        let candidates = [
+            std::path::Path::new("../tests/fixtures/golden_replays.json"),
+            std::path::Path::new("core/tests/fixtures/golden_replays.json"),
+            std::path::Path::new("tests/fixtures/golden_replays.json"),
+        ];
+        for p in &candidates {
+            if p.exists() {
+                return p.to_path_buf();
+            }
+        }
+        panic!(
+            "golden_replays.json not found in any of: {}",
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     #[test]
     fn golden_replays_parse() {

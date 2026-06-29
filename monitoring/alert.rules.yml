@@ -1,0 +1,65 @@
+# Prometheus alerting rules for Project Chimera
+# Metric names match core/src/metrics.rs emitters.
+groups:
+  - name: chimera
+    rules:
+      - alert: ChimeraBreakerTripped
+        expr: chimera_breaker_state == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Chimera circuit breaker tripped"
+          description: >-
+            chimera_breaker_state has been 1 (tripped) for over 1m. A safety
+            breaker has halted execution. Trading is paused until the breaker
+            is reset. Investigate recent reverts, losses, or oracle anomalies.
+
+      - alert: ChimeraDailyLossApproachingCap
+        expr: chimera_daily_net_usd < -50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chimera daily net USD is negative"
+          description: >-
+            chimera_daily_net_usd has been below -50 USD for 5m, indicating
+            accumulating daily losses approaching the loss cap. Review strategy
+            performance and consider intervention before the daily cap trips
+            the breaker.
+
+      - alert: ChimeraNoCandidates
+        expr: rate(chimera_candidates_seen_total[15m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chimera detector sees no candidates"
+          description: >-
+            rate(chimera_candidates_seen_total[15m]) has been 0 for 15m. The
+            detector may be stalled or the on-chain snapshot is stale. Check
+            snapshot freshness and the candidate ingestion pipeline.
+
+      - alert: ChimeraHighRevertRate
+        expr: rate(chimera_revert_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Chimera revert rate elevated"
+          description: >-
+            rate(chimera_revert_total[10m]) has exceeded 0.1/s for 10m.
+            Transactions are reverting frequently. Inspect revert reasons
+            (label `reason`), gas settings, and venue liquidity.
+
+      - alert: ChimeraScraperDown
+        expr: up{job="chimera"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Chimera metrics endpoint down"
+          description: >-
+            Prometheus has been unable to scrape job="chimera"
+            (chimera-core:9100) for 2m. The core binary may be down or its
+            metrics server is unreachable. Observability is blind until resolved.

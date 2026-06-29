@@ -185,7 +185,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_missing_file() {
-        let path = std::path::PathBuf::from("/tmp/nonexistent_chimera_audit.jsonl");
+        let path = std::env::temp_dir().join(format!(
+            "chimera_test_nonexistent_{}.jsonl",
+            std::process::id()
+        ));
+        assert!(!path.exists());
         let state = CrashRecovery::recover_from_jsonl(&path).await.unwrap();
         assert_eq!(state.daily_usage_usd, Decimal::ZERO);
     }

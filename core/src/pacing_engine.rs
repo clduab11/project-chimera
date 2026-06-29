@@ -52,6 +52,8 @@ pub enum BreakerReason {
     DailyLossLimitExceeded,
     WeeklyCapExceeded,
     SingleTransferCapExceeded,
+    /// Force-tripped by an external emergency (e.g. emergency.flag). Carries the reason.
+    EmergencyHalt(String),
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskState {
@@ -82,6 +84,11 @@ struct PacingEngineInner {
     consecutive_reverts: u32,
     last_release: Option<DateTime<Utc>>,
     recent_outcomes: VecDeque<(DateTime<Utc>, Decimal)>,
+    /// Rolling 24h window of (timestamp, gas_spent_eth) for losing outcomes.
+    /// Parallels `recent_outcomes`; used to recompute `daily_loss_eth` so the
+    /// DailyLossLimit breaker decays over time instead of accumulating forever.
+    /// NOT persisted in RiskState — it is a runtime reconstruction aid.
+    daily_losses: VecDeque<(DateTime<Utc>, Decimal)>,
     breaker_tripped: Option<BreakerReason>,
     venue_rotation: VecDeque<String>,
     eoa_rotation: VecDeque<String>,
@@ -198,9 +205,26 @@ impl PacingEngineInner {
             .map(|(_, v)| *v)
             .sum();
         self.weekly_net_usd = self.recent_outcomes.iter().map(|(_, v)| *v).sum();
+        // Rolling 24h loss window, mirroring the daily_net_usd recompute above.
+        // `daily_loss_eth` must decay like daily/weekly (window-recomputed) rather
+        // than accumulate monotonically, otherwise the DailyLossLimit breaker would
+        // trip permanently once cumulative loss crossed the cap across many days.
         if realized_net_usd < Decimal::ZERO {
-            self.daily_loss_eth += gas_spent_eth;
+            self.daily_losses.push_back((now, gas_spent_eth));
         }
+        while let Some((ts, _)) = self.daily_losses.front() {
+            if now - *ts > TimeDelta::days(1) {
+                self.daily_losses.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.daily_loss_eth = self
+            .daily_losses
+            .iter()
+            .filter(|(ts, _)| now - *ts <= TimeDelta::days(1))
+            .map(|(_, v)| *v)
+            .sum();
         if reverted {
             self.consecutive_reverts += 1;
         } else {
@@ -264,6 +288,11 @@ impl PacingEngineInner {
             consecutive_reverts: state.consecutive_reverts,
             last_release: state.last_release,
             recent_outcomes: VecDeque::with_capacity(capacity),
+            // `daily_losses` is not persisted in RiskState. When restoring from a
+            // state with a non-zero `daily_loss_eth`, we seed it empty best-effort:
+            // the next record_outcome prune/recompute will then reflect only losses
+            // within the live 24h window (zeroing stale carryover after a day).
+            daily_losses: VecDeque::new(),
             breaker_tripped: state.breaker_tripped,
             venue_rotation: VecDeque::new(),
             eoa_rotation: eoa_pool,
@@ -316,6 +345,7 @@ impl PacingEngine {
                     consecutive_reverts: 0,
                     last_release: None,
                     recent_outcomes: VecDeque::with_capacity(cap),
+                    daily_losses: VecDeque::new(),
                     breaker_tripped: None,
                     venue_rotation: VecDeque::new(),
                     eoa_rotation: capped_pool,
@@ -329,6 +359,7 @@ impl PacingEngine {
                 consecutive_reverts: 0,
                 last_release: None,
                 recent_outcomes: VecDeque::with_capacity(cap),
+                daily_losses: VecDeque::new(),
                 breaker_tripped: None,
                 venue_rotation: VecDeque::new(),
                 eoa_rotation: capped_pool,
@@ -449,12 +480,39 @@ impl PacingEngine {
         }
     }
     /// Operator can manually clear a breaker after investigation.
-    pub fn clear_breaker(&self) {
+    /// Gated behind the `CHIMERA_OPERATOR_TOKEN` env var to prevent unauthorized clears.
+    pub fn clear_breaker(&self, operator_token: &str) -> Result<(), ChimeraError> {
+        let expected = std::env::var("CHIMERA_OPERATOR_TOKEN").unwrap_or_default();
+        if expected.is_empty() {
+            return Err(ChimeraError::ConfigError(
+                "clear_breaker refused: CHIMERA_OPERATOR_TOKEN not set".into(),
+            ));
+        }
+        // Constant-time-ish comparison; tokens are short operator secrets.
+        if operator_token != expected {
+            warn!("OPERATOR: clear_breaker called with invalid token; refusing");
+            return Err(ChimeraError::ConfigError(
+                "clear_breaker refused: invalid operator token".into(),
+            ));
+        }
         let mut inner = self.inner.write();
         if inner.breaker_tripped.is_some() {
             warn!("OPERATOR: Manually clearing breaker. Ensure root cause resolved.");
             inner.breaker_tripped = None;
             inner.consecutive_reverts = 0;
+        }
+        drop(inner);
+        self.persist_state();
+        Ok(())
+    }
+
+    /// Force-trip the breaker due to an external emergency (e.g. emergency.flag).
+    /// Idempotent: re-tripping with the same reason is a no-op on state.
+    pub fn trip_emergency(&self, reason: &str) {
+        let mut inner = self.inner.write();
+        if !matches!(inner.breaker_tripped, Some(BreakerReason::EmergencyHalt(_))) {
+            warn!(target: "chimera::pacing", reason = %reason, "EMERGENCY: breaker tripped via flag");
+            inner.breaker_tripped = Some(BreakerReason::EmergencyHalt(reason.to_string()));
         }
         drop(inner);
         self.persist_state();
@@ -718,6 +776,95 @@ mod tests {
         }
         let state = engine.current_risk_state();
         assert_eq!(state.weekly_net_usd, Decimal::from(60));
+    }
+
+    /// Serializes env-mutating tests so concurrent test threads don't race on the
+    /// process-global `CHIMERA_OPERATOR_TOKEN`. `Mutex::new` is const, so this is
+    /// valid in a `static`. Poisoning is recovered via `into_inner`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn clear_breaker_succeeds_with_valid_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CHIMERA_OPERATOR_TOKEN", "s3cret");
+        let engine = PacingEngine::new(make_test_config());
+        engine.inner.write().breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
+        let res = engine.clear_breaker("s3cret");
+        std::env::remove_var("CHIMERA_OPERATOR_TOKEN");
+        assert!(res.is_ok(), "expected Ok, got {:?}", res);
+        assert!(!engine.is_breaker_active(), "breaker should be cleared");
+    }
+
+    #[test]
+    fn clear_breaker_rejects_wrong_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("CHIMERA_OPERATOR_TOKEN", "s3cret");
+        let engine = PacingEngine::new(make_test_config());
+        engine.inner.write().breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
+        let res = engine.clear_breaker("wrong-token");
+        std::env::remove_var("CHIMERA_OPERATOR_TOKEN");
+        assert!(
+            matches!(res, Err(ChimeraError::ConfigError(_))),
+            "expected ConfigError, got {:?}", res
+        );
+        // Breaker must remain tripped after a rejected clear.
+        assert!(engine.is_breaker_active(), "breaker must stay tripped");
+    }
+
+    #[test]
+    fn clear_breaker_rejects_without_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CHIMERA_OPERATOR_TOKEN");
+        let engine = PacingEngine::new(make_test_config());
+        engine.inner.write().breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
+        let res = engine.clear_breaker("anything");
+        assert!(
+            matches!(res, Err(ChimeraError::ConfigError(_))),
+            "expected ConfigError, got {:?}", res
+        );
+        assert!(engine.is_breaker_active(), "breaker must stay tripped");
+    }
+
+    #[test]
+    fn trip_emergency_sets_breaker_and_is_idempotent() {
+        let engine = PacingEngine::new(make_test_config());
+        engine.trip_emergency("flag-A");
+        assert!(engine.is_breaker_active());
+        let state1 = engine.current_risk_state();
+        assert_eq!(
+            state1.breaker_tripped,
+            Some(BreakerReason::EmergencyHalt("flag-A".into()))
+        );
+        // Re-tripping (even with a different reason) is a no-op on state.
+        engine.trip_emergency("flag-B");
+        let state2 = engine.current_risk_state();
+        assert_eq!(
+            state2.breaker_tripped,
+            Some(BreakerReason::EmergencyHalt("flag-A".into()))
+        );
+    }
+
+    #[test]
+    fn daily_loss_eth_is_rolling_sum_not_monotonic() {
+        let mut config = make_test_config();
+        config.venue_rotation_count = 0;
+        let engine = PacingEngine::new(config);
+        let gas = Decimal::from_str("0.001").unwrap();
+        for i in 0..2 {
+            let opp = Opportunity {
+                id: format!("loss-{i}"),
+                expected_net_usd: Decimal::from(10),
+                gas_estimate_gwei: 1,
+                venue: "v".into(),
+                eoa: "0x0000".into(),
+                timestamp: Utc::now(),
+            };
+            // Negative realized => losing outcome; gas_spent accumulates in the window.
+            engine.record_outcome(&opp, Decimal::from(-5), gas, false);
+        }
+        let state = engine.current_risk_state();
+        // Both losses are within the live 24h window: 0.001 + 0.001 = 0.002.
+        assert_eq!(state.daily_loss_eth, Decimal::from_str("0.002").unwrap());
     }
 
     proptest! {

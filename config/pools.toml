@@ -4,13 +4,13 @@
 
 [base]
 # Aave V3 Pool Proxy — entry point for all lending operations (supply, borrow, withdraw, repay)
-pool = "0xA238Dd80C259a72e81d7e4666a2CEDEcD3cA5cB"
+pool = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
 
 # Aave V3 PoolDataProvider — read-only view for user account data, reserve data, and liquidation info
 pool_data_provider = "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
 
 # Aave V3 Oracle — returns asset prices used for health factor and liquidation calculations
-oracle = "0x2DaD3A13EF0C636622150F51bA8b404Fd4c56B98c"
+oracle = "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156"
 
 # Wrapped ETH (WETH) — Base canonical WETH used as common collateral asset
 weth = "0x4200000000000000000000000000000000000006"
@@ -23,10 +23,10 @@ usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 pool = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 
 # Aave V3 PoolDataProvider — read-only view for user account data and reserve data
-pool_data_provider = "0x69FA688f1Dc47d4B5d8029D5a35FB7a5480d4d96"
+pool_data_provider = "0x243Aa95cAC2a25651eda86e80bEe66114413c43b"
 
 # Aave V3 Oracle — returns asset prices used for health factor and liquidation calculations
-oracle = "0xb56c2F0B8Be1bd3C6f81A24fe035B91ea9E14711"
+oracle = "0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7"
 
 # Wrapped ETH (WETH) — Arbitrum canonical WETH used as common collateral asset
 weth = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"

@@ -1,181 +1,46 @@
-/*
- * Project Chimera - Flash Loan Executor (Complete Yul Implementation)
- * ==================================================================
- * Aave V3 flash-loan receiver + liquidation engine + DEX swap router.
- * All-or-nothing atomic execution with profit gate. EIP-7702 compatible.
- * Gas optimized for L2 (Cancun). Production ready.
- *
- * Architecture:
- *   1. Aave Pool calls executeOperation() during flashLoanSimple().
- *   2. Executor decodes strategy params from the bytes payload.
- *   3. Atomic steps: (a) liquidationCall, (b) swap collateral -> debt,
- *      (c) approve Pool for repayment, (d) profit gate check.
- *   4. If any step fails, the entire transaction reverts (all-or-nothing).
- *   5. On success, emits Profit event and returns true to Aave.
- *
- * EIP-7702:
- *   When this runtime is attached to an EOA via EIP-7702, address()
- *   returns the EOA address and caller() is the Aave Pool.
- *   Lazy-init: first caller becomes owner (slot 0). Owner manages
- *   pool address (slot 1) via setPool() and can withdraw via withdraw().
- *
- * DEX Routing:
- *   Supports multiple DEX routers by passing the router address in
- *   strategy params. Uses selector-based routing for swap functions.
- *   Currently implements Uniswap-V2-compatible swapExactTokensForTokens.
- *   Extending to V3 or other routers only requires adding a new
- *   selector branch and encoding helper.
- *
- * Storage Layout:
- *   slot 0: owner address (set lazily on first call)
- *   slot 1: aave pool address (set by owner via setPool)
- */
 object "Executor" {
-    // ================================= Constructor =================================
-    // Optionally sets the owner from an appended 32-byte address arg, then
-    // copies runtime bytecode to memory and returns it.
+    // G--G-- Constructor G--G--
+    // Copies runtime bytecode to memory and returns it.
     code {
-        // Constructor: optionally set owner from an appended 32-byte address arg.
-        // Standard CREATE appends ABI-encoded constructor args after the init code.
-        // If a non-zero address is present, slot 0 (owner) is set at construction.
-        // If absent or zero, slot 0 stays 0 and runtime lazy-init applies.
-        let argOffset := add(dataoffset("runtime"), datasize("runtime"))
-        if gt(codesize(), argOffset) {
-            codecopy(0, argOffset, 32)
-            let ownerArg := and(mload(0), 0xffffffffffffffffffffffffffffffffffffffff)
-            if iszero(iszero(ownerArg)) {
-                sstore(0, ownerArg)
-            }
-        }
         datacopy(0, dataoffset("runtime"), datasize("runtime"))
         return(0, datasize("runtime"))
     }
     object "runtime" {
         code {
-            // ==================== SECTION 0: CONSTANTS ====================
-
-            // -- Function selectors --
-            let SEL_EXECUTE_OPERATION := 0x1b11d0ff // executeOperation(address,uint256,uint256,address,bytes)
-            let SEL_EXEC              := 0x55f86501 // exec(bytes)
-            let SEL_OWNER             := 0x8da5cb5b // owner()
-            let SEL_SET_POOL          := 0xa51b62c1 // setPool(address)
-            let SEL_TRANSFER_OWNERSHIP := 0xf2fde38b // transferOwnership(address)
-            let SEL_WITHDRAW          := 0xf3fef3a3 // withdraw(address,uint256)
-
-            // -- Aave / DEX selectors --
-            let SEL_LIQUIDATION_CALL  := 0x00a718a9 // liquidationCall(address,address,address,uint256,bool)
-            let SEL_SWAP_EXACT_TOKENS := 0x38ed1739 // swapExactTokensForTokens(uint256,uint256,address[],address,uint256)
-
-            // -- ERC20 selectors --
+            // G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----G----
+            // SECTION 0: CONSTANT SELECTORS & SIGNATURES
+            // Aave V3 IFlashLoanSimpleReceiver.executeOperation
+            // Signature: executeOperation(address,uint256,uint256,address,bytes)
+            // Computes first 4 bytes of keccak256 hash of the above.
+            // Used by Aave Pool to callback into this contract.
+            let SEL_EXECUTE_OPERATION := 0x1b11d0ff
+            // Direct execution entry for EIP-7702 / manual trigger.
+            // Signature: exec(bytes)
+            let SEL_EXEC := 0x55f86501
+            // Aave V3 Pool.liquidationCall
+            // Signature: liquidationCall(address,address,address,uint256,bool)
+            let SEL_LIQUIDATION_CALL := 0x00a718a9
+            // Uniswap V2 / compatible DEX: swapExactTokensForTokens
+            // Signature: swapExactTokensForTokens(uint256,uint256,address[],address,uint256)
+            let SEL_SWAP_EXACT_TOKENS := 0x38ed1739
+            // ERC20 standard selectors
             let SEL_BALANCE_OF := 0x70a08231 // balanceOf(address)
-            let SEL_APPROVE    := 0x095ea7b3 // approve(address,uint256)
-            let SEL_TRANSFER   := 0xa9059cbb // transfer(address,uint256)
-
-            // -- Event --
+            let SEL_APPROVE      := 0x095ea7b3 // approve(address,uint256)
+            let SEL_TRANSFER     := 0xa9059cbb // transfer(address,uint256)
+            // Event: Profit(uint256 amount)  (non-indexed parameter)
+            // topic0 = keccak256("Profit(uint256)")
             let EVT_PROFIT_TOPIC0 := 0x357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8
-
-            // -- Custom error selectors --
-            let ERR_PROFIT_GATE      := 0x2e5a0d02 // ProfitGateFailed()
-            let ERR_ATOMIC_FAIL      := 0x5fe2e75c // AtomicFail()
-            let ERR_UNAUTHORIZED     := 0x82b42900 // Unauthorized()
-            let ERR_INVALID_ROUTER   := 0x8d4f59a9 // InvalidDexRouter()
-            let ERR_INVALID_POOL     := 0xd0363b78 // InvalidPool()
-            let ERR_WITHDRAW_FAILED  := 0xf1620b3e // WithdrawFailed()
-
-            // ==================== SECTION 0.5: LAZY OWNER INIT ====================
-            // EIP-7702 compat: if slot 0 is zero, store caller() as owner.
-            if iszero(sload(0)) {
-                sstore(0, caller())
-            }
-
-            // ==================== SECTION 1: DISPATCHER ====================
+            // Custom error selectors (4-byte signatures)
+            // Used for clean revert reasons compatible with Solidity try/catch.
+            let ERR_PROFIT_GATE   := 0x2e5a0d02 // ProfitGateFailed()
+            let ERR_ATOMIC_FAIL   := 0x5fe2e75c // AtomicFail()
+            let ERR_UNAUTHORIZED  := 0x82b42900 // Unauthorized()
+            let ERR_INVALID_ROUTER := 0x8d4f59a9 // InvalidDexRouter()
+            // SECTION 1: MAIN CALLDATA DISPATCHER
+            // Extract function selector: highest 4 bytes of calldata.
             let sig := shr(224, calldataload(0))
             switch sig
-
-            // -------------------- CASE: owner() --------------------
-            case 0x8da5cb5b {
-                mstore(0, sload(0))
-                return(0, 32)
-            }
-
-            // -------------------- CASE: setPool(address) --------------------
-            case 0xa51b62c1 {
-                if iszero(eq(caller(), sload(0))) {
-                    mstore(0, shl(224, ERR_UNAUTHORIZED))
-                    revert(0, 4)
-                }
-                let poolAddr := shr(96, shl(96, calldataload(4)))
-                sstore(1, poolAddr)
-                mstore(0, 1)
-                return(0, 32)
-            }
-
-            // -------------------- CASE: transferOwnership(address) --------------------
-            case 0xf2fde38b {
-                // owner-gated
-                if iszero(eq(caller(), sload(0))) {
-                    mstore(0, shl(224, ERR_UNAUTHORIZED))
-                    revert(0, 4)
-                }
-                let newOwner := and(calldataload(4), 0xffffffffffffffffffffffffffffffffffffffff)
-                // Reject zero address (would re-enable lazy-init hijack on next call)
-                if iszero(newOwner) {
-                    mstore(0, shl(224, ERR_UNAUTHORIZED))
-                    revert(0, 4)
-                }
-                sstore(0, newOwner)
-                mstore(0, 1)
-                return(0, 32)
-            }
-
-            // -------------------- CASE: withdraw(address,uint256) --------------------
-            case 0xf3fef3a3 {
-                if iszero(eq(caller(), sload(0))) {
-                    mstore(0, shl(224, ERR_UNAUTHORIZED))
-                    revert(0, 4)
-                }
-                let w_token  := shr(96, shl(96, calldataload(4)))
-                let w_amount := calldataload(36)
-                let w_owner  := sload(0)
-
-                if iszero(w_token) {
-                    // Withdraw native ETH
-                    if iszero(w_amount) { w_amount := selfbalance() }
-                    let w_ok := call(gas(), w_owner, w_amount, 0, 0, 0, 0)
-                    if iszero(w_ok) {
-                        mstore(0, shl(224, ERR_WITHDRAW_FAILED))
-                        revert(0, 4)
-                    }
-                } {
-                    // Withdraw ERC20
-                    if iszero(w_amount) {
-                        mstore(0, shl(224, SEL_BALANCE_OF))
-                        mstore(4, address())
-                        if iszero(staticcall(gas(), w_token, 0, 36, 0, 32)) {
-                            mstore(0, shl(224, ERR_WITHDRAW_FAILED))
-                            revert(0, 4)
-                        }
-                        w_amount := mload(0)
-                    }
-                    mstore(0, shl(224, SEL_TRANSFER))
-                    mstore(4, w_owner)
-                    mstore(36, w_amount)
-                    let w_ok := call(gas(), w_token, 0, 0, 68, 0, 32)
-                    if w_ok {
-                        if returndatasize() {
-                            returndatacopy(0, 0, 32)
-                            if iszero(mload(0)) { w_ok := 0 }
-                        }
-                    }
-                    if iszero(w_ok) {
-                        mstore(0, shl(224, ERR_WITHDRAW_FAILED))
-                        revert(0, 4)
-                    }
-                }
-                stop()
-            }
-
-            // ======================================================================
+            // G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--G--
             // CASE A: Aave V3 Flash Loan Callback (executeOperation)
             // ======================================================================
             case 0x1b11d0ff {
@@ -188,14 +53,7 @@ object "Executor" {
                 //   [0x84:0xA4)  params.offset    (uint256, relative to 0x04)
                 //   [0xA4:0xC4)  params.length    (uint256, at offset=params.offset+0x04)
                 //   [0xC4:...)   params data      (StrategyParams tightly packed)
-
-                // -- Pool validation: caller must be the configured pool --
-                if iszero(eq(caller(), sload(1))) {
-                    mstore(0, shl(224, ERR_INVALID_POOL))
-                    revert(0, 4)
-                }
-
-                // -- Decode fixed arguments --
+                // G--G-- Decode fixed arguments G--G--
                 let asset     := calldataload(4)
                 let amount    := calldataload(36)
                 let premium   := calldataload(68)
@@ -205,14 +63,12 @@ object "Executor" {
                 let paramsOffset    := add(calldataload(132), 4)
                 let paramsLen       := calldataload(paramsOffset)
                 let paramsDataStart := add(paramsOffset, 32)
-
-                // -- Validate params length --
+                // G--G-- Validate params length G--G--
                 // StrategyParams: 9 * 32 = 288 bytes.
                 if lt(paramsLen, 288) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
-
-                // -- Decode StrategyParams --
+                // G--G-- Decode StrategyParams G--G--
                 //   [0x00:0x20)  collateralAsset   (address, left-padded)
                 //   [0x20:0x40)  userToLiquidate   (address, left-padded)
                 //   [0x40:0x60)  debtToCover       (uint256)
@@ -231,12 +87,10 @@ object "Executor" {
                 let minProfit       := calldataload(add(paramsDataStart, 192))
                 let tip             := calldataload(add(paramsDataStart, 224))
                 let deadline        := calldataload(add(paramsDataStart, 256))
-
-                // -- Record pre-flight balance of debt token --
+                // G--G-- Record pre-flight balance of debt token G--G--
                 let self := address()
                 let balanceBefore := callBalanceOf(asset, self)
-
-                // -- Step 1: LIQUIDATION --
+                // G--G-- Step 1: LIQUIDATION G--G--
                 // Approve Aave Pool to pull debtToCover of the debt asset.
                 let pool := caller()
                 if iszero(callApprove(asset, pool, debtToCover)) {
@@ -246,8 +100,7 @@ object "Executor" {
                 if iszero(callLiquidation(pool, collateralAsset, asset, userToLiquidate, debtToCover, receiveAToken)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
-
-                // -- Step 2: DEX SWAP --
+                // G--G-- Step 2: DEX SWAP G--G--
                 // Swap seized collateral back into the debt token.
                 // Skip if collateral is already the debt token.
                 if iszero(eq(collateralAsset, asset)) {
@@ -262,15 +115,16 @@ object "Executor" {
                         revertWithError(ERR_ATOMIC_FAIL)
                     }
                 }
-
-                // -- Step 3: REPAY FLASH LOAN --
+                // G--G-- Step 3: REPAY FLASH LOAN G--G--
                 // Approve Aave Pool to pull back flash-loaned amount + premium.
                 let repayAmt := add(amount, premium)
                 if iszero(callApprove(asset, pool, repayAmt)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
-
-                // -- Step 4: PROFIT GATE (with overflow protection) --
+                // G--G-- Step 4: PROFIT GATE G--G--
+                // Ensure the strategy was profitable after covering all costs.
+                // Profit check: balanceAfter > balanceBefore + minProfit + tip.
+                // minProfit should be set off-chain to cover gas, slippage, etc.
                 let balanceAfter := callBalanceOf(asset, self)
                 let _sum1 := add(balanceBefore, minProfit)
                 if lt(_sum1, balanceBefore) {
@@ -283,13 +137,12 @@ object "Executor" {
                 if iszero(gt(balanceAfter, requiredBalance)) {
                     revertWithError(ERR_PROFIT_GATE)
                 }
-
-                // -- Step 5: EMIT PROFIT EVENT --
+                // G--G-- Step 5: EMIT PROFIT EVENT G--G--
                 let profit := sub(balanceAfter, balanceBefore)
                 mstore(0, profit)
                 log1(0, 32, EVT_PROFIT_TOPIC0)
-
-                // -- Step 6: RETURN TRUE TO AAVE --
+                // G--G-- Step 6: RETURN TRUE TO AAVE G--G--
+                // Aave Pool expects a bool return value.
                 mstore(0, 1)
                 return(0, 32)
             }
@@ -344,16 +197,14 @@ object "Executor" {
 
                 let self := address()
                 let balanceBefore := callBalanceOf(d_asset, self)
-
-                // -- Liquidation --
+                // G--G-- Liquidation G--G--
                 if iszero(callApprove(d_asset, d_pool, d_debtToCover)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
                 if iszero(callLiquidation(d_pool, d_collateral, d_asset, d_user, d_debtToCover, d_receiveAToken)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
-
-                // -- Swap --
+                // G--G-- Swap G--G--
                 if iszero(eq(d_collateral, d_asset)) {
                     if iszero(d_dexRouter) {
                         revertWithError(ERR_INVALID_ROUTER)
@@ -366,8 +217,7 @@ object "Executor" {
                         revertWithError(ERR_ATOMIC_FAIL)
                     }
                 }
-
-                // -- Profit Gate (with overflow protection) --
+                // G--G-- Profit Gate G--G--
                 let balanceAfter := callBalanceOf(d_asset, self)
                 let _sum1 := add(balanceBefore, d_minProfit)
                 if lt(_sum1, balanceBefore) {
@@ -380,8 +230,7 @@ object "Executor" {
                 if iszero(gt(balanceAfter, required)) {
                     revertWithError(ERR_PROFIT_GATE)
                 }
-
-                // -- Emit Profit Event --
+                // G--G-- Emit Profit Event G--G--
                 let profit := sub(balanceAfter, balanceBefore)
                 mstore(0, profit)
                 log1(0, 32, EVT_PROFIT_TOPIC0)
@@ -393,10 +242,8 @@ object "Executor" {
                 mstore(0, shl(224, ERR_UNAUTHORIZED))
                 revert(0, 4)
             }
-
-            // ==================== SECTION 2: INTERNAL HELPERS ====================
-
-            // -- callBalanceOf --
+            // SECTION 2: INTERNAL HELPER FUNCTIONS
+            // G--G-- callBalanceOf G--G--
             // Queries ERC20 balanceOf for a given token and account.
             // Uses staticcall (read-only). Reverts on failure.
             function callBalanceOf(token, account) -> bal {
@@ -407,8 +254,7 @@ object "Executor" {
                 }
                 bal := mload(0)
             }
-
-            // -- callApprove --
+            // G--G-- callApprove G--G--
             // Calls ERC20 approve. Handles tokens that return nothing (e.g. USDT)
             // or return bool. Returns true only if the call succeeded AND
             // the return data (if any) is true.
@@ -422,12 +268,11 @@ object "Executor" {
                         returndatacopy(0, 0, 32)
                         if iszero(mload(0)) {
                             success := 0
-                        }
-                    }
-                }
+        }
+    }
+}
             }
-
-            // -- callLiquidation --
+            // G--G-- callLiquidation G--G--
             // Calls Aave V3 Pool.liquidationCall.
             function callLiquidation(pool, collateralAsset, debtAsset, user, debtToCover, receiveAToken) -> success {
                 mstore(0, shl(224, 0x00a718a9))
@@ -438,8 +283,7 @@ object "Executor" {
                 mstore(132, receiveAToken)
                 success := call(gas(), pool, 0, 0, 164, 0, 0)
             }
-
-            // -- callSwapExactTokens --
+            // G--G-- callSwapExactTokens G--G--
             // Calls Uniswap V2 compatible swapExactTokensForTokens with a 2-hop path.
             // Builds the ABI-encoded calldata in scratch memory and executes the call.
             function callSwapExactTokens(router, amountIn, amountOutMin, tokenIn, tokenOut, to, deadline) -> success {
@@ -453,19 +297,21 @@ object "Executor" {
                 //   [0xA4:0xC4)  path.length (= 2)
                 //   [0xC4:0xE4)  path[0] (tokenIn)
                 //   [0xE4:0x104) path[1] (tokenOut)
-                mstore(0, shl(224, 0x38ed1739))
+                // path offset = 0xA0 = 160 (bytes from 0x04 to 0xA4)
+                // G-- Write fixed parameters G--
+                mstore(0, shl(224, 0x38ed1739)) // SEL_SWAP_EXACT_TOKENS
                 mstore(4, amountIn)
                 mstore(36, amountOutMin)
                 mstore(68, 160)
                 mstore(100, to)
                 mstore(132, deadline)
-                mstore(164, 2)
+                // G-- Write dynamic path array G--
+                mstore(164, 2)           // path.length
                 mstore(196, tokenIn)
                 mstore(228, tokenOut)
                 success := call(gas(), router, 0, 0, 260, 0, 0)
             }
-
-            // -- revertWithError --
+            // G--G-- revertWithError G--G--
             // Reverts with a 4-byte custom error selector.
             function revertWithError(selector) {
                 mstore(0, shl(224, selector))

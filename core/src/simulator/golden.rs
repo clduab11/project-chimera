@@ -105,9 +105,8 @@ mod tests {
 
     #[test]
     fn golden_replays_parse() {
-        let path = find_golden_replays_path();
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("golden_replays.json not found at {}: {e}", path.display()));
+        let raw = std::fs::read_to_string("tests/fixtures/golden_replays.json")
+            .unwrap_or_else(|e| panic!("golden_replays.json not found: {e}"));
         let fixtures: Vec<HistoricalLiquidation> = serde_json::from_str(&raw)
             .expect("golden_replays.json must deserialize into Vec<HistoricalLiquidation>");
         assert!(fixtures.len() >= 2, "Need at least 2 replay fixtures");
@@ -119,8 +118,7 @@ mod tests {
 
     #[test]
     fn golden_replays_have_verified_source_fields() {
-        let path = find_golden_replays_path();
-        let raw = std::fs::read_to_string(&path).unwrap();
+        let raw = std::fs::read_to_string("tests/fixtures/golden_replays.json").unwrap();
         let fixtures: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
         for f in &fixtures {
             assert!(f.get("_verified").is_some(), "Missing _verified field");

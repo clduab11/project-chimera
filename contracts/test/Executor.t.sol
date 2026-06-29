@@ -211,4 +211,43 @@ contract ExecutorTest is Test {
         }
         assertTrue(foundProfit, "Profit event should be emitted on direct exec");
     }
+
+    function testExecutorStructuralIntegrity() public {
+        string memory path = string.concat(vm.projectRoot(), "/out/Executor.yul/Executor.json");
+        string memory json = vm.readFile(path);
+        bytes memory runtimeCode = vm.parseJsonBytes(json, ".deployedBytecode.object");
+
+        assertGt(runtimeCode.length, 0, "runtime bytecode must be non-empty");
+        assertGt(runtimeCode.length, 100, "runtime bytecode suspiciously short");
+
+        bytes4[2] memory requiredSelectors = [SEL_EXECUTE_OPERATION, SEL_EXEC];
+        for (uint256 i = 0; i < requiredSelectors.length; i++) {
+            bool found = false;
+            bytes4 sel = requiredSelectors[i];
+            for (uint256 j = 0; j + 4 <= runtimeCode.length; j++) {
+                bytes4 candidate;
+                assembly {
+                    candidate := mload(add(add(runtimeCode, 0x20), j))
+                }
+                if (candidate == sel) {
+                    found = true;
+                    break;
+                }
+            }
+            assertTrue(found, "runtime bytecode must contain required selector");
+        }
+
+        assertGt(executor.code.length, 0, "deployed contract must have code");
+    }
+}
+                if (candidate == sel) {
+                    found = true;
+                    break;
+                }
+            }
+            assertTrue(found, "runtime bytecode must contain required selector");
+        }
+
+        assertGt(executor.code.length, 0, "deployed contract must have code");
+    }
 }

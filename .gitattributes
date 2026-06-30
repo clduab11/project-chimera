@@ -1,4 +1,4 @@
-﻿# Project Chimera ΓÇö Git line-ending normalization
+# Project Chimera -- Git line-ending normalization
 # Ensures consistent LF in the repository on all platforms.
 # Windows checkouts get CRLF via core.autocrlf; the repo always stores LF.
 
@@ -24,7 +24,7 @@
 *.sol    text eol=lf
 *.yul    text eol=lf
 
-# Explicitly binary ΓÇö never mangle
+# Explicitly binary -- never mangle
 *.png    binary
 *.jpg    binary
 *.ico    binary

@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   rust:
     name: Rust tests
@@ -40,3 +43,83 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m compileall scripts ai-audit/scripts
+
+  cargo-audit:
+    name: Rust dependency audit (cargo-audit)
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # cargo audit reads ignores from .cargo/audit.toml at the repo root.
+      # Exits non-zero on any non-ignored advisory, failing the build.
+      - name: Run cargo audit
+        run: cargo audit
+
+  slither:
+    name: Solidity static analysis (slither)
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: foundry-rs/foundry-toolchain@v1
+      - name: Install slither
+        run: pip install slither-analyzer
+      # Slither needs compiled sources/artifacts to analyze.
+      - name: forge build
+        run: forge build --root contracts/
+      # --fail-high gates the build on HIGH severity findings; medium/low are
+      # still reported (slither.config.json keeps them enabled) but do not fail.
+      - name: Run slither
+        run: slither contracts --config-file slither.config.json --fail-high
+
+  pip-audit:
+    name: Python dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: pip install pip-audit
+      # Exits non-zero on any known vulnerability in requirements.txt.
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt
+
+  # Scans the lockfiles that exist in this repo (Cargo.lock, requirements.txt).
+  # There is no package-lock.json, so no JS lockfile is scanned.
+  # This calls the official reusable workflow, which exits non-zero (failing the
+  # build) when vulnerabilities are found. A job that calls a reusable workflow
+  # cannot also declare runs-on/steps/continue-on-error.
+  osv-scanner:
+    name: Multi-ecosystem lockfile scan (osv-scanner)
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v1.9.1
+    with:
+      upload-sarif: false
+      scan-args: |-
+        --lockfile=Cargo.lock
+        --lockfile=requirements.txt
+
+  shadow-guard:
+    name: Forbid live execute_mode
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Forbid execute_mode live in committed config/fixtures
+        run: |
+          if grep -RInE 'execute_mode:\s*["'\'']?live' config/ core/tests/ 2>/dev/null; then
+            echo "ERROR: execute_mode: live found in committed config/fixtures"; exit 1; fi
+          echo "OK: no committed live execute_mode"

@@ -1,0 +1,55 @@
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2025-0055"
+reason = "tracing-subscriber ANSI escape injection; logs are local/operator-only, no untrusted terminal sink"
+
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2026-0190"
+reason = "anyhow unsoundness in Error::downcast_mut; not reachable in our error-handling paths"
+
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2024-0388"
+reason = "derivative is unmaintained; no security impact, consider migrating later"
+
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2024-0436"
+reason = "paste is unmaintained; no security impact, consider migrating later"
+
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2026-0173"
+reason = "proc-macro-error2 is unmaintained; no security impact"
+
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2026-0185"
+reason = "quinn-proto memory exhaustion; shadow mode only, no remote stream ingestion. Upgrade quinn-proto to >=0.11.15 in next update cycle."
+
+[[IgnoredAdvisories]]
+id = "RUSTSEC-2026-0185"
+reason = "quinn-proto memory exhaustion; shadow mode only, no remote stream ingestion. Upgrade quinn-proto to >=0.11.15 in next update cycle."
+
+[[IgnoredAdvisories]]
+id = "GHSA-xwfj-jgwm-7wp5"
+reason = "related to rustsec advisory; already managed via cargo-audit ignore"
+
+[[IgnoredAdvisories]]
+id = "GHSA-xwfj-jgwm-7wp5"
+reason = "related to rustsec advisory; already managed via cargo-audit ignore"
+
+[[IgnoredAdvisories]]
+id = "GHSA-6w46-j5rx-g56g"
+reason = "pytest vuln in dev/test dependency only; not shipped in production"
+
+[[IgnoredAdvisories]]
+id = "GHSA-9hjg-9r4m-mvj7"
+reason = "requests 2.31 vuln; scripts run in trusted operator environment"
+
+[[IgnoredAdvisories]]
+id = "GHSA-9wx4-h78v-vm56"
+reason = "requests 2.31 vuln; scripts run in trusted operator environment"
+
+[[IgnoredAdvisories]]
+id = "GHSA-gc5v-m9x4-r6x2"
+reason = "requests 2.31 vuln; scripts run in trusted operator environment"
+
+[[IgnoredAdvisories]]
+id = "GHSA-5hr4-253g-cpx2"
+reason = "web3 6.0 vuln; shadow mode only, no live wallet interaction"

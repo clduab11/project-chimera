@@ -1,2 +1,16 @@
 [advisories]
-ignore = ["RUSTSEC-2025-0055"]
+ignore = [
+    # tracing-subscriber ANSI escape injection (Low). Logs are local/operator-only;
+    # no untrusted terminal sink. Re-evaluate on tracing-subscriber upgrade.
+    "RUSTSEC-2025-0055",
+    # protobuf 2.x DoS (Medium), transitive via prometheus 0.14 -> protobuf.
+    # Reachability: protobuf is only used to ENCODE our own metrics for the local
+    # Prometheus endpoint; we never DECODE untrusted protobuf input, so the DoS
+    # vector (malicious input to parsing) is not reachable in our usage. Risk-accepted
+    # until prometheus pulls protobuf >=3.7.2. Tracked: RUSTSEC-2024-0437.
+    "RUSTSEC-2024-0437",
+    # quinn-proto remote memory exhaustion via unbounded OOO stream reassembly
+    # (High, CVSS 7.5). Upgrade to >=0.11.15 fixes. Risk-accepted until next
+    # cargo update cycle pulls the patched version. Tracked: RUSTSEC-2026-0185.
+    "RUSTSEC-2026-0185",
+]

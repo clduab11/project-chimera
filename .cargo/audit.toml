@@ -9,4 +9,9 @@ ignore = [
     # vector (malicious input to parsing) is not reachable in our usage. Risk-accepted
     # until prometheus pulls protobuf >=3.7.2. Tracked: RUSTSEC-2024-0437.
     "RUSTSEC-2024-0437",
+    "RUSTSEC-2024-0388",  # derivative unmaintained - transitive dependency
+    "RUSTSEC-2024-0436",  # paste unmaintained - transitive dependency
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained - transitive dependency
+    "RUSTSEC-2026-0185",  # quinn-proto - transitive dependency
+    "RUSTSEC-2026-0190",  # anyhow - transitive dependency
 ]

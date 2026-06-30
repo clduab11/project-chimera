@@ -260,15 +260,5 @@ contract ExecutorTest is Test {
 
         assertGt(executor.code.length, 0, "deployed contract must have code");
     }
-}
-                if (candidate == sel) {
-                    found = true;
-                    break;
-                }
-            }
-            assertTrue(found, "runtime bytecode must contain required selector");
-        }
 
-        assertGt(executor.code.length, 0, "deployed contract must have code");
-    }
 }

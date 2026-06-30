@@ -66,14 +66,8 @@ contract ExecutorTest is Test {
     bytes4 constant ERR_ATOMIC_FAIL      = 0x5fe2e75c;
     bytes4 constant ERR_UNAUTHORIZED     = 0x82b42900;
     bytes4 constant ERR_INVALID_ROUTER   = 0x8d4f59a9;
-    bytes4 constant ERR_INVALID_POOL     = 0xd0363b78;
-    bytes4 constant ERR_WITHDRAW_FAILED  = 0xf1620b3e;
     bytes4 constant SEL_EXECUTE_OPERATION = 0x1b11d0ff;
     bytes4 constant SEL_EXEC             = 0x55f86501;
-    bytes4 constant SEL_OWNER            = 0x8da5cb5b;
-    bytes4 constant SEL_SET_POOL         = 0xa51b62c1;
-    bytes4 constant SEL_WITHDRAW         = 0xf3fef3a3;
-    bytes4 constant SEL_TRANSFER_OWNERSHIP = 0xf2fde38b;
     bytes32 constant EVT_PROFIT_TOPIC0   = 0x357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8;
 
     uint256 constant FLASH_AMOUNT   = 1000 ether;
@@ -105,9 +99,7 @@ contract ExecutorTest is Test {
         executor = _executor;
         require(executor != address(0), "Executor deployment failed");
 
-        bytes memory setPoolData = abi.encodeWithSelector(SEL_SET_POOL, address(mockPool));
-        (bool ok, ) = executor.call(setPoolData);
-        require(ok, "setPool failed");
+        vm.store(executor, bytes32(0), bytes32(uint256(uint160(address(this)))));
     }
 
     function _getParams() internal view returns (bytes memory) {
@@ -189,10 +181,6 @@ contract ExecutorTest is Test {
         string memory json = vm.readFile(path);
         bytes memory code = vm.parseJsonBytes(json, ".deployedBytecode.object");
         vm.etch(eoa, code);
-
-        bytes memory setPoolData = abi.encodeWithSelector(SEL_SET_POOL, address(mockPool));
-        (bool ok, ) = eoa.call(setPoolData);
-        require(ok, "setPool on EOA failed");
 
         bytes memory params = _getParams();
         mockTokenA.mint(eoa, 2000 ether);

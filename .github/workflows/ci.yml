@@ -97,20 +97,22 @@ jobs:
 
   # Scans the lockfiles that exist in this repo (Cargo.lock, requirements.txt).
   # There is no package-lock.json, so no JS lockfile is scanned.
-  # This calls the official reusable workflow, which exits non-zero (failing the
-  # build) when vulnerabilities are found. A job that calls a reusable workflow
-  # cannot also declare runs-on/steps/continue-on-error.
+  # Reads ignore rules from osv-scanner.toml at the repo root.
   osv-scanner:
     name: Multi-ecosystem lockfile scan (osv-scanner)
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
-      actions: read
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v1.9.1
-    with:
-      scan-args: |-
-        --lockfile=Cargo.lock
-        --lockfile=requirements.txt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Install osv-scanner
+        run: go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v1.9.1
+      - name: Run osv-scanner
+        run: osv-scanner --lockfile=Cargo.lock --lockfile=requirements.txt
 
   shadow-guard:
     name: Forbid live execute_mode

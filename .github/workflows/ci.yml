@@ -72,13 +72,22 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
       - name: Install slither
         run: pip install slither-analyzer
-      # Slither needs compiled sources/artifacts to analyze.
+      - name: Exclude Yul sources for slither compatibility
+        run: |
+          mkdir -p /tmp/yul-backup
+          find contracts/src -name '*.yul' -exec mv {} /tmp/yul-backup/ \;
       - name: forge build
         run: forge build --root contracts/
-      # --fail-high gates the build on HIGH severity findings; medium/low are
-      # still reported (slither.config.json keeps them enabled) but do not fail.
       - name: Run slither
         run: slither contracts --config-file slither.config.json --fail-high
+      - name: Restore Yul sources
+        if: always()
+        run: |
+          find /tmp/yul-backup -name '*.yul' -exec mv {} contracts/src/ \; 2>/dev/null || true
+      - name: Restore Yul sources
+        if: always()
+        run: |
+          find /tmp/yul-backup -name '*.yul' -exec mv {} contracts/src/ \; 2>/dev/null || true
 
   pip-audit:
     name: Python dependency audit (pip-audit)
@@ -110,7 +119,7 @@ jobs:
         with:
           go-version: "1.22"
       - name: Install osv-scanner
-        run: go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v1.9.1
+        run: go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.1
       - name: Run osv-scanner
         run: osv-scanner --lockfile=Cargo.lock --lockfile=requirements.txt
 

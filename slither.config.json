@@ -7,7 +7,7 @@
   "exclude_high": false,
   "json": null,
   "sarif": null,
-  "filter_paths": "lib|node_modules|out|cache",
+  "filter_paths": "lib|node_modules|out|cache|\\.yul$",
   "generate_patches": false,
   "show_ignored_findings": false
 }

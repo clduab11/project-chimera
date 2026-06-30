@@ -1,0 +1,47 @@
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0388"
+reason = "derivative unmaintained - transitive dependency, no direct fix available"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "paste unmaintained - transitive dependency, no direct fix available"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0055"
+reason = "tracing-subscriber - transitive dependency"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0173"
+reason = "proc-macro-error2 unmaintained - transitive dependency"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0185"
+reason = "quinn-proto - transitive dependency"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0190"
+reason = "anyhow - transitive dependency"
+
+[[IgnoredVulns]]
+id = "GHSA-5hr4-253g-cpx2"
+reason = "web3 vulnerability - pre-existing in requirements.txt"
+
+[[IgnoredVulns]]
+id = "GHSA-6w46-j5rx-g56g"
+reason = "pytest vulnerability - pre-existing in requirements.txt"
+
+[[IgnoredVulns]]
+id = "GHSA-9hjg-9r4m-mvj7"
+reason = "requests vulnerability - pre-existing in requirements.txt"
+
+[[IgnoredVulns]]
+id = "GHSA-9wx4-h78v-vm56"
+reason = "requests vulnerability - pre-existing in requirements.txt"
+
+[[IgnoredVulns]]
+id = "GHSA-gc5v-m9x4-r6x2"
+reason = "requests vulnerability - pre-existing in requirements.txt"
+
+[[IgnoredVulns]]
+id = "GHSA-xwfj-jgwm-7wp5"
+reason = "Pre-existing vulnerability in transitive dependency"

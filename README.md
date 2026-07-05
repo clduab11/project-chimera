@@ -24,6 +24,7 @@ All documentation files in the repository, with brief descriptions:
 | [docs/runbook-keystore-multisig-go-live.md](docs/runbook-keystore-multisig-go-live.md) | Keystore and multisig go-live runbook |
 | [docs/runbook-testnet-deploy.md](docs/runbook-testnet-deploy.md) | Testnet deployment runbook |
 | [docs/testing-strategy-liquidations.md](docs/testing-strategy-liquidations.md) | Test pyramid: unit, integration, proptest, golden replay, Foundry fork tests |
+| [docs/subagent-testing-routines.md](docs/subagent-testing-routines.md) | Claude Code subagent lanes (`.claude/agents/`) and the `test-suite` orchestration workflow |
 | [docs/security-research.md](docs/security-research.md) | CVE/advisory workflow and curated Aave/Solidity/Slither references |
 | [docs/research/aave-v3-liquidation-compendium.md](docs/research/aave-v3-liquidation-compendium.md) | Aave V3 liquidation logic source map and regression scenarios |
 | [docs/research/dependency-cve-triage.md](docs/research/dependency-cve-triage.md) | CVE triage for pinned dependencies |

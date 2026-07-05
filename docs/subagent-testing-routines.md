@@ -8,7 +8,7 @@ that run the full test surface in parallel and triage failures. They live in
 
 | Routine | Lane | What it runs |
 |---------|------|--------------|
-| `.claude/agents/rust-test-runner.md` | rust | `cargo fmt --check`, `cargo clippy -p chimera-core --all-targets -- -D warnings`, `cargo test -p chimera-core` (unit + integration suites in `core/tests/` + proptest + golden replays) |
+| `.claude/agents/rust-test-runner.md` | rust | `cargo fmt --check` (advisory — repo has no rustfmt contract), `cargo clippy -p chimera-core --all-targets -- -D warnings`, `cargo test -p chimera-core` (unit + integration suites in `core/tests/` + proptest + golden replays) |
 | `.claude/agents/python-test-runner.md` | python | `python3 -m compileall scripts ai-audit/scripts`, `python3 -m pytest tests/ -v` |
 | `.claude/agents/contract-test-runner.md` | contracts | `forge build` + `forge test --root contracts/ -vvv`; reports SKIPPED with workstation instructions when Foundry is absent |
 | `.claude/agents/guardrail-checker.md` | guardrails | shadow-guard grep (no committed `execute_mode: live`), pacing-cap sanity vs `pacing_canonical.yaml`, snapshot-schema sync with `core/src/simulator/prewarm.rs`, no-secrets scan |

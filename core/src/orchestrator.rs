@@ -1,7 +1,7 @@
 //! Continuous detection → simulation → execution orchestrator loop.
 
 use crate::{
-    check_eoa_gas_sufficient, BuiltTransaction, ChimeraError, CrossProcessPacing,
+    check_eoa_gas_sufficient, ChimeraError, CrossProcessPacing,
     LiquidationCandidate, LiquidationDetector, LiquidationSimulator, MarketSnapshot,
     MempoolWatcher, Metrics, Opportunity, PacingConfig, PacingDecision, ResolvedV2Route,
     RoutingResolver, RpcSubmitter, SignerRegistry, StrategyAssembler, TransactionExecutor,
@@ -11,7 +11,7 @@ use hex;
 use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use rust_decimal::prelude::ToPrimitive;
@@ -73,12 +73,18 @@ pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
     aave_pool: Address,
     routing_config: RoutingConfig,
     risk_config: RiskConfig,
+    // Not yet read: live submissions pin nonces via signer_registry; retained
+    // for the deferred multi-worker EOA rotation (T7).
+    #[allow(dead_code)]
     signer_address: Option<Address>,
     signer_registry: Arc<SignerRegistry>,
     mempool_watcher: Option<Arc<dyn MempoolWatcher>>,
     mock_gas_price_wei: Option<u128>,
-    mock_sim_fn: Option<Arc<dyn Fn(&crate::LiquidationCandidate) -> crate::SimulationResult + Send + Sync>>,
+    mock_sim_fn: Option<MockSimFn>,
 }
+
+/// Test-only simulation override injected via [`Orchestrator::set_mock_sim_fn`].
+type MockSimFn = Arc<dyn Fn(&crate::LiquidationCandidate) -> crate::SimulationResult + Send + Sync>;
 
 impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
     #[allow(clippy::too_many_arguments)]
@@ -580,6 +586,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
     /// Live broadcast path. Only reached when `execute_mode == "live"`, pacing allowed
     /// and the simulation was profitable. Builds the flashLoanSimple transaction via
     /// [`StrategyAssembler::build_transaction`] and submits it instead of legacy calldata.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_live(
         &self,
         opp: &Opportunity,
@@ -683,7 +690,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             let local_nonce = worker_signer.next_nonce();
             tx.nonce = local_nonce;
 
-            let mut alloy_tx = TxEip1559 {
+            let alloy_tx = TxEip1559 {
                 chain_id: self.chain_id,
                 nonce: tx.nonce,
                 max_fee_per_gas: tx.max_fee_per_gas,

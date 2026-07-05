@@ -151,6 +151,7 @@ impl StrategyAssembler {
     ///
     /// In addition to the fields set by [`build_strategy_params`], this populates
     /// words 6–8 (min_profit, tip, deadline) from caller-provided values.
+    #[allow(clippy::too_many_arguments)]
     fn build_strategy_params_full(
         collateral: Address,
         user: Address,
@@ -482,6 +483,7 @@ mod tests {
             collateral, user, debt_to_cover, false,
             TEST_DEBT, min_profit, tip, deadline, 1,
         );
+        assert_eq!(tx.to, aave_pool, "live tx must target the Aave pool");
 
         // Build expected params and verify min_profit at word 6 (offset 192)
         let params = StrategyAssembler::build_strategy_params_full(
@@ -490,6 +492,10 @@ mod tests {
             min_profit, tip, deadline,
         );
         let encoded = params.encode();
+        assert!(
+            tx.data.windows(encoded.len()).any(|w| w == &encoded[..]),
+            "tx calldata must embed the live StrategyParams payload"
+        );
 
         let mut mp_buf = [0u8; 32];
         mp_buf.copy_from_slice(&encoded[192..224]);
@@ -531,7 +537,6 @@ mod tests {
 
     #[test]
     fn test_rust_params_match_executor_yul_offsets() {
-        let route = sample_route();
 
         let collateral = address!("0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B");
         let user       = address!("0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE");

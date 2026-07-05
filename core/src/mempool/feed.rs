@@ -96,7 +96,6 @@ impl MempoolWatcher for SequencerFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mempool::watcher::MempoolWatcher;
 
     /// A trivial test feed that always returns a synthetic event.
     async fn test_feed() -> Result<WatchEvent, ChimeraError> {

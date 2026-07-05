@@ -6,7 +6,7 @@ use tokio::fs;
 use tokio::fs::File;
 use tracing::{info, warn};
 
-use crate::state::{CrashRecovery, OutcomeRecord, RecoveredState, StatePersistence};
+use crate::state::{OutcomeRecord, StatePersistence};
 use crate::ChimeraError;
 
 /// JSONL-backed persistence with configurable rotation.
@@ -214,7 +214,6 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use std::path::PathBuf;
 
     fn make_test_record(id: &str, net: f64, reverted: bool) -> OutcomeRecord {
         OutcomeRecord {

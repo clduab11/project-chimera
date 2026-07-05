@@ -30,6 +30,7 @@ All documentation files in the repository, with brief descriptions:
 | [docs/research/dependency-cve-triage.md](docs/research/dependency-cve-triage.md) | CVE triage for pinned dependencies |
 | [docs/gate-report-2026-06-16.md](docs/gate-report-2026-06-16.md) | Validation gate run record |
 | [docs/gate-report-2026-06-16-t2.md](docs/gate-report-2026-06-16-t2.md) | Validation gate run record (t2) |
+| [docs/gate-report-2026-07-05.md](docs/gate-report-2026-07-05.md) | Subagent test-suite run record: Rust/Python/guardrail gates pass, clippy + shadow_e2e fixes |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and validation gate instructions (new in 0.1.4) |
 | [SECURITY.md](SECURITY.md) | Vulnerability reporting and security model (new in 0.1.4) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history in Keep a Changelog format |

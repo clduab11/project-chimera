@@ -723,11 +723,11 @@ impl CrossProcessPacing {
         for entry in entries {
             let entry = entry.map_err(ChimeraError::Io)?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "jsonl")
+            if path.extension().is_some_and(|e| e == "jsonl")
                 && path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with("reservations-"))
+                    .is_some_and(|n| n.starts_with("reservations-"))
             {
                 let mut records = Self::load_reservations(&path)?;
                 all.append(&mut records);
@@ -805,7 +805,7 @@ impl CrossProcessPacing {
         (daily, weekly)
     }
 
-    fn expire_stale_in_place(records: &mut Vec<ReservationRecord>, now: DateTime<Utc>) -> usize {
+    fn expire_stale_in_place(records: &mut [ReservationRecord], now: DateTime<Utc>) -> usize {
         let mut expired = 0;
         for r in records.iter_mut() {
             if r.status == ReservationStatus::Reserved && now >= r.expires_at {

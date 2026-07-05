@@ -32,7 +32,7 @@ use chimera_core::{
         LiquidationDetector, MarketSnapshot, ReserveData, UserPosition,
     },
     routing::RoutingResolver,
-    state::{ReservationRecord, ReservationStatus},
+    state::{CrashRecovery, ReservationRecord, ReservationStatus},
     BreakerReason, CrossProcessPacing, JsonlPersistence, Metrics, Opportunity,
     Orchestrator, OrchestratorConfig, PacingDecision, PacingEngine, RpcSubmitter,
     SimulationResult, SignerRegistry, StrategyAssembler,
@@ -401,6 +401,13 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
     // (error code 5: Access denied). On non-Windows platforms, verify full roundtrip.
     #[cfg(not(target_os = "windows"))]
     {
+        // The outcome append is a fire-and-forget spawned task by design
+        // (PacingEngine::record_outcome must not block the scan hot path),
+        // so allow it a bounded window to land before asserting durability.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !outcomes_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(
             outcomes_path.exists(),
             "outcomes.jsonl must exist after orchestration"

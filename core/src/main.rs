@@ -31,7 +31,7 @@ use chimera_core::{
     start_metrics_server, AaveOracle, BlockWatch, ChainlinkOracle, CrossProcessPacing,
     JsonlPersistence, L2ChainType, LiquidationSimulator, MarketSnapshot, MempoolWatcher, Metrics,
     Orchestrator, OrchestratorConfig, PacingConfig, PacingEngine, PriceOracle, RiskConfig,
-    RoutingConfig, RpcSubmitter, SequencerFeed, SignerRegistry, SweepScheduler, WatchEvent,
+    RoutingConfig, RpcSubmitter, SequencerFeed, SignerRegistry, SweepScheduler,
 };
 
 /// Persistent execute-mode state used to enforce the shadow→live transition rule.
@@ -53,6 +53,9 @@ fn default_previous_mode() -> String {
 struct AaveAddresses {
     pool: Address,
     oracle: Address,
+    /// Not yet read at runtime; kept as the canonical per-chain record
+    /// alongside pool/oracle.
+    #[allow(dead_code)]
     pool_data_provider: Address,
     /// Canonical WETH — used as the simulator's ETH oracle asset.
     weth: Address,
@@ -254,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Monomorphized once per concrete `P`, so the wallet-backed and read-only providers
 /// (which have different concrete types) both flow through here without trait objects.
+#[allow(clippy::too_many_arguments)]
 async fn run_with_provider<P>(
     provider: Arc<P>,
     pacing_cfg: PacingConfig,
@@ -343,7 +347,7 @@ where
     if execute_mode == "live" {
         if let Some(ref sa) = signer_address {
             if let Some(pool_eoa) = pacing_engine.select_next_eoa() {
-                if pool_eoa.parse::<Address>().map_or(true, |a| a != *sa) {
+                if pool_eoa.parse::<Address>() != Ok(*sa) {
                     warn!(
                         target = "chimera::main",
                         signer = %sa,

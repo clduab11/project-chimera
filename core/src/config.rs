@@ -599,6 +599,7 @@ impl StrategyParams {
 
 /// A single DEX/liquidity venue entry.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Default)]
 pub struct VenueEntry {
     pub name: String,
     pub chain: String,
@@ -639,20 +640,6 @@ pub struct RoutingConfig {
     pub forensic_tag_sources: Vec<String>,
 }
 
-impl Default for VenueEntry {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            chain: String::new(),
-            liquidity_usd_min: 0,
-            venue_type: String::new(),
-            kyc: false,
-            router_address: String::new(),
-            pairs: Vec::new(),
-            router_compatibility: String::new(),
-        }
-    }
-}
 
 impl Default for RoutingConfig {
     fn default() -> Self {
@@ -915,8 +902,6 @@ forensic_tag_sources:
 
     #[test]
     fn test_strategy_params_288_byte_abi_layout() {
-        use alloy::primitives::Address;
-
         // Build a sample StrategyParams with known address values
         let mut p = StrategyParams::default();
         // collateral_asset = 0x0000...0001 (left-padded address)

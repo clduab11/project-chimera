@@ -85,7 +85,7 @@ impl CalldataBuilder {
     /// * `amount`          – Amount to borrow.
     /// * `params`          – ABI-encoded parameters forwarded to the receiver.
     pub fn build_flash_loan_simple(
-        pool: Address,
+        _pool: Address,
         receiver_address: Address,
         asset: Address,
         amount: U256,

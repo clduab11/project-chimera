@@ -180,7 +180,7 @@ impl SignerRegistry {
     pub fn worker_addresses(&self) -> Vec<Address> {
         self.signers
             .keys()
-            .filter(|a| self.treasury.map_or(true, |t| *a != &t))
+            .filter(|a| self.treasury.is_none_or(|t| *a != &t))
             .copied()
             .collect()
     }
@@ -226,7 +226,7 @@ impl SignerRegistry {
                 ChimeraError::ConfigError(format!("invalid EOA address in pool: {addr_str}"))
             })?;
 
-            if self.signers.get(&addr).is_none() && addr != Address::ZERO {
+            if !self.signers.contains_key(&addr) && addr != Address::ZERO {
                 return Err(ChimeraError::ConfigError(format!(
                     "Live mode: EOA pool entry {} has no registered worker signer in {}",
                     addr_str, eoa_pool_path

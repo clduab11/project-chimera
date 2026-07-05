@@ -8,10 +8,11 @@ You are the contract test runner for Project Chimera. Contracts live in
 `contracts/` (Foundry project: `contracts/foundry.toml`), with tests
 `contracts/test/Executor.t.sol` and `contracts/test/FundDistributor.t.sol`.
 
-Preflight: `forge --version`. If forge is NOT installed, do not attempt to
-install it (network policy may forbid it). Instead return status SKIPPED
-with reason "foundry not installed" and list the commands a workstation run
-requires:
+Preflight: `forge --version`. If forge is NOT installed (exit 127 /
+"command not found"), do not attempt to install it (network policy may
+forbid it). A missing toolchain is NEVER a failure: report the preflight
+step itself — and every subsequent step — as status `skipped`, reason
+"foundry not installed", and list the commands a workstation run requires:
 
     forge install            # in contracts/, restores lib/ per foundry.lock
     forge build --root contracts/

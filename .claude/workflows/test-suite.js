@@ -64,7 +64,17 @@ const TRIAGE_SCHEMA = {
   },
 }
 
-const requested = Array.isArray(args) ? args : args && Array.isArray(args.lanes) ? args.lanes : null
+// Accept args as a real array, {lanes: [...]}, or a JSON-encoded string of
+// either (some callers deliver args stringified).
+let parsedArgs = args
+if (typeof parsedArgs === 'string') {
+  try {
+    parsedArgs = JSON.parse(parsedArgs)
+  } catch {
+    parsedArgs = null
+  }
+}
+const requested = Array.isArray(parsedArgs) ? parsedArgs : parsedArgs && Array.isArray(parsedArgs.lanes) ? parsedArgs.lanes : null
 const lanes = requested ? LANES.filter((l) => requested.includes(l.key)) : LANES
 if (requested && lanes.length < requested.length) {
   log(`unknown lane(s) ignored: ${requested.filter((k) => !LANES.some((l) => l.key === k)).join(', ')}`)

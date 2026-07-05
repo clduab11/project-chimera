@@ -137,7 +137,7 @@ that addresses it. "Slot 0/1" refer to `Executor.yul` storage.
 |---|---|---|---|
 | **Spoofing** | Attacker contract calls `executeOperation` pretending to be the Aave pool | Pool validation: `caller()` must equal `sload(1)`; else `InvalidPool` revert (`Executor.yul` CASE A) | Mitigated |
 | **Spoofing** | Attacker calls `exec`, `setPool`, `withdraw`, or `transferOwnership` as if owner | Owner gate: `caller()` must equal `sload(0)`; else `Unauthorized` revert | Mitigated |
-| **Spoofing** | Lazy-init owner hijack: first caller becomes owner if slot 0 == 0 | Constructor sets owner from appended arg; deploy script must set owner to multisig at construction; `transferOwnership` rejects zero address to prevent re-opening lazy-init | Partial (depends on correct deploy + verification step) |
+| **Spoofing** | Lazy-init owner hijack: first caller becomes owner if slot 0 == 0 | No caller()-based lazy-init; ownership set only at construction or by explicit worker self-init; arbitrary external callers cannot seize worker-as-Executor | Mitigated |
 | **Tampering** | `pacing.yaml` edited to weaken caps; drifts from `config.rs` defaults | 3-way sync invariant (AGENTS.md #1): `pacing.yaml` ↔ `config.rs` defaults ↔ `valid_yaml()` fixture; CI/test must catch drift | Partial (enforced by test that must be run) |
 | **Tampering** | Snapshot poisoning: malicious Aave state fed to simulator | Snapshot schema contract (`docs/snapshot-schema.md` ↔ `prewarm.rs`); simulation re-derives economics; profit gate is on-chain regardless | Partial |
 | **Repudiation** | No record of why a decision/execution happened | JSONL audit trail (`StatePersistence`) logs every outcome with id, timestamp, venue, eoa, chain_id | Mitigated (library; wiring into `main.rs` still partial — see README §9) |
@@ -164,7 +164,7 @@ that addresses it. "Slot 0/1" refer to `Executor.yul` storage.
 | Nonce collision in funding | Concurrent funding txns reuse a nonce | Addressed in funding path; sequential nonce handling | Mitigated (verify under load) |
 | Bad-debt liquidation | Liquidating a position that leaves uncovered bad debt | **Must-not-attempt:** simulator screens bad-debt coverage before submission; engine declines | Partial (relies on simulator fidelity) |
 | MEV front-running | Searcher steals the liquidation or sandwiches the swap | `tip` parameter and profit gate make unprofitable theft self-defeating for us; **private submission is not yet wired** — current state submits via standard RPC | Open (private submission planned) |
-| Flash-loan callback abuse | Attacker triggers `executeOperation` with crafted params | Pool validation (slot 1) + params length checks (≥288 bytes) + atomic revert on any failed step | Mitigated |
+| Flash-loan callback abuse | Attacker triggers `executeOperation` with crafted params | Pool validation (slot 1) + initiator must equal contract address + exact 288-byte params + atomic revert on any failed step | Mitigated |
 
 ---
 

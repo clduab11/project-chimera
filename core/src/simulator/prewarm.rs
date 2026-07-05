@@ -5,8 +5,10 @@
 use crate::ChimeraError;
 use alloy::primitives::{keccak256, Address, B256, U256};
 use revm::database::CacheDB;
+use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 
 /// Represents the JSON structure output by `snapshot_generator.py`.
 #[derive(Deserialize, Debug)]
@@ -26,6 +28,48 @@ fn default_true() -> bool {
     true
 }
 
+/// Default RAY value (1e27) for index fields in mock snapshots.
+fn default_ray_u128() -> u128 {
+    1_000_000_000_000_000_000_000_000_000u128
+}
+
+/// Deserialize a `u128` from either a JSON number or a JSON decimal string.
+///
+/// Python's `snapshot_generator.py` serializes all u128-scale reserve fields as
+/// strings to avoid JSON integer precision loss. This deserializer accepts both
+/// representations so the Rust side is compatible with the documented wire format
+/// (see `docs/snapshot-schema.md`) as well as integer-only legacy snapshots.
+fn deser_u128_or_string<'de, D>(d: D) -> Result<u128, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct U128OrString;
+
+    impl<'de> Visitor<'de> for U128OrString {
+        type Value = u128;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a u128 integer or a decimal string")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u128, E> {
+            Ok(v as u128)
+        }
+
+        fn visit_u128<E: de::Error>(self, v: u128) -> Result<u128, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: de::Error>(self, s: &str) -> Result<u128, E> {
+            s.parse::<u128>().map_err(|_| {
+                de::Error::invalid_value(de::Unexpected::Str(s), &self)
+            })
+        }
+    }
+
+    d.deserialize_any(U128OrString)
+}
+
 #[derive(Deserialize, Debug)]
 pub struct ReserveData {
     pub symbol: String,
@@ -35,8 +79,11 @@ pub struct ReserveData {
     pub ltv: u16,
     pub liquidation_threshold: u16,
     pub liquidation_bonus: u16,
+    #[serde(deserialize_with = "deser_u128_or_string")]
     pub liquidity_rate: u128,
+    #[serde(deserialize_with = "deser_u128_or_string")]
     pub variable_borrow_rate: u128,
+    #[serde(deserialize_with = "deser_u128_or_string")]
     pub total_variable_debt: u128,
     /// aToken address for this reserve. Defaults to ZERO if not present in JSON.
     #[serde(default)]
@@ -77,6 +124,23 @@ pub struct ReserveData {
     /// Isolation debt ceiling as a decimal string (bits 212-251). "" / absent => 0.
     #[serde(default)]
     pub debt_ceiling: String,
+    // --- Snapshot indices / rates / timestamps consumed at offsets 1 and 3.
+    //     Previously hard-coded to RAY / zero; now sourced from the snapshot JSON.
+    /// Current liquidity index as a RAY (1e27). Defaults to RAY for mock snapshots.
+    #[serde(default = "default_ray_u128", deserialize_with = "deser_u128_or_string")]
+    pub liquidity_index: u128,
+    /// Current variable borrow index as a RAY (1e27). Defaults to RAY for mock snapshots.
+    #[serde(default = "default_ray_u128", deserialize_with = "deser_u128_or_string")]
+    pub variable_borrow_index: u128,
+    /// Current stable borrow rate as a RAY (1e27). Defaults to 0.
+    #[serde(default, deserialize_with = "deser_u128_or_string")]
+    pub stable_borrow_rate: u128,
+    /// Last update timestamp (seconds). Defaults to 0.
+    #[serde(default)]
+    pub last_update_timestamp: u64,
+    /// Aave V3 reserve id (sequential index in the active reserves list, bits 40-55 of offset 3).
+    #[serde(default)]
+    pub id: u16,
 }
 
 /// Pack reserve configuration parameters into Aave V3's `ReserveConfigurationMap` bitmap.
@@ -204,9 +268,10 @@ pub fn calculate_storage_slot(_contract: Address, mapping_slot: U256, key: B256)
 ///
 /// Individual fields within `ReserveData` are then accessed at fixed offsets from this base:
 /// - Offset 0: `ReserveConfigurationMap configuration` (packed bitmap, 256 bits)
-/// - Offset 1: `liquidityIndex` (128 bits) + `variableBorrowIndex` (128 bits)
-/// - Offset 2: `currentLiquidityRate` (128 bits) + `currentVariableBorrowRate` (128 bits)
-/// - Offset 3: `currentStableBorrowRate` (128 bits) + `lastUpdateTimestamp` (40 bits) + `id` (16 bits)
+/// - Offset 1: `liquidityIndex` (128 bits high) + `currentLiquidityRate` (128 bits low)
+/// - Offset 2: `variableBorrowIndex` (128 bits high) + `currentVariableBorrowRate` (128 bits low)
+/// - Offset 3: `currentStableBorrowRate` (128 bits high) + `id` (16 bits, 40-55) + `lastUpdateTimestamp` (40 bits, 0-39)
+/// - Offset 4+: aTokenAddress, stableDebtTokenAddress, variableDebtTokenAddress, strategy address, accruedToTreasury + unbacked, isolationModeTotalDebt
 ///
 /// # References
 /// - Aave V3 PoolStorage: <https://github.com/aave/aave-v3-core/blob/master/contracts/protocol/pool/PoolStorage.sol>
@@ -262,19 +327,23 @@ pub fn pre_warm_db<ExtDB: revm::database_interface::DatabaseRef>(
             let config_word = pack_reserve_configuration_map(reserve);
             let _ = db.insert_account_storage(snapshot.pool, base, config_word);
 
-            // Offset 1: liquidityIndex (128 bits) + variableBorrowIndex (128 bits).
-            // Use RAY (1e27) as neutral indices for mock snapshots.
-            let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
-            let indices = (ray << 128) | ray;
-            let _ = db.insert_account_storage(snapshot.pool, base + U256::from(1), indices);
+            // Offset 1: liquidityIndex (128 bits high) + currentLiquidityRate (128 bits low).
+            // Aave V3 ReserveData struct order: liquidityIndex, currentLiquidityRate pack together.
+            let offset1 = (U256::from(reserve.liquidity_index) << 128)
+                | U256::from(reserve.liquidity_rate);
+            let _ = db.insert_account_storage(snapshot.pool, base + U256::from(1), offset1);
 
-            // Offset 2: currentLiquidityRate (128 bits) + currentVariableBorrowRate (128 bits).
-            let rates = (U256::from(reserve.liquidity_rate) << 128)
+            // Offset 2: variableBorrowIndex (128 bits high) + currentVariableBorrowRate (128 bits low).
+            let offset2 = (U256::from(reserve.variable_borrow_index) << 128)
                 | U256::from(reserve.variable_borrow_rate);
-            let _ = db.insert_account_storage(snapshot.pool, base + U256::from(2), rates);
+            let _ = db.insert_account_storage(snapshot.pool, base + U256::from(2), offset2);
 
-            // Offset 3: currentStableBorrowRate (128 bits) + lastUpdateTimestamp (40 bits) + id (16 bits).
-            let _ = db.insert_account_storage(snapshot.pool, base + U256::from(3), U256::ZERO);
+            // Offset 3: currentStableBorrowRate (128 bits high) + id (16 bits, 40-55)
+            //           + lastUpdateTimestamp (40 bits, 0-39).
+            let offset3 = (U256::from(reserve.stable_borrow_rate) << 128)
+                | (U256::from(reserve.id) << 40)
+                | U256::from(reserve.last_update_timestamp);
+            let _ = db.insert_account_storage(snapshot.pool, base + U256::from(3), offset3);
         }
 
         // Legacy price warming (kept for backward compatibility).
@@ -386,6 +455,11 @@ mod tests {
             emode_liquidation_bonus: 0,
             is_isolated: false,
             debt_ceiling: String::new(),
+            liquidity_index: 1_000_000_000_000_000_000_000_000_000u128,
+            variable_borrow_index: 1_000_000_000_000_000_000_000_000_000u128,
+            stable_borrow_rate: 0,
+            last_update_timestamp: 0,
+            id: 0,
         };
 
         let user = address!("0x1234567890123456789012345678901234567890");
@@ -457,6 +531,36 @@ mod tests {
             "Pool should have 4 reserve data slots (config, indices, rates, timestamp+id)"
         );
 
+        // Verify the packed values at each offset match the reserve.
+        let base = calculate_reserve_data_slot(
+            snapshot.pool,
+            snapshot.reserves[0].address,
+            U256::from(53),
+        );
+        // Offset 0: config word.
+        let stored_config = pool_storage.get(&base).expect("offset 0 must exist");
+        let expected_config = pack_reserve_configuration_map(&snapshot.reserves[0]);
+        assert_eq!(
+            *stored_config, expected_config,
+            "offset 0 config word must match packed bitmap"
+        );
+        // Offset 1: liquidityIndex << 128 | liquidity_rate.
+        let stored_offset1 = pool_storage.get(&(base + U256::from(1))).expect("offset 1 must exist");
+        let expected_offset1 = (U256::from(snapshot.reserves[0].liquidity_index) << 128)
+            | U256::from(snapshot.reserves[0].liquidity_rate);
+        assert_eq!(*stored_offset1, expected_offset1, "offset 1 pack mismatch");
+        // Offset 2: variableBorrowIndex << 128 | variable_borrow_rate.
+        let stored_offset2 = pool_storage.get(&(base + U256::from(2))).expect("offset 2 must exist");
+        let expected_offset2 = (U256::from(snapshot.reserves[0].variable_borrow_index) << 128)
+            | U256::from(snapshot.reserves[0].variable_borrow_rate);
+        assert_eq!(*stored_offset2, expected_offset2, "offset 2 pack mismatch");
+        // Offset 3: stable_borrow_rate << 128 | (id << 40) | last_update_timestamp.
+        let stored_offset3 = pool_storage.get(&(base + U256::from(3))).expect("offset 3 must exist");
+        let expected_offset3 = (U256::from(snapshot.reserves[0].stable_borrow_rate) << 128)
+            | (U256::from(snapshot.reserves[0].id) << 40)
+            | U256::from(snapshot.reserves[0].last_update_timestamp);
+        assert_eq!(*stored_offset3, expected_offset3, "offset 3 pack mismatch");
+
         let price_account = db.cache.accounts.get(&Address::ZERO);
         assert!(
             price_account.is_some(),
@@ -492,6 +596,11 @@ mod tests {
             emode_liquidation_bonus: 0,
             is_isolated: false,
             debt_ceiling: String::new(),
+            liquidity_index: 1_000_000_000_000_000_000_000_000_000u128,
+            variable_borrow_index: 1_000_000_000_000_000_000_000_000_000u128,
+            stable_borrow_rate: 0,
+            last_update_timestamp: 0,
+            id: 0,
         };
         let _a_token_addr = reserve.a_token;
         let _debt_token_addr = reserve.variable_debt_token;
@@ -540,5 +649,68 @@ mod tests {
             db.cache.accounts.contains_key(&Address::ZERO),
             "Price slot should still be inserted at Address::ZERO"
         );
+    }
+
+    #[test]
+    fn test_deserialize_u128_fields_from_strings() {
+        // Verify that all u128 reserve fields deserialize correctly from
+        // decimal string values (the schema contract per docs/snapshot-schema.md).
+        let json = r#"{
+          "chain": "base",
+          "block_number": 42,
+          "reserves": [
+            {
+              "address": "0x4200000000000000000000000000000000000006",
+              "symbol": "WETH",
+              "decimals": 18,
+              "ltv": 8000,
+              "liquidation_threshold": 8250,
+              "liquidation_bonus": 10500,
+              "liquidity_rate": "3000000000000000000000000",
+              "variable_borrow_rate": "5000000000000000000000000",
+              "total_variable_debt": "500000000000000000000000",
+              "price_usd": 2500.0,
+              "a_token": "0xD4a0e0b9149BCee3C920d2E00b5dE09138fd8bb7",
+              "variable_debt_token": "0x24e6e0795b3c7c71D965fCc4f371803d1c1DcA1E",
+              "liquidity_index": "1056789123456789123456789123",
+              "variable_borrow_index": "1034567891234567891234567891",
+              "stable_borrow_rate": "2000000000000000000000000",
+              "last_update_timestamp": 1751420000,
+              "id": 3,
+              "liquidation_protocol_fee": 1000,
+              "emode_category": 1,
+              "emode_liquidation_threshold": 9300,
+              "emode_liquidation_bonus": 10200,
+              "is_isolated": false,
+              "debt_ceiling": "0",
+              "active": true,
+              "frozen": false,
+              "paused": false,
+              "siloed_borrowing": false
+            }
+          ],
+          "users": {}
+        }"#;
+
+        let snapshot: MarketSnapshot =
+            serde_json::from_str(json).expect("snapshot must deserialize");
+
+        let reserve = &snapshot.reserves[0];
+        assert_eq!(reserve.liquidity_rate, 3_000_000_000_000_000_000_000_000u128);
+        assert_eq!(reserve.variable_borrow_rate, 5_000_000_000_000_000_000_000_000u128);
+        assert_eq!(reserve.total_variable_debt, 500_000_000_000_000_000_000_000u128);
+        assert_eq!(reserve.liquidity_index, 1_056_789_123_456_789_123_456_789_123u128);
+        assert_eq!(reserve.variable_borrow_index, 1_034_567_891_234_567_891_234_567_891u128);
+        assert_eq!(reserve.stable_borrow_rate, 2_000_000_000_000_000_000_000_000u128);
+        assert_eq!(reserve.last_update_timestamp, 1_751_420_000u64);
+        assert_eq!(reserve.id, 3);
+        assert_eq!(reserve.emode_category, 1);
+        assert_eq!(reserve.emode_liquidation_threshold, 9300);
+        assert_eq!(reserve.emode_liquidation_bonus, 10200);
+        assert!(!reserve.a_token.is_zero(), "a_token must be populated");
+        assert!(!reserve.variable_debt_token.is_zero(), "variable_debt_token must be populated");
+        assert!(reserve.active, "active must default true / be present");
+        assert!(!reserve.frozen);
+        assert!(!reserve.paused);
     }
 }

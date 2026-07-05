@@ -1,9 +1,20 @@
 object "Executor" {
     // G--G-- Constructor G--G--
     // Copies runtime bytecode to memory and returns it.
+    // Optionally reads a trailing 32-byte owner arg appended by Deploy.s.sol
+    // and stores it in slot 0. Non-appended (tests) leaves 0 for lazy-init.
     code {
-        datacopy(0, dataoffset("runtime"), datasize("runtime"))
-        return(0, datasize("runtime"))
+        let owner := 0
+        let rsize := datasize("runtime")
+        let csize := codesize()
+        if gt(csize, rsize) {
+            let argStart := sub(csize, 32)
+            codecopy(0, argStart, 32)
+            owner := mload(0)
+        }
+        if owner { sstore(0, owner) }
+        datacopy(0, dataoffset("runtime"), rsize)
+        return(0, rsize)
     }
     object "runtime" {
         code {
@@ -17,6 +28,11 @@ object "Executor" {
             // Direct execution entry for EIP-7702 / manual trigger.
             // Signature: exec(bytes)
             let SEL_EXEC := 0x55f86501
+            // Admin surface (owner-gated)
+            let SEL_OWNER               := 0x8da5cb5b // owner()
+            let SEL_SET_POOL            := 0xa51b62c1 // setPool(address)
+            let SEL_WITHDRAW            := 0xf3fef3a3 // withdraw(address,uint256)
+            let SEL_TRANSFER_OWNERSHIP  := 0xf2fde38b // transferOwnership(address)
             // Aave V3 Pool.liquidationCall
             // Signature: liquidationCall(address,address,address,uint256,bool)
             let SEL_LIQUIDATION_CALL := 0x00a718a9
@@ -36,6 +52,8 @@ object "Executor" {
             let ERR_ATOMIC_FAIL   := 0x5fe2e75c // AtomicFail()
             let ERR_UNAUTHORIZED  := 0x82b42900 // Unauthorized()
             let ERR_INVALID_ROUTER := 0x8d4f59a9 // InvalidDexRouter()
+            let ERR_INVALID_POOL     := 0xd0363b78 // InvalidPool()
+            let ERR_WITHDRAW_FAILED  := 0xf1620b3e // WithdrawFailed()
             // SECTION 1: MAIN CALLDATA DISPATCHER
             // Extract function selector: highest 4 bytes of calldata.
             let sig := shr(224, calldataload(0))
@@ -64,8 +82,8 @@ object "Executor" {
                 let paramsLen       := calldataload(paramsOffset)
                 let paramsDataStart := add(paramsOffset, 32)
                 // G--G-- Validate params length G--G--
-                // StrategyParams: 9 * 32 = 288 bytes.
-                if lt(paramsLen, 288) {
+                // StrategyParams: exactly 9 * 32 = 288 bytes.
+                if iszero(eq(paramsLen, 288)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
                 // G--G-- Decode StrategyParams G--G--
@@ -90,9 +108,18 @@ object "Executor" {
                 // G--G-- Record pre-flight balance of debt token G--G--
                 let self := address()
                 let balanceBefore := callBalanceOf(asset, self)
+                // G--G-- Pool validation gate (worker-as-Executor invariant)
+                if iszero(eq(caller(), sload(1))) {
+                    revertWithError(ERR_INVALID_POOL)
+                }
+                // G--G-- Initiator authorization gate (worker-as-Executor model)
+                // Only the worker address itself is allowed to trigger via flash-loan callback.
+                if iszero(eq(initiator, address())) {
+                    revertWithError(ERR_UNAUTHORIZED)
+                }
                 // G--G-- Step 1: LIQUIDATION G--G--
                 // Approve Aave Pool to pull debtToCover of the debt asset.
-                let pool := caller()
+                let pool := sload(1)
                 if iszero(callApprove(asset, pool, debtToCover)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
@@ -148,6 +175,71 @@ object "Executor" {
             }
 
             // ======================================================================
+            // CASE C: Admin surface (owner() / setPool / withdraw / transferOwnership)
+            // Ownership is set only at construction via Deploy.s.sol appended arg
+            // or by the worker EOA itself via an explicit one-time self-init path.
+            // No caller()-based lazy-init is allowed; arbitrary external callers
+            // cannot seize ownership of a worker-as-Executor wallet.
+            // ======================================================================
+            case 0x8da5cb5b {
+                mstore(0, sload(0))
+                return(0, 32)
+            }
+            case 0xa51b62c1 {
+                if iszero(eq(caller(), sload(0))) {
+                    mstore(0, shl(224, ERR_UNAUTHORIZED))
+                    revert(0, 4)
+                }
+                sstore(1, calldataload(4))
+                stop()
+            }
+            case 0xf3fef3a3 {
+                if iszero(eq(caller(), sload(0))) {
+                    mstore(0, shl(224, ERR_UNAUTHORIZED))
+                    revert(0, 4)
+                }
+                let token := calldataload(4)
+                let amt   := calldataload(36)
+                let self  := address()
+                if iszero(token) {
+                    // native ETH
+                    let bal := selfbalance()
+                    let w := amt
+                    if iszero(w) { w := bal }
+                    if gt(w, bal) { revertWithError(ERR_WITHDRAW_FAILED) }
+                    if iszero(call(gas(), caller(), w, 0, 0, 0, 0)) {
+                        revertWithError(ERR_WITHDRAW_FAILED)
+                    }
+                    stop()
+                }
+                // ERC20
+                let bal := callBalanceOf(token, self)
+                let w := amt
+                if iszero(w) { w := bal }
+                if gt(w, bal) { revertWithError(ERR_WITHDRAW_FAILED) }
+                mstore(0, shl(224, SEL_TRANSFER))
+                mstore(4, caller())
+                mstore(36, w)
+                if iszero(call(gas(), token, 0, 0, 68, 0, 0)) {
+                    revertWithError(ERR_WITHDRAW_FAILED)
+                }
+                stop()
+            }
+            case 0xf2fde38b {
+                if iszero(eq(caller(), sload(0))) {
+                    mstore(0, shl(224, ERR_UNAUTHORIZED))
+                    revert(0, 4)
+                }
+                let newOwner := calldataload(4)
+                if iszero(newOwner) {
+                    mstore(0, shl(224, ERR_UNAUTHORIZED))
+                    revert(0, 4)
+                }
+                sstore(0, newOwner)
+                stop()
+            }
+
+            // ======================================================================
             // CASE B: Direct Execution Entry (EIP-7702 compatible, owner only)
             // ======================================================================
             case 0x55f86501 {
@@ -179,7 +271,7 @@ object "Executor" {
                 let dataOffset    := add(calldataload(4), 4)
                 let dataLen       := calldataload(dataOffset)
                 let dataStart     := add(dataOffset, 32)
-                if lt(dataLen, 384) {
+                if iszero(eq(dataLen, 384)) {
                     revertWithError(ERR_ATOMIC_FAIL)
                 }
                 let d_asset         := calldataload(dataStart)

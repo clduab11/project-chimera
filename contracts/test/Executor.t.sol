@@ -62,6 +62,9 @@ contract ExecutorTest is Test {
     MockRouter mockRouter;
     address victim = makeAddr("victim");
 
+    // Allow receiving ETH from Executor.withdraw(0,0)
+    receive() external payable {}
+
     bytes4 constant ERR_PROFIT_GATE      = 0x2e5a0d02;
     bytes4 constant ERR_ATOMIC_FAIL      = 0x5fe2e75c;
     bytes4 constant ERR_UNAUTHORIZED     = 0x82b42900;
@@ -91,15 +94,20 @@ contract ExecutorTest is Test {
 
         string memory path = string.concat(vm.projectRoot(), "/out/Executor.yul/Executor.json");
         string memory json = vm.readFile(path);
-        bytes memory code  = vm.parseJsonBytes(json, ".bytecode.object");
+        bytes memory code = vm.parseJsonBytes(json, ".bytecode.object");
+        // Append owner arg exactly like Deploy.s.sol so ctor reads it (no garbage read from initcode tail).
+        bytes memory initCode = abi.encodePacked(code, abi.encode(address(this)));
         address _executor;
         assembly {
-            _executor := create(0, add(code, 0x20), mload(code))
+            _executor := create(0, add(initCode, 0x20), mload(initCode))
         }
         executor = _executor;
         require(executor != address(0), "Executor deployment failed");
 
-        vm.store(executor, bytes32(0), bytes32(uint256(uint160(address(this)))));
+        // Owner is already set via appended ctor arg; now set the pool (owner-gated).
+        bytes memory setPoolData = abi.encodeWithSelector(SEL_SET_POOL, address(mockPool));
+        (bool ok, ) = executor.call(setPoolData);
+        require(ok, "setPool failed");
     }
 
     function _getParams() internal view returns (bytes memory) {
@@ -115,7 +123,7 @@ contract ExecutorTest is Test {
         mockTokenA.mint(executor, 2000 ether);
 
         bytes memory callData = abi.encodeWithSelector(
-            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, address(this), params
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, params
         );
 
         vm.recordLogs();
@@ -146,12 +154,12 @@ contract ExecutorTest is Test {
         mockTokenA.mint(executor, 2000 ether);
 
         bytes memory callData = abi.encodeWithSelector(
-            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, address(this), params
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, params
         );
 
         vm.expectRevert(ERR_PROFIT_GATE);
         vm.prank(address(mockPool));
-        executor.call(callData);
+        (bool _ok1, ) = executor.call(callData);
     }
 
     // ─── 3. Atomic Revert on Liquidation Failure ───────────────────────────────
@@ -166,33 +174,104 @@ contract ExecutorTest is Test {
         );
 
         bytes memory callData = abi.encodeWithSelector(
-            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, address(this), params
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, params
         );
 
         vm.expectRevert(ERR_ATOMIC_FAIL);
         vm.prank(address(mockPool));
-        executor.call(callData);
+        (bool _ok2, ) = executor.call(callData);
     }
 
-    // ─── 4. EIP-7702 Compatibility ─────────────────────────────────────────────
-    function testEIP7702Compatibility() public {
-        address eoa = makeAddr("eoa_wallet");
+    // ─── Wrong Initiator Rejected ──────────────────────────────────────────────
+    function testExecuteOperationRejectsWrongInitiator() public {
+        bytes memory params = _getParams();
+        mockTokenA.mint(executor, 2000 ether);
+
+        // Valid pool caller but wrong initiator (not the executor address).
+        bytes memory callData = abi.encodeWithSelector(
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, address(0xBEEF), params
+        );
+
+        vm.expectRevert(ERR_UNAUTHORIZED);
+        vm.prank(address(mockPool));
+        (bool _ok3, ) = executor.call(callData);
+    }
+
+    // ─── Payload Length Validation (exact sizes) ───────────────────────────────
+    function testExecuteOperationRejectsWrongPayloadLength() public {
+        // Too short (287 bytes instead of 288)
+        bytes memory shortParams = abi.encodePacked(_getParams()[0:287]);
+        mockTokenA.mint(executor, 2000 ether);
+        bytes memory callDataShort = abi.encodeWithSelector(
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, shortParams
+        );
+        vm.expectRevert(ERR_ATOMIC_FAIL);
+        vm.prank(address(mockPool));
+        executor.call(callDataShort);
+
+        // Too long (289 bytes)
+        bytes memory longParams = abi.encodePacked(_getParams(), hex"00");
+        bytes memory callDataLong = abi.encodeWithSelector(
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, longParams
+        );
+        vm.expectRevert(ERR_ATOMIC_FAIL);
+        vm.prank(address(mockPool));
+        executor.call(callDataLong);
+    }
+
+    function testDirectExecRejectsWrongPayloadLength() public {
+        // Too short (383 bytes instead of 384)
+        bytes memory shortData = abi.encodePacked(abi.encode(
+            address(mockTokenA), FLASH_AMOUNT, address(mockPool), address(mockTokenB),
+            victim, DEBT_TO_COVER, false, address(mockRouter), AMOUNT_OUT_MIN, MIN_PROFIT, TIP, DEADLINE
+        )[0:383]);
+        mockTokenA.mint(executor, 2000 ether);
+        bytes memory callDataShort = abi.encodeWithSelector(SEL_EXEC, shortData);
+        vm.expectRevert(ERR_ATOMIC_FAIL);
+        vm.prank(address(this));
+        executor.call(callDataShort);
+
+        // Too long (385 bytes)
+        bytes memory longData = abi.encodePacked(abi.encode(
+            address(mockTokenA), FLASH_AMOUNT, address(mockPool), address(mockTokenB),
+            victim, DEBT_TO_COVER, false, address(mockRouter), AMOUNT_OUT_MIN, MIN_PROFIT, TIP, DEADLINE
+        ), hex"00");
+        bytes memory callDataLong = abi.encodeWithSelector(SEL_EXEC, longData);
+        vm.expectRevert(ERR_ATOMIC_FAIL);
+        vm.prank(address(this));
+        executor.call(callDataLong);
+    }
+
+    // ─── 4. EIP-7702 Ownership Hardening ──────────────────────────────────────
+    // Arbitrary external caller must NOT be able to seize ownership of etched worker.
+    function testEIP7702ArbitraryCallerCannotClaim() public {
+        address worker = makeAddr("worker_eoa");
         string memory path = string.concat(vm.projectRoot(), "/out/Executor.yul/Executor.json");
         string memory json = vm.readFile(path);
         bytes memory code = vm.parseJsonBytes(json, ".deployedBytecode.object");
-        vm.etch(eoa, code);
+        vm.etch(worker, code);
 
-        bytes memory params = _getParams();
-        mockTokenA.mint(eoa, 2000 ether);
+        // Arbitrary external caller tries setPool — must revert Unauthorized.
+        address attacker = makeAddr("attacker");
+        bytes memory setPoolData = abi.encodeWithSelector(SEL_SET_POOL, address(mockPool));
+        vm.expectRevert(ERR_UNAUTHORIZED);
+        vm.prank(attacker);
+        (bool ok, ) = worker.call(setPoolData);
+        assertFalse(ok, "attacker must not claim ownership");
+    }
 
-        bytes memory callData = abi.encodeWithSelector(
-            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, address(this), params
-        );
+    // Worker self-init path succeeds when the etched worker itself calls setPool.
+    function testEIP7702WorkerSelfInitSucceeds() public {
+        address worker = makeAddr("worker_eoa");
+        string memory path = string.concat(vm.projectRoot(), "/out/Executor.yul/Executor.json");
+        string memory json = vm.readFile(path);
+        bytes memory code = vm.parseJsonBytes(json, ".deployedBytecode.object");
+        vm.etch(worker, code);
 
-        vm.prank(address(mockPool));
-        (bool success, bytes memory ret) = eoa.call(callData);
-        assertTrue(success, "EIP-7702 EOA should handle executeOperation");
-        assertEq(abi.decode(ret, (bool)), true, "should return true");
+        vm.prank(worker);
+        bytes memory setPoolData = abi.encodeWithSelector(SEL_SET_POOL, address(mockPool));
+        (bool ok, ) = worker.call(setPoolData);
+        assertTrue(ok, "worker self-init must succeed");
     }
 
     // ─── 5. Direct Exec Path ──────────────────────────────────────────────────
@@ -249,4 +328,148 @@ contract ExecutorTest is Test {
         assertGt(executor.code.length, 0, "deployed contract must have code");
     }
 
+    }
+
+    // ─── Admin surface + gates (per T2 ABI gate + Invariant #6) ─────────────────
+
+    function testOwnerView() public {
+        bytes memory data = abi.encodeWithSelector(SEL_OWNER);
+        (bool ok, bytes memory ret) = executor.staticcall(data);
+        assertTrue(ok, "owner() staticcall failed");
+        address o = abi.decode(ret, (address));
+        assertEq(o, address(this), "owner should be test contract after setUp");
+    }
+
+    function testSetPoolOnlyOwner() public {
+        address stranger = makeAddr("stranger");
+        bytes memory bad = abi.encodeWithSelector(SEL_SET_POOL, address(0xBEEF));
+        vm.prank(stranger);
+        vm.expectRevert(ERR_UNAUTHORIZED);
+        (bool _ok3, ) = executor.call(bad);
+    }
+
+    function testExecuteOperationRejectsNonPool() public {
+        bytes memory params = _getParams();
+        mockTokenA.mint(executor, 2000 ether);
+        bytes memory callData = abi.encodeWithSelector(
+            SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, params
+        );
+        address notPool = makeAddr("not_the_pool");
+        vm.prank(notPool);
+        vm.expectRevert(ERR_INVALID_POOL);
+        (bool _ok4, ) = executor.call(callData);
+    }
+
+    function testWithdrawERC20ByOwner() public {
+        // fund executor
+        mockTokenA.mint(executor, 123 ether);
+        uint256 balBefore = mockTokenA.balanceOf(address(this));
+        bytes memory wd = abi.encodeWithSelector(SEL_WITHDRAW, address(mockTokenA), uint256(50 ether));
+        vm.prank(address(this));
+        (bool ok, ) = executor.call(wd);
+        assertTrue(ok, "withdraw should succeed");
+        uint256 balAfter = mockTokenA.balanceOf(address(this));
+        assertEq(balAfter - balBefore, 50 ether, "owner should have received 50");
+    }
+
+    function testWithdrawETHByOwner() public {
+        vm.deal(executor, 1 ether);
+        uint256 before = address(this).balance;
+        bytes memory wd = abi.encodeWithSelector(SEL_WITHDRAW, address(0), uint256(0)); // 0 = full
+        vm.prank(address(this));
+        (bool ok, ) = executor.call(wd);
+        assertTrue(ok, "eth withdraw should succeed");
+        uint256 afterBal = address(this).balance;
+        assertGt(afterBal, before, "received ETH");
+    }
+
+    function testWithdrawByNonOwnerReverts() public {
+        mockTokenA.mint(executor, 10 ether);
+        address stranger = makeAddr("stranger2");
+        bytes memory wd = abi.encodeWithSelector(SEL_WITHDRAW, address(mockTokenA), uint256(1 ether));
+        vm.prank(stranger);
+        vm.expectRevert(ERR_UNAUTHORIZED);
+        (bool _ok5, ) = executor.call(wd);
+    }
+
+    function testTransferOwnership() public {
+        address newO = makeAddr("newOwner");
+        bytes memory txo = abi.encodeWithSelector(SEL_TRANSFER_OWNERSHIP, newO);
+        vm.prank(address(this));
+        (bool ok, ) = executor.call(txo);
+        assertTrue(ok, "transferOwnership should succeed");
+
+        // verify owner changed
+        bytes memory q = abi.encodeWithSelector(SEL_OWNER);
+        (bool ok2, bytes memory ret) = executor.staticcall(q);
+        assertTrue(ok2);
+        assertEq(abi.decode(ret, (address)), newO, "owner should be newO");
+    }
+
+    function testTransferOwnershipRejectsZero() public {
+        bytes memory txo = abi.encodeWithSelector(SEL_TRANSFER_OWNERSHIP, address(0));
+        vm.prank(address(this));
+        vm.expectRevert(ERR_UNAUTHORIZED);
+        (bool _ok6, ) = executor.call(txo);
+    }
+
+    function testTransferOwnershipOnlyOwner() public {
+        address stranger = makeAddr("stranger3");
+        bytes memory txo = abi.encodeWithSelector(SEL_TRANSFER_OWNERSHIP, makeAddr("x"));
+        vm.prank(stranger);
+        vm.expectRevert(ERR_UNAUTHORIZED);
+        (bool _ok7, ) = executor.call(txo);
+    }
+
+    // ─── E2E: Rust-assembled StrategyParams shape matches Executor.yul calldataload offsets ──
+    function testFlashLoanParamsMatchExecutorShape() public {
+        bytes memory params = _getParams();
+        // StrategyParams is exactly 288 bytes (9 words of 32)
+        assertEq(params.length, 288, "params must be 288 bytes");
+
+        // Decode known fields and verify offsets match Executor.yul:99-107
+        // word 0 (offset 0): collateralAsset
+        address decodedCollateral = address(uint160(uint256(bytes32(_slice(params, 0, 32)))));
+        assertEq(decodedCollateral, address(mockTokenB), "word0: collateralAsset");
+
+        // word 1 (offset 32): userToLiquidate
+        address decodedUser = address(uint160(uint256(bytes32(_slice(params, 32, 32)))));
+        assertEq(decodedUser, victim, "word1: userToLiquidate");
+
+        // word 2 (offset 64): debtToCover
+        uint256 decodedDebt = uint256(bytes32(_slice(params, 64, 32)));
+        assertEq(decodedDebt, DEBT_TO_COVER, "word2: debtToCover");
+
+        // word 3 (offset 96): receiveAToken
+        uint256 decodedRat = uint256(bytes32(_slice(params, 96, 32)));
+        assertEq(decodedRat, 0, "word3: receiveAToken (false=0)");
+
+        // word 4 (offset 128): dexRouter
+        address decodedRouter = address(uint160(uint256(bytes32(_slice(params, 128, 32)))));
+        assertEq(decodedRouter, address(mockRouter), "word4: dexRouter");
+
+        // word 5 (offset 160): amountOutMin
+        uint256 decodedAom = uint256(bytes32(_slice(params, 160, 32)));
+        assertEq(decodedAom, AMOUNT_OUT_MIN, "word5: amountOutMin");
+
+        // word 6 (offset 192): minProfit
+        uint256 decodedMinProfit = uint256(bytes32(_slice(params, 192, 32)));
+        assertEq(decodedMinProfit, MIN_PROFIT, "word6: minProfit");
+
+        // word 7 (offset 224): tip
+        uint256 decodedTip = uint256(bytes32(_slice(params, 224, 32)));
+        assertEq(decodedTip, TIP, "word7: tip");
+
+        // word 8 (offset 256): deadline
+        uint256 decodedDeadline = uint256(bytes32(_slice(params, 256, 32)));
+        assertEq(decodedDeadline, DEADLINE, "word8: deadline");
+    }
+
+    function _slice(bytes memory data, uint256 start, uint256 len) internal pure returns (bytes memory) {
+        bytes memory out = new bytes(len);
+        for (uint256 i = 0; i < len; i++) {
+            out[i] = data[start + i];
+        }
+        return out;
+    }
 }

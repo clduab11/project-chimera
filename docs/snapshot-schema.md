@@ -49,7 +49,12 @@
   "emode_liquidation_threshold": 0,
   "emode_liquidation_bonus": 0,
   "is_isolated": false,
-  "debt_ceiling": "0"
+  "debt_ceiling": "0",
+  "liquidity_index": "1056789123456789123456789123",
+  "variable_borrow_index": "1034567891234567891234567891",
+  "stable_borrow_rate": "0",
+  "last_update_timestamp": 1751420000,
+  "id": 0
 }
 ```
 
@@ -67,6 +72,11 @@
 | `price_usd` | number | USD price used for profit/guardrail estimates. |
 | `a_token` | address string | Aave aToken contract address. |
 | `variable_debt_token` | address string | Aave variable-debt token contract address. |
+| `liquidity_index` | string | Current liquidity index as a RAY (`1e27`). Defaults to RAY. |
+| `variable_borrow_index` | string | Current variable borrow index as a RAY (`1e27`). Defaults to RAY. |
+| `stable_borrow_rate` | string | Current stable borrow rate as a RAY (`1e27`). Defaults to `"0"`. |
+| `last_update_timestamp` | integer | Last reserve update timestamp (unix seconds). Defaults to `0`. |
+| `id` | integer | Aave V3 reserve id (sequential index, bits 40-55 of Pool slot 3). Defaults to `0`. |
 
 ### Aave V3 edge-case reserve fields (optional, backward compatible)
 
@@ -89,6 +99,18 @@ key implies an active reserve); every other new field defaults to the zero/false
 | `debt_ceiling` | string (decimal) | `"0"` | 212-251 | Isolation debt ceiling. Serialized as a string to avoid JSON integer precision loss. |
 
 The `a_token` and `variable_debt_token` addresses are required for real prewarming of ERC20 `balanceOf` storage slots. If they are zero addresses, prewarming falls back to price-only compatibility mode and must not be used for live simulation confidence.
+
+### Pool reserve-data storage mapping
+
+In addition to the configuration bitmap (offset 0), the pre-warmer writes the following fields at their Pool storage offsets (Aave V3 `_reserves` mapping, slot 53):
+
+| Offset | Slot | Fields |
+| --- | --- | --- |
+| 0 | `base` | `ReserveConfigurationMap` (bitmap; see above) |
+| 1 | `base + 1` | `liquidityIndex` (128 bits, high) + `currentLiquidityRate` (128 bits, low) |
+| 2 | `base + 2` | `variableBorrowIndex` (128 bits, high) + `currentVariableBorrowRate` (128 bits, low) |
+| 3 | `base + 3` | `currentStableBorrowRate` (128 bits, high) + `id` (16 bits, 40-55) + `lastUpdateTimestamp` (40 bits, 0-39) |
+| 4+ | `base + 4+` | aTokenAddress, stableDebtTokenAddress, variableDebtTokenAddress, interestRateStrategyAddress, accruedToTreasury + unbacked, isolationModeTotalDebt |
 
 ### Reserve configuration bitmap
 
@@ -157,5 +179,10 @@ All token amounts are serialized as strings to avoid JSON integer precision loss
   field are optional with serde defaults; pre-edge-case snapshots, golden fixtures, and
   mock data continue to deserialize unchanged. `active` defaults to `true`; all others
   default to false/0/`"0"`.
+- Index, rate, and debt fields (`liquidity_rate`, `variable_borrow_rate`,
+  `total_variable_debt`, `liquidity_index`, `variable_borrow_index`, `stable_borrow_rate`)
+  are serialized as **decimal strings** to avoid JSON integer precision loss for u128
+  values. `liquidity_index` and `variable_borrow_index` default to the RAY value (`1e27`);
+  `stable_borrow_rate` and `last_update_timestamp` default to `0`.
 - Invariant #2: this document MUST stay synchronized with `prewarm::ReserveData`. The
   detector's private `RawReserve` mirror parses the same JSON and uses the same defaults.

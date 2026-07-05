@@ -28,12 +28,48 @@ pub struct PacingConfig {
     pub oracle_staleness_seconds: u64,
     #[serde(default = "default_eth_price_usd_fallback")]
     pub eth_price_usd_fallback: Decimal,
+    /// Chainlink ETH/USD feed address for live gas-cost pricing.
+    /// Pacing uses ChainlinkOracle — the feed address is inserted into
+    /// the feed map keyed by itself so `refresh_eth_price` can resolve it.
+    /// On chains where AaveOracle is preferred for pacing, rename this field
+    /// to match the WETH/asset address and change the oracle wiring in main.rs.
+    #[serde(default = "default_eth_usd_feed_address")]
+    pub eth_usd_feed_address: String,
     #[serde(default = "default_recent_outcomes_capacity")]
     pub recent_outcomes_capacity: usize,
     #[serde(default = "default_eoa_pool_path")]
     pub eoa_pool_path: String,
     #[serde(default = "default_pools_toml_path")]
     pub pools_toml_path: String,
+    #[serde(default)]
+    pub executor_address: String,
+    #[serde(default)]
+    pub treasury_address: String,
+    #[serde(default)]
+    pub treasury_keystore: String,
+    #[serde(default)]
+    pub worker_keystore_dir: String,
+    #[serde(default = "default_sweep_interval_secs")]
+    pub sweep_interval_secs: u64,
+    #[serde(default = "default_refund_interval_secs")]
+    pub refund_interval_secs: u64,
+    #[serde(default = "default_min_worker_balance_eth")]
+    pub min_worker_balance_eth: Decimal,
+    #[serde(default = "default_refund_topup_eth")]
+    pub refund_topup_eth: Decimal,
+
+    #[serde(default)]
+    pub sweep_tokens: Vec<String>,
+
+    #[serde(default = "default_sweep_min_keep_eth")]
+    pub sweep_min_keep_eth: Decimal,
+
+    /// WebSocket endpoint for the block-watch trigger. When populated, the
+    /// orchestrator subscribes to `newHeads` via WebSocket instead of using
+    /// fixed-interval polling. If empty (default), polling is used.
+    /// Form: "ws://host:port" or "wss://host:port".
+    #[serde(default)]
+    pub ws_endpoint: String,
 }
 
 fn default_chain_id() -> u64 {
@@ -45,6 +81,9 @@ fn default_oracle_staleness_seconds() -> u64 {
 fn default_eth_price_usd_fallback() -> Decimal {
     Decimal::from(1800)
 }
+fn default_eth_usd_feed_address() -> String {
+    "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into()
+}
 fn default_recent_outcomes_capacity() -> usize {
     128
 }
@@ -53,6 +92,27 @@ fn default_eoa_pool_path() -> String {
 }
 fn default_pools_toml_path() -> String {
     "config/pools.toml".into()
+}
+fn default_sweep_interval_secs() -> u64 {
+    300
+}
+fn default_refund_interval_secs() -> u64 {
+    3600
+}
+fn default_min_worker_balance_eth() -> Decimal {
+    Decimal::from_str("0.01").expect("valid literal")
+}
+fn default_refund_topup_eth() -> Decimal {
+    Decimal::from_str("0.05").expect("valid literal")
+}
+fn default_sweep_min_keep_eth() -> Decimal {
+    Decimal::from_str("0.005").expect("valid literal")
+}
+fn default_router_compatibility() -> String {
+    String::new()
+}
+fn default_min_profit_fraction() -> Decimal {
+    Decimal::from_str("0.8").expect("valid literal")
 }
 
 impl Default for PacingConfig {
@@ -75,9 +135,21 @@ impl Default for PacingConfig {
             chain_id: 8453,
             oracle_staleness_seconds: 300,
             eth_price_usd_fallback: Decimal::from(1800),
+            eth_usd_feed_address: default_eth_usd_feed_address(),
             recent_outcomes_capacity: 128,
             eoa_pool_path: "config/eoa_pool.json".into(),
             pools_toml_path: "config/pools.toml".into(),
+            executor_address: String::new(),
+            treasury_address: String::new(),
+            treasury_keystore: String::new(),
+            worker_keystore_dir: String::new(),
+            sweep_interval_secs: 300,
+            refund_interval_secs: 3600,
+            min_worker_balance_eth: Decimal::from_str("0.01").expect("valid literal"),
+            refund_topup_eth: Decimal::from_str("0.05").expect("valid literal"),
+            sweep_tokens: Vec::new(),
+            sweep_min_keep_eth: Decimal::from_str("0.005").expect("valid literal"),
+            ws_endpoint: String::new(),
         }
     }
 }
@@ -212,8 +284,19 @@ impl PacingConfig {
 
         if let Ok(v) = std::env::var("CHIMERA_EXECUTE_MODE") { self.execute_mode = v; }
         if let Ok(v) = std::env::var("CHIMERA_LOG_LEVEL")    { self.log_level    = v; }
+        if let Ok(v) = std::env::var("CHIMERA_ETH_USD_FEED_ADDRESS")    { self.eth_usd_feed_address    = v; }
         if let Ok(v) = std::env::var("CHIMERA_EOA_POOL_PATH")    { self.eoa_pool_path    = v; }
         if let Ok(v) = std::env::var("CHIMERA_POOLS_TOML_PATH")  { self.pools_toml_path  = v; }
+        if let Ok(v) = std::env::var("CHIMERA_EXECUTOR_ADDRESS") { self.executor_address = v; }
+        if let Ok(v) = std::env::var("CHIMERA_TREASURY_ADDRESS") { self.treasury_address = v; }
+        if let Ok(v) = std::env::var("CHIMERA_TREASURY_KEYSTORE") { self.treasury_keystore = v; }
+        if let Ok(v) = std::env::var("CHIMERA_WORKER_KEYSTORE_DIR") { self.worker_keystore_dir = v; }
+        override_parse!("CHIMERA_SWEEP_INTERVAL_SECS", self.sweep_interval_secs, u64);
+        override_parse!("CHIMERA_REFUND_INTERVAL_SECS", self.refund_interval_secs, u64);
+        override_decimal!("CHIMERA_MIN_WORKER_BALANCE_ETH", self.min_worker_balance_eth);
+        override_decimal!("CHIMERA_REFUND_TOPUP_ETH", self.refund_topup_eth);
+
+        if let Ok(v) = std::env::var("CHIMERA_WS_ENDPOINT") { self.ws_endpoint = v; }
 
         Ok(())
     }
@@ -230,8 +313,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn valid_yaml() -> String {
-        r#"
-max_daily_net_usd: 2000
+        "max_daily_net_usd: 2000
 max_weekly_net_usd: 7500
 max_single_transfer_usd: 1000
 min_interval_hours: 6
@@ -248,11 +330,22 @@ metrics_port: 9100
 chain_id: 8453
 oracle_staleness_seconds: 300
 eth_price_usd_fallback: 1800
+eth_usd_feed_address: \"0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b\"
 recent_outcomes_capacity: 128
 eoa_pool_path: config/eoa_pool.json
 pools_toml_path: config/pools.toml
-"#
-        .into()
+executor_address: \"\"
+treasury_address: \"\"
+treasury_keystore: \"\"
+worker_keystore_dir: \"\"
+sweep_interval_secs: 300
+refund_interval_secs: 3600
+min_worker_balance_eth: 0.01
+refund_topup_eth: 0.05
+sweep_tokens: []
+sweep_min_keep_eth: 0.005
+ws_endpoint: \"\"
+".to_string()
     }
 
     #[test]
@@ -267,6 +360,7 @@ pools_toml_path: config/pools.toml
         assert_eq!(cfg.chain_id,                8453);
         assert_eq!(cfg.oracle_staleness_seconds, 300);
         assert_eq!(cfg.eth_price_usd_fallback,  Decimal::from(1800));
+        assert_eq!(cfg.eth_usd_feed_address,   "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b");
         assert_eq!(cfg.eoa_pool_path,           "config/eoa_pool.json");
         assert_eq!(cfg.pools_toml_path,         "config/pools.toml");
     }
@@ -373,6 +467,16 @@ pub struct RiskConfig {
     pub max_loss_eth: Decimal,
     /// Minimum profit multiplier over (gas + priority + L1 data fee).
     pub min_profit: Decimal,
+    /// Fraction of expected profit enforced as the on-chain `min_profit` gate.
+    /// Range 0.0–1.0. Default 0.8 requires 80% of simulated expected profit to be
+    /// retained on-chain, protecting against sandwich attacks while leaving a buffer
+    /// for gas/slippage variance.
+    ///
+    /// The orchestrator converts `expected_profit_usd → debt‑token wei` using the
+    /// ETH/USD oracle price (assumes WETH as the debt asset, matching the routing
+    /// config pairs). For non‑WETH debt assets, this conversion is approximate.
+    #[serde(default = "default_min_profit_fraction")]
+    pub min_profit_fraction: Decimal,
     /// Consecutive bundle reverts before auto-halt.
     pub auto_halt_reverts: u32,
     /// L2 gas price ceiling in gwei.
@@ -396,6 +500,7 @@ impl Default for RiskConfig {
         Self {
             max_loss_eth: Decimal::from_str("0.005").expect("valid literal"),
             min_profit: Decimal::from_str("2.5").expect("valid literal"),
+            min_profit_fraction: Decimal::from_str("0.8").expect("valid literal"),
             auto_halt_reverts: 3,
             max_gas_gwei: 300,
             slippage_max_bps: 50,
@@ -443,7 +548,53 @@ impl RiskConfig {
 }
 
 // ---------------------------------------------------------------------------
-// RoutingConfig ΓÇö loaded from config/routing.yaml
+// StrategyParams — ABI layout matching Executor.yul (9 * 32 = 288 bytes)
+// ---------------------------------------------------------------------------
+
+/// StrategyParams — explicit 9-word (288-byte) ABI layout for Executor.yul.
+/// Every field occupies a full 32-byte word; addresses are left-padded to 32 bytes.
+/// Field order matches Yul `calldataload` offsets documented in Executor.yul:85.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StrategyParams {
+    /// word 0: collateralAsset (address, left-padded)
+    pub collateral_asset: [u8; 32],
+    /// word 1: userToLiquidate (address, left-padded)
+    pub user_to_liquidate: [u8; 32],
+    /// word 2: debtToCover (uint256)
+    pub debt_to_cover: [u8; 32],
+    /// word 3: receiveAToken (uint256, 0/1)
+    pub receive_a_token: [u8; 32],
+    /// word 4: dexRouter (address, left-padded)
+    pub dex_router: [u8; 32],
+    /// word 5: amountOutMin (uint256)
+    pub amount_out_min: [u8; 32],
+    /// word 6: minProfit (uint256)
+    pub min_profit: [u8; 32],
+    /// word 7: tip (uint256)
+    pub tip: [u8; 32],
+    /// word 8: deadline (uint256)
+    pub deadline: [u8; 32],
+}
+
+impl StrategyParams {
+    /// Encode to exactly 288 bytes (9 * 32) in the documented field order.
+    pub fn encode(&self) -> [u8; 288] {
+        let mut out = [0u8; 288];
+        out[0..32].copy_from_slice(&self.collateral_asset);
+        out[32..64].copy_from_slice(&self.user_to_liquidate);
+        out[64..96].copy_from_slice(&self.debt_to_cover);
+        out[96..128].copy_from_slice(&self.receive_a_token);
+        out[128..160].copy_from_slice(&self.dex_router);
+        out[160..192].copy_from_slice(&self.amount_out_min);
+        out[192..224].copy_from_slice(&self.min_profit);
+        out[224..256].copy_from_slice(&self.tip);
+        out[256..288].copy_from_slice(&self.deadline);
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RoutingConfig — loaded from config/routing.yaml
 // ---------------------------------------------------------------------------
 
 /// A single DEX/liquidity venue entry.
@@ -455,6 +606,19 @@ pub struct VenueEntry {
     #[serde(rename = "type")]
     pub venue_type: String,
     pub kyc: bool,
+    #[serde(default)]
+    pub router_address: String,
+    #[serde(default)]
+    pub pairs: Vec<TradingPair>,
+    #[serde(default = "default_router_compatibility")]
+    pub router_compatibility: String,
+}
+
+/// V2 2-hop trading pair definition.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+pub struct TradingPair {
+    pub token_in: String,
+    pub token_out: String,
 }
 
 /// Routing and venue configuration. Loaded from `config/routing.yaml`.
@@ -473,6 +637,21 @@ pub struct RoutingConfig {
     /// Forensic tag source URIs (remote URLs or "local:<path>").
     #[serde(default)]
     pub forensic_tag_sources: Vec<String>,
+}
+
+impl Default for VenueEntry {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            chain: String::new(),
+            liquidity_usd_min: 0,
+            venue_type: String::new(),
+            kyc: false,
+            router_address: String::new(),
+            pairs: Vec::new(),
+            router_compatibility: String::new(),
+        }
+    }
 }
 
 impl Default for RoutingConfig {
@@ -513,7 +692,7 @@ impl RoutingConfig {
         for venue in &self.venues {
             if venue.kyc {
                 return Err(ChimeraError::ConfigError(format!(
-                    "routing.yaml venue '{}' has kyc: true ΓÇö only non-KYC venues allowed",
+                    "routing.yaml venue '{}' has kyc: true — only non-KYC venues allowed",
                     venue.name
                 )));
             }
@@ -521,6 +700,12 @@ impl RoutingConfig {
                 return Err(ChimeraError::ConfigError(format!(
                     "routing.yaml venue '{}' liquidity_usd_min {} below $50k floor",
                     venue.name, venue.liquidity_usd_min
+                )));
+            }
+            if !["v2", "v3", "custom", ""].contains(&venue.router_compatibility.as_str()) {
+                return Err(ChimeraError::ConfigError(format!(
+                    "routing.yaml venue '{}' has unknown router_compatibility '{}'",
+                    venue.name, venue.router_compatibility
                 )));
             }
         }
@@ -567,6 +752,10 @@ venues:
     liquidity_usd_min: 50000
     type: dex
     kyc: false
+    router_address: "0x0000000000000000000000000000000000000001"
+    pairs:
+      - token_in: "0xUSDC"
+        token_out: "0xWETH"
   - name: uniswap-v3-base
     chain: base
     liquidity_usd_min: 75000
@@ -702,12 +891,66 @@ forensic_tag_sources:
     }
 
     #[test]
+    fn test_routing_yaml_new_fields_present() {
+        let path = std::path::Path::new("../config/routing.yaml");
+        let path = if path.exists() { path } else { std::path::Path::new("config/routing.yaml") };
+        if path.exists() {
+            let cfg = RoutingConfig::load(path).expect("routing.yaml must parse");
+            // At least one venue must have the new T3 routing fields populated
+            let has_new_fields = cfg.venues.iter().any(|v| {
+                !v.router_address.is_empty() && !v.pairs.is_empty()
+            });
+            assert!(has_new_fields, "checked-in routing.yaml must contain router_address + pairs for ≥1 venue");
+        }
+    }
+
+    #[test]
     fn test_disk_routing_yaml_parses() {
         let path = std::path::Path::new("../config/routing.yaml");
         let path = if path.exists() { path } else { std::path::Path::new("config/routing.yaml") };
         if path.exists() {
             RoutingConfig::load(path).expect("config/routing.yaml must parse as RoutingConfig");
         }
+    }
+
+    #[test]
+    fn test_strategy_params_288_byte_abi_layout() {
+        use alloy::primitives::Address;
+
+        // Build a sample StrategyParams with known address values
+        let mut p = StrategyParams::default();
+        // collateral_asset = 0x0000...0001 (left-padded address)
+        p.collateral_asset[31] = 0x01;
+        // user_to_liquidate = 0x0000...0002
+        p.user_to_liquidate[31] = 0x02;
+        // debt_to_cover = 1000 (little-endian at end of word)
+        p.debt_to_cover[28..32].copy_from_slice(&1000u32.to_be_bytes());
+        // receive_a_token = 1
+        p.receive_a_token[31] = 0x01;
+        // dex_router = 0x0000...0003
+        p.dex_router[31] = 0x03;
+        // amount_out_min = 500
+        p.amount_out_min[28..32].copy_from_slice(&500u32.to_be_bytes());
+        // min_profit = 10
+        p.min_profit[31] = 0x0A;
+        // tip = 1
+        p.tip[31] = 0x01;
+        // deadline = 999999
+        p.deadline[24..32].copy_from_slice(&999999u64.to_be_bytes());
+
+        let encoded = p.encode();
+        assert_eq!(encoded.len(), 288, "StrategyParams must encode to exactly 288 bytes");
+
+        // Offsets documented in Executor.yul:99-107
+        assert_eq!(&encoded[0..32], &p.collateral_asset, "word0 offset 0");
+        assert_eq!(&encoded[32..64], &p.user_to_liquidate, "word1 offset 32");
+        assert_eq!(&encoded[64..96], &p.debt_to_cover, "word2 offset 64");
+        assert_eq!(&encoded[96..128], &p.receive_a_token, "word3 offset 96");
+        assert_eq!(&encoded[128..160], &p.dex_router, "word4 offset 128");
+        assert_eq!(&encoded[160..192], &p.amount_out_min, "word5 offset 160");
+        assert_eq!(&encoded[192..224], &p.min_profit, "word6 offset 192");
+        assert_eq!(&encoded[224..256], &p.tip, "word7 offset 224");
+        assert_eq!(&encoded[256..288], &p.deadline, "word8 offset 256");
     }
 }
 

@@ -179,9 +179,8 @@ class Venue:
     liquidity_usd_min: int
     type: str
     kyc: bool
-    address: str | None = None
-    pair: str | None = None
-    verified: bool = False
+    router_address: str | None = None
+    pairs: list[str] | None = None
 
     def to_yaml_record(self) -> dict[str, Any]:
         return {
@@ -190,9 +189,8 @@ class Venue:
             "liquidity_usd_min": self.liquidity_usd_min,
             "type": self.type,
             "kyc": self.kyc,
-            "address": self.address,
-            "pair": self.pair,
-            "verified": self.verified,
+            "router_address": self.router_address,
+            "pairs": self.pairs or [],
         }
 
 

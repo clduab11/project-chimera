@@ -1,3 +1,84 @@
 {
-  "$schema": "https://app.kilo.ai/config.json"
+  "$schema": "https://app.kilo.ai/config.json",
+  "instructions": [
+    ".kilo/rules/semi-agentic-64k.md"
+  ],
+  "model": "lmstudio/gemma-4-26b-a4b-qat",
+  "agent": {},
+  "provider": {
+    "lmstudio": {
+      "models": {
+        "gemma-4-26b-a4b-qat": {
+          "id": "gemma-4-26b-a4b-qat",
+          "name": "Gemma 4 26B A4B QAT",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        },
+        "gemma4-26b-a4b-uncensored-hauhaucs-balanced": {
+          "id": "gemma4-26b-a4b-uncensored-hauhaucs-balanced",
+          "name": "Gemma 4 26B A4B Balanced (HauhauCS)",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "gemma-4-12b-qat": {
+          "id": "google/gemma-4-12b-qat",
+          "name": "Gemma 4 12B QAT",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        },
+        "qwen3.5-4b-aggressive": {
+          "id": "qwen3.5-4b-uncensored-hauhaucs-aggressive",
+          "name": "Qwen3.5 4B Aggressive",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "lfm2.5-8b-a1b-moq": {
+          "id": "lfm2.5-8b-a1b-moq",
+          "name": "LFM 2.5 8B A1B MoQ",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "granite-4.0-h-tiny": {
+          "id": "granite-4.0-h-tiny",
+          "name": "Granite 4.0 H Tiny",
+          "tool_call": true,
+          "reasoning": false,
+          "limit": {
+            "context": 131072,
+            "output": 8192
+          }
+        },
+        "jinx-gpt-oss-20b": {
+          "id": "jinx-gpt-oss-20b",
+          "name": "Jinx GPT OSS 20B",
+          "tool_call": true,
+          "reasoning": true,
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
 }

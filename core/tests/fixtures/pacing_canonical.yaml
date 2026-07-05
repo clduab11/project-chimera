@@ -1,5 +1,5 @@
 # Canonical pacing config — all Rust defaults, Python scripts, and docs must match this.
-# Last verified: 2026-06-17
+# Last verified: 2026-07-02
 max_daily_net_usd: 2000
 max_weekly_net_usd: 7500
 max_single_transfer_usd: 1000
@@ -17,6 +17,18 @@ metrics_port: 9100
 chain_id: 8453
 oracle_staleness_seconds: 300
 eth_price_usd_fallback: 1800
+eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b"
 recent_outcomes_capacity: 128
 eoa_pool_path: config/eoa_pool.json
 pools_toml_path: config/pools.toml
+executor_address: ""
+treasury_address: ""
+treasury_keystore: ""
+worker_keystore_dir: ""
+sweep_interval_secs: 300
+refund_interval_secs: 3600
+min_worker_balance_eth: 0.01
+refund_topup_eth: 0.05
+sweep_tokens: []
+sweep_min_keep_eth: 0.005
+ws_endpoint: ""

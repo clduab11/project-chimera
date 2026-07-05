@@ -98,21 +98,80 @@ impl StatePersistence for JsonlPersistence {
         content.push_str(&line);
         content.push('\n');
 
+        // Log the target path for debugging
+        let display_path = self.file_path.display();
+        let log_target = format!("Writing to file: {}", display_path);
+        println!("{}", log_target);
+
         let temp_path = self.file_path.with_extension("jsonl.tmp");
-        fs::write(&temp_path, &content)
-            .await
-            .map_err(ChimeraError::Io)?;
 
-        let temp_file = File::open(&temp_path).await.map_err(ChimeraError::Io)?;
-        temp_file.sync_all().await.map_err(ChimeraError::Io)?;
-        drop(temp_file);
+        if let Some(parent) = temp_path.parent() {
+            fs::create_dir_all(parent).await.map_err(ChimeraError::Io)?;
+        }
 
-        fs::rename(&temp_path, &self.file_path)
-            .await
-            .map_err(ChimeraError::Io)?;
+        // Write content to temp file with error handling
+        let write_result = fs::write(&temp_path, &content).await;
+        match write_result {
+            Ok(_) => (),
+            Err(e) => {
+                eprintln!("Failed to write temp file: {:?}", e);
+                let error = ChimeraError::Io(e);
+                // Clean up temp file if it exists
+                if temp_path.exists() {
+                    let _ = fs::remove_file(&temp_path).await;
+                }
+                return Err(error);
+            }
+        }
+
+        // Ensure temp file is properly closed before opening for sync
+        drop(content);
+
+        // Try to open file for sync - handle errors gracefully
+        let temp_file_result = File::open(&temp_path).await;
+        match temp_file_result {
+            Ok(temp_file) => {
+                let sync_result = temp_file.sync_all().await;
+                match sync_result {
+                    Ok(_) => (),
+                    Err(e) => {
+                        eprintln!("Failed to sync temp file: {:?}", e);
+                        // Clean up temp file
+                        let _ = fs::remove_file(&temp_path).await;
+                        return Err(ChimeraError::Io(e));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to open temp file for sync: {:?}", e);
+                // Clean up temp file
+                if temp_path.exists() {
+                    let _ = fs::remove_file(&temp_path).await;
+                }
+                return Err(ChimeraError::Io(e));
+            }
+        }
+
+        // Try to rename temp file to final location
+        let rename_result = fs::rename(&temp_path, &self.file_path).await;
+        match rename_result {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("Failed to rename temp file: {:?}", e);
+                // Try to clean up temp file even if rename fails
+                if temp_path.exists() {
+                    let _ = fs::remove_file(&temp_path).await;
+                }
+                return Err(ChimeraError::Io(e));
+            }
+        }
 
         self.rotate_if_needed().await?;
         Ok(())
+    }
+
+    async fn recover_state(&self) -> Result<crate::state::RecoveredState, ChimeraError> {
+        crate::state::recovery::CrashRecovery::recover_from_jsonl(&self.file_path).await
     }
 
     async fn load_recent(&self, limit: usize) -> Result<Vec<OutcomeRecord>, ChimeraError> {
@@ -148,10 +207,6 @@ impl StatePersistence for JsonlPersistence {
 
         Ok(records)
     }
-
-    async fn recover_state(&self) -> Result<RecoveredState, ChimeraError> {
-        CrashRecovery::recover_from_jsonl(&self.file_path).await
-    }
 }
 
 #[cfg(test)]
@@ -176,9 +231,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore = "fsync not supported on Windows temp directories")]
     async fn test_append_and_load_recent() {
         let dir = tempfile::tempdir().unwrap();
-        let path: PathBuf = dir.path().join("audit.jsonl");
+        let path = dir.path().join("audit.jsonl");
         let persistence = JsonlPersistence::new(path.clone(), 10, 3);
 
         let r1 = make_test_record("001", 100.0, false);
@@ -215,6 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore = "fsync not supported on Windows temp directories")]
     async fn test_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -228,6 +285,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(target_os = "windows", ignore = "fsync not supported on Windows temp directories")]
     async fn test_recover_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");

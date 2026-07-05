@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
+use std::io::{BufRead, BufReader as SyncBufReader};
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -78,6 +79,86 @@ impl CrashRecovery {
         }
 
         // Count trailing consecutive reverts
+        for record in records.iter().rev() {
+            if record.reverted {
+                consecutive_reverts += 1;
+            } else {
+                break;
+            }
+        }
+
+        if let Some(last) = records.last() {
+            last_time = Some(last.timestamp);
+        }
+
+        Ok(RecoveredState {
+            daily_usage_usd: daily_usage,
+            weekly_usage_usd: weekly_usage,
+            consecutive_reverts,
+            last_outcome_time: last_time,
+        })
+    }
+
+    /// Synchronous variant of [`Self::recover_from_jsonl`] that uses blocking I/O.
+    ///
+    /// Callers must ensure they are NOT inside a Tokio runtime, or this will
+    /// block the async worker. Preferred for call-sites that are already
+    /// synchronous (e.g. inside a `std::sync::Mutex` or file-lock critical
+    /// section) or for boot-time recovery before the async loop starts.
+    pub fn recover_from_jsonl_sync(path: &Path) -> Result<RecoveredState, ChimeraError> {
+        if !path.exists() {
+            return Ok(RecoveredState {
+                daily_usage_usd: Decimal::ZERO,
+                weekly_usage_usd: Decimal::ZERO,
+                consecutive_reverts: 0,
+                last_outcome_time: None,
+            });
+        }
+
+        let file = std::fs::File::open(path).map_err(ChimeraError::Io)?;
+        let reader = SyncBufReader::new(file);
+
+        let mut records = Vec::new();
+
+        for line in reader.lines() {
+            let line = line.map_err(ChimeraError::Io)?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<OutcomeRecord>(&line) {
+                Ok(record) => records.push(record),
+                Err(e) => {
+                    warn!(
+                        "Corrupted JSONL line in {}: {}. Returning zeroed state.",
+                        path.display(),
+                        e
+                    );
+                    return Ok(RecoveredState {
+                        daily_usage_usd: Decimal::ZERO,
+                        weekly_usage_usd: Decimal::ZERO,
+                        consecutive_reverts: 0,
+                        last_outcome_time: None,
+                    });
+                }
+            }
+        }
+
+        let now = Utc::now();
+        let mut daily_usage = Decimal::ZERO;
+        let mut weekly_usage = Decimal::ZERO;
+        let mut consecutive_reverts: u32 = 0;
+        let mut last_time: Option<DateTime<Utc>> = None;
+
+        for record in &records {
+            let age = now - record.timestamp;
+            if age <= TimeDelta::days(1) {
+                daily_usage += record.realized_net_usd;
+            }
+            if age <= TimeDelta::days(7) {
+                weekly_usage += record.realized_net_usd;
+            }
+        }
+
         for record in records.iter().rev() {
             if record.reverted {
                 consecutive_reverts += 1;

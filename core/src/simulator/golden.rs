@@ -82,27 +82,6 @@ pub async fn run_golden_replays<P: alloy::providers::Provider<Ethereum> + Clone 
 mod tests {
     use super::*;
 
-    fn find_golden_replays_path() -> std::path::PathBuf {
-        let candidates = [
-            std::path::Path::new("../tests/fixtures/golden_replays.json"),
-            std::path::Path::new("core/tests/fixtures/golden_replays.json"),
-            std::path::Path::new("tests/fixtures/golden_replays.json"),
-        ];
-        for p in &candidates {
-            if p.exists() {
-                return p.to_path_buf();
-            }
-        }
-        panic!(
-            "golden_replays.json not found in any of: {}",
-            candidates
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
     #[test]
     fn golden_replays_parse() {
         let raw = std::fs::read_to_string("tests/fixtures/golden_replays.json")

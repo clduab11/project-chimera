@@ -60,12 +60,36 @@ fn assert_configs_eq(a: &PacingConfig, b: &PacingConfig, ctx: &str) {
         "[{ctx}] oracle_staleness_seconds: {} != {}", a.oracle_staleness_seconds, b.oracle_staleness_seconds);
     assert_eq!(a.eth_price_usd_fallback, b.eth_price_usd_fallback,
         "[{ctx}] eth_price_usd_fallback: {} != {}", a.eth_price_usd_fallback, b.eth_price_usd_fallback);
+    assert_eq!(a.eth_usd_feed_address, b.eth_usd_feed_address,
+        "[{ctx}] eth_usd_feed_address: {} != {}", a.eth_usd_feed_address, b.eth_usd_feed_address);
     assert_eq!(a.recent_outcomes_capacity, b.recent_outcomes_capacity,
         "[{ctx}] recent_outcomes_capacity: {} != {}", a.recent_outcomes_capacity, b.recent_outcomes_capacity);
     assert_eq!(a.eoa_pool_path, b.eoa_pool_path,
         "[{ctx}] eoa_pool_path: {} != {}", a.eoa_pool_path, b.eoa_pool_path);
     assert_eq!(a.pools_toml_path, b.pools_toml_path,
         "[{ctx}] pools_toml_path: {} != {}", a.pools_toml_path, b.pools_toml_path);
+    assert_eq!(a.executor_address, b.executor_address,
+        "[{ctx}] executor_address: {} != {}", a.executor_address, b.executor_address);
+    assert_eq!(a.treasury_address, b.treasury_address,
+        "[{ctx}] treasury_address: {} != {}", a.treasury_address, b.treasury_address);
+    assert_eq!(a.treasury_keystore, b.treasury_keystore,
+        "[{ctx}] treasury_keystore: {} != {}", a.treasury_keystore, b.treasury_keystore);
+    assert_eq!(a.worker_keystore_dir, b.worker_keystore_dir,
+        "[{ctx}] worker_keystore_dir: {} != {}", a.worker_keystore_dir, b.worker_keystore_dir);
+    assert_eq!(a.sweep_interval_secs, b.sweep_interval_secs,
+        "[{ctx}] sweep_interval_secs: {} != {}", a.sweep_interval_secs, b.sweep_interval_secs);
+    assert_eq!(a.refund_interval_secs, b.refund_interval_secs,
+        "[{ctx}] refund_interval_secs: {} != {}", a.refund_interval_secs, b.refund_interval_secs);
+    assert_eq!(a.min_worker_balance_eth, b.min_worker_balance_eth,
+        "[{ctx}] min_worker_balance_eth: {} != {}", a.min_worker_balance_eth, b.min_worker_balance_eth);
+    assert_eq!(a.refund_topup_eth, b.refund_topup_eth,
+        "[{ctx}] refund_topup_eth: {} != {}", a.refund_topup_eth, b.refund_topup_eth);
+    assert_eq!(a.sweep_tokens, b.sweep_tokens,
+        "[{ctx}] sweep_tokens: {:?} != {:?}", a.sweep_tokens, b.sweep_tokens);
+    assert_eq!(a.sweep_min_keep_eth, b.sweep_min_keep_eth,
+        "[{ctx}] sweep_min_keep_eth: {} != {}", a.sweep_min_keep_eth, b.sweep_min_keep_eth);
+    assert_eq!(a.ws_endpoint, b.ws_endpoint,
+        "[{ctx}] ws_endpoint: {} != {}", a.ws_endpoint, b.ws_endpoint);
 }
 
 #[test]

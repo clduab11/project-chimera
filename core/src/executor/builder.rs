@@ -79,18 +79,20 @@ impl CalldataBuilder {
     /// Encode an Aave V3 `flashLoanSimple`.
     ///
     /// # Arguments
-    /// * `pool`   – Aave Pool address (target of the call).
-    /// * `asset`  – Asset to flash-loan.
-    /// * `amount` – Amount to borrow.
-    /// * `params` – ABI-encoded parameters forwarded to the receiver.
+    /// * `pool`            – Aave Pool address (transaction target only).
+    /// * `receiver_address`– Receiver that receives the flash loan (encoded in calldata).
+    /// * `asset`           – Asset to flash-loan.
+    /// * `amount`          – Amount to borrow.
+    /// * `params`          – ABI-encoded parameters forwarded to the receiver.
     pub fn build_flash_loan_simple(
         pool: Address,
+        receiver_address: Address,
         asset: Address,
         amount: U256,
         params: Bytes,
     ) -> Bytes {
         let call = IAavePoolSimple::flashLoanSimpleCall {
-            receiverAddress: pool,
+            receiverAddress: receiver_address,
             asset,
             amount,
             params,
@@ -174,6 +176,7 @@ mod tests {
     #[test]
     fn test_flash_loan_simple_non_empty() {
         let data = CalldataBuilder::build_flash_loan_simple(
+            Address::ZERO,
             Address::ZERO,
             Address::ZERO,
             U256::ZERO,
@@ -264,5 +267,21 @@ mod tests {
 
         // Fifth param (offset 128..160) is receiveAToken (bool padded to 32 bytes).
         assert_eq!(params[159], 0);
+    }
+
+    #[test]
+    fn test_flash_loan_simple_encodes_receiver_not_pool() {
+        let pool: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
+        let worker: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
+        let asset: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+        let amount = U256::from(1_000_000u64);
+        let params = Bytes::from_static(&[0u8; 4]);
+
+        let encoded = CalldataBuilder::build_flash_loan_simple(pool, worker, asset, amount, params);
+        // Skip 4-byte selector; decode the 5 ABI-encoded args.
+        let data = &encoded[4..];
+        // receiverAddress is the first argument (offset 0..32).
+        let decoded_receiver = Address::from_slice(&data[12..32]);
+        assert_eq!(decoded_receiver, worker, "receiver must equal supplied worker, not pool");
     }
 }

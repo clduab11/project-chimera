@@ -8,8 +8,7 @@
 >
 > Honesty note: some referenced helpers are fully wired and some are still
 > partial (e.g. `sweep_profits.py` currently prints a ready message rather than
-> sweeping; `fund_eoa.py` has a known `wallets` vs `workers` JSON-shape
-> mismatch). Treat a partial helper as "verify/extend before relying on it,"
+> sweeping). Treat a partial helper as "verify/extend before relying on it,"
 > not "done." See `docs/first-run-onboarding.md` §8–10.
 >
 > Nothing in this repo has been validated end-to-end with the full toolchain in
@@ -24,6 +23,7 @@ Run from a clean clone on a full-toolchain workstation. Every box must be green
 or explicitly documented before moving on.
 
 - [ ] `cargo test -p chimera-core` — green
+- [ ] `cargo test -p chimera-core test_load_valid_config` — config-load test passes (unit test in `core/src/config.rs`, not a separate integration test)
 - [ ] `forge test --root contracts/ -vvv` — green, including:
   - [ ] owner/auth tests (`exec`, `setPool`, `withdraw` reject non-owner)
   - [ ] withdraw path tests (ETH + ERC20, USDT-style no-return)
@@ -49,7 +49,11 @@ Deploy and exercise on testnet before any mainnet deployment.
 - [ ] Deploy via `contracts/script/Deploy.s.sol` to **Base Sepolia** and/or **Arbitrum Sepolia**
 - [ ] Confirm Executor `owner()` == the intended **multisig** address
 - [ ] Confirm `multisig.code.length > 0` (owner is a deployed contract, not an EOA typo)
-- [ ] Call `setPool(<aaveV3Pool>)` **from the multisig**; confirm slot 1 reads back the correct pool
+- [ ] Call `setPool(<aaveV3Pool>)` **from the multisig**; verify the pool address reads back from slot 1:
+      ```bash
+      cast storage <EXECUTOR_ADDRESS> 1 --rpc-url <RPC_URL>
+      ```
+      Note: The Executor contract has no `pool()` public view getter. Use `cast storage` to read slot 1 directly.
 - [ ] `FundDistributor`: constructor `_owner` set; then `transferOwnership(multisig)`
 - [ ] `FundDistributor`: multisig calls `acceptOwnership`; confirm `owner` == multisig and `pendingOwner` == 0
 - [ ] Verify both contracts on the block explorer (source + constructor args)
@@ -64,9 +68,9 @@ Deploy and exercise on testnet before any mainnet deployment.
 - [ ] Encrypted keystore created **outside the repo**; never committed (confirm `.gitignore`)
 - [ ] `CHIMERA_KEYSTORE_PATH` and `CHIMERA_KEYSTORE_PASSWORD` set in the host env
 - [ ] `CHIMERA_OPERATOR_TOKEN` set (gates `clear_breaker`); strong, not reused
-- [ ] RPC env(s) set (`RPC_URL`; multi-chain `BASE_RPC_URL`/`ARB_RPC_URL` is partial — see onboarding §9)
-- [ ] `config/eoa_pool.json` populated with **public addresses only**
-- [ ] Worker EOAs funded via `fund_eoa.py` (verify the `wallets` vs `workers` JSON-shape mismatch is resolved first; otherwise fund manually, ~0.02 ETH/worker)
+- [ ] RPC env(s) set (`BASE_RPC_URL` / `ARB_RPC_URL` are now wired in `main.rs`; `RPC_URL` used as fallback)
+- [ ] `config/eoa_pool.json` populated with **public addresses only**, using the `wallets` key (the `workers` vs `wallets` mismatch is resolved; `fund_eoa.py` now reads `wallets`)
+- [ ] Worker EOAs funded via `fund_eoa.py` (verify the script reads `wallets` key and your treasury key is available; default funding is ~0.02 ETH/worker)
 - [ ] `check_balances.py` confirms worker balances are gas-sized and treasury is cold
 - [ ] `config/pacing.yaml` reviewed — caps sane and conservative:
   - [ ] `max_daily_net_usd` (default $2,000)
@@ -77,9 +81,11 @@ Deploy and exercise on testnet before any mainnet deployment.
   - [ ] `auto_halt_on_reverts` (default 3) and `max_gas_gwei` (default 300)
   - [ ] `execute_mode: shadow`
 - [ ] Snapshot generated via `snapshot_generator.py` (`--mock` first, then real RPC)
-- [ ] Monitoring up: Prometheus + Grafana (`localhost:3002`) + Alertmanager; dashboard provisioned; metrics endpoint responds on `:9100`
+- [ ] Monitoring up: Prometheus + Grafana (`localhost:3002`) + Alertmanager; dashboard provisioned; metrics endpoint responds on the computed port
+  - [ ] **Important:** The actual metrics port is `9100 + (chain_id % 1000)`, e.g. `:9553` for Base (chain_id=8453). It is NOT a flat `:9100` in the default binary configuration. Verify the port in `config/pacing.yaml` or with `curl` against the running process.
 - [ ] `chimera_breaker_state` reads `0` at startup
-- [ ] `health_check.py --full` — PASS
+- [ ] Run `health_check.py --rpc <RPC_URL> --metrics-port <ACTUAL_PORT>` — there is no `--full` flag; use the flags above
+- [ ] Run `check_balances.py --chain base --min-balance 0.01` to verify worker balances (default `--min-balance` is `0.0`; explicitly set the threshold you expect)
 
 ---
 
@@ -92,7 +98,7 @@ as designed before any capital is at risk.
 - [ ] **Zero unexpected breaker trips** over the window (any trip → investigate, do not paper over)
 - [ ] Simulated profit within **10%** of historical, cross-checked against `fetch_historical_liquidations.py`
 - [ ] Crash-restart recovery verified: kill the process, restart, confirm state restored via `recover_state.py`; verify recovered state against on-chain data
-- [ ] Emergency drill: `emergency_pause.py` trips the breaker in **≤ 5s**, visible as `chimera_breaker_state 1`, with an incident entry written
+- [ ] Emergency drill: `emergency_pause.py --state-file core/state/emergency.flag --reason "drill"` trips the breaker in **≤ 5s**, visible as `chimera_breaker_state 1`, with an incident entry written
 - [ ] Confirm breaker auto-trip conditions fire in shadow (3+ reverts, gas > 300 gwei, daily loss ≥ 0.005 ETH) via controlled simulation
 - [ ] `status.py` shows healthy, incrementing candidate/sim counters and no `ERROR` logs
 
@@ -118,11 +124,11 @@ Only enter this section after §1–4 are fully satisfied.
 Any operator must be able to stop the system and protect funds quickly. Practice
 this in the §4 drill.
 
-- [ ] **Halt now:** `emergency_pause.py --reason "<what you saw>"` (cancels pending, sets pause flag, writes incident)
+- [ ] **Halt now:** `emergency_pause.py --state-file core/state/emergency.flag --reason "<what you saw>"` (cancels pending, sets pause flag, writes incident)
 - [ ] **Return to safe mode:** `toggle_shadow.py --set-shadow` (logs only, no execution)
 - [ ] **Recover funds:**
   - [ ] Executor: `withdraw(token, amount)` from the multisig owner (amount `0` = full balance; `token=0` = native ETH)
   - [ ] FundDistributor: `emergencyWithdraw()` from the multisig owner
-- [ ] **Rotate exposure:** `rotate_eoa.py` (pool hygiene) and, if keys may be compromised, `rotate_wallet.py`
+- [ ] **Rotate exposure:** `rotate_eoa.py` (pool hygiene) and, if keys may be compromised, rotate keys manually
 - [ ] Do not clear the breaker until root cause is resolved; `clear_breaker` requires `CHIMERA_OPERATOR_TOKEN` by design
 - [ ] File an incident using the template in `docs/emergency-procedures.md`; leave the system explicitly paused or in shadow — never ambiguous

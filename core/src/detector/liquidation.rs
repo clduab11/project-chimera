@@ -124,6 +124,13 @@ struct RawReserve {
     /// Siloed-borrowing flag (asset can only be borrowed alone). Default false.
     #[serde(default)]
     siloed_borrowing: bool,
+    // --- Snapshot indices (u128 string contract; see docs/snapshot-schema.md). ---
+    /// Liquidity index as a RAY decimal string. "" → 1e27 (default).
+    #[serde(default)]
+    liquidity_index: String,
+    /// Variable borrow index as a RAY decimal string. "" → 1e27 (default).
+    #[serde(default)]
+    variable_borrow_index: String,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -165,6 +172,16 @@ fn parse_balance_map(
     Ok(out)
 }
 
+/// Parse an optional u128 index string from JSON. "" or absent → RAY (1e27).
+fn parse_index_or_ray(s: &str) -> U256 {
+    if s.is_empty() {
+        // Default RAY value for backward compatibility with older snapshots.
+        U256::from(1_000_000_000_000_000_000_000_000_000u128)
+    } else {
+        U256::from_str(s).unwrap_or(U256::from(1_000_000_000_000_000_000_000_000_000u128))
+    }
+}
+
 fn chain_name_to_id(chain: &str) -> u64 {
     match chain {
         "base" => 8453,
@@ -175,12 +192,11 @@ fn chain_name_to_id(chain: &str) -> u64 {
 
 impl RawSnapshot {
     fn into_market_snapshot(self) -> Result<MarketSnapshot, ChimeraError> {
-        let chain_id = chain_name_to_id(&self.chain);
-        // Neutral RAY indices: the JSON carries rates, not indices. With index = 1.0
-        // (RAY) the detector treats stored balances as already index-scaled amounts.
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+            let chain_id = chain_name_to_id(&self.chain);
+            // Index fields now sourced from the snapshot JSON; fall back to RAY for
+            // pre-edge-case snapshots that lack the keys (backward compatible).
 
-        let mut reserves = HashMap::with_capacity(self.reserves.len());
+            let mut reserves = HashMap::with_capacity(self.reserves.len());
         for r in self.reserves {
             let addr = Address::from_str(&r.address).map_err(|e| {
                 ChimeraError::ConfigError(format!("snapshot bad reserve address {}: {e}", r.address))
@@ -202,8 +218,8 @@ impl RawSnapshot {
                 ReserveData {
                     a_token: parse_addr_or_zero(&r.a_token),
                     variable_debt_token: parse_addr_or_zero(&r.variable_debt_token),
-                    liquidity_index: ray,
-                    variable_borrow_index: ray,
+                    liquidity_index: parse_index_or_ray(&r.liquidity_index),
+                    variable_borrow_index: parse_index_or_ray(&r.variable_borrow_index),
                     liquidation_bonus_bps: r.liquidation_bonus,
                     liquidation_threshold_bps: r.liquidation_threshold,
                     price_usd,

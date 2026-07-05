@@ -64,3 +64,38 @@ pub struct RecoveredState {
     /// Timestamp of the most recent outcome record.
     pub last_outcome_time: Option<DateTime<Utc>>,
 }
+
+/// A cross-process reservation record for global cap enforcement.
+///
+/// Written to a shared JSONL file under advisory file lock so that independent
+/// per-chain processes cannot jointly exceed daily/weekly caps.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReservationRecord {
+    /// Unique identifier for this reservation (typically the opportunity id).
+    pub id: String,
+    /// Chain ID this reservation applies to.
+    pub chain_id: u64,
+    /// The reserved net USD amount.
+    pub amount_usd: Decimal,
+    /// Current lifecycle status.
+    pub status: ReservationStatus,
+    /// When the reservation was created.
+    pub created_at: DateTime<Utc>,
+    /// When the reservation expires (TTL).
+    pub expires_at: DateTime<Utc>,
+    /// When the reservation was settled (only set on Settled).
+    #[serde(default)]
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+/// Lifecycle status of a reservation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReservationStatus {
+    /// Reservation is active and counting against global caps.
+    Reserved,
+    /// Outcome has been recorded; reservation is finalized.
+    Settled,
+    /// Reservation TTL expired without settlement.
+    Expired,
+}

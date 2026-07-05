@@ -133,7 +133,7 @@ POOL_DATA_PROVIDER_ABI: list[dict[str, Any]] = [
     },
 ]
 
-# Aave V3 Pool ABI (minimal fragment for events)
+# Aave V3 Pool ABI (minimal fragment for events + config decode)
 POOL_ABI: list[dict[str, Any]] = [
     {
         "anonymous": False,
@@ -152,6 +152,25 @@ POOL_ABI: list[dict[str, Any]] = [
         ],
         "name": "Borrow",
         "type": "event",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
+        "name": "getConfiguration",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "uint8", "name": "id", "type": "uint8"}],
+        "name": "getEModeCategoryData",
+        "outputs": [
+            {"internalType": "uint16", "name": "liquidationThreshold", "type": "uint16"},
+            {"internalType": "uint16", "name": "liquidationBonus", "type": "uint16"},
+            {"internalType": "address", "name": "priceSource", "type": "address"},
+            {"internalType": "string", "name": "label", "type": "string"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
     },
 ]
 
@@ -191,6 +210,13 @@ class Reserve:
     emode_liquidation_bonus: int = 0  # bps; carried for schema parity
     is_isolated: bool = False
     debt_ceiling: str = "0"  # decimal string (bits 212-251); string avoids JSON int precision loss
+    # --- Pre-warm indices / rates / timestamps (offset 1 & 3 in Pool ReserveData storage).
+    #     Default to RAY (1e27) neutral values; live snapshots populate from on-chain state.
+    liquidity_index: int = 10**27   # RAY
+    variable_borrow_index: int = 10**27  # RAY
+    stable_borrow_rate: int = 0     # RAY
+    last_update_timestamp: int = 0  # unix seconds
+    id: int = 0                     # Aave V3 reserve id (sequential index in active reserves)
 
 
 def load_pool_config(chain: str, path: str = "config/pools.toml") -> dict[str, str]:
@@ -273,6 +299,71 @@ def get_w3(chain: str, rpc_url: str | None = None) -> Web3:
 
 
 # ---------------------------------------------------------------------------
+# Bitmap decoding helpers
+# ---------------------------------------------------------------------------
+def _decode_configuration_bitmap(configuration: int) -> dict[str, Any]:
+    """Decode an Aave V3 ReserveConfigurationMap into a dict of field values.
+
+    Bit layout (Aave V3 Pool v1):
+      0-15   : LTV
+      16-31  : liquidationThreshold
+      32-47  : liquidationBonus
+      48-55  : decimals (not in the bitmap on-chain; set by config call)
+      56     : active
+      57     : frozen
+      60     : paused
+      62     : siloedBorrowing
+      152-167: liquidationProtocolFee (16 bits)
+      168-175: eModeCategory (8 bits)
+      212-251: debtCeiling (40 bits)
+    """
+    paused = bool((configuration >> 60) & 1)
+    siloed_borrowing = bool((configuration >> 62) & 1)
+    liquidation_protocol_fee = (configuration >> 152) & 0xFFFF
+    emode_category = (configuration >> 168) & 0xFF
+    debt_ceiling = (configuration >> 212) & 0xFFFFFFFFFF  # 40 bits
+    # is_isolated is derived on-chain from debt_ceiling > 0
+    is_isolated = debt_ceiling > 0
+    return {
+        "paused": paused,
+        "siloed_borrowing": siloed_borrowing,
+        "liquidation_protocol_fee": liquidation_protocol_fee,
+        "emode_category": emode_category,
+        "debt_ceiling": str(debt_ceiling),
+        "is_isolated": is_isolated,
+    }
+
+
+def _fetch_emode_category_data(
+    w3: Web3, pool_address: str, category_id: int
+) -> tuple[int, int]:
+    """Fetch eMode liquidation threshold and bonus for a category from the Pool."""
+    if category_id == 0:
+        return 0, 0
+    pool_contract = w3.eth.contract(
+        address=Web3.to_checksum_address(pool_address),
+        abi=[
+            {
+                "inputs": [{"internalType": "uint8", "name": "id", "type": "uint8"}],
+                "name": "getEModeCategoryData",
+                "outputs": [
+                    {"internalType": "uint16", "name": "liquidationThreshold", "type": "uint16"},
+                    {"internalType": "uint16", "name": "liquidationBonus", "type": "uint16"},
+                    {"internalType": "address", "name": "priceSource", "type": "address"},
+                    {"internalType": "string", "name": "label", "type": "string"},
+                ],
+                "stateMutability": "view",
+                "type": "function",
+            },
+        ],
+    )
+    result = _retry_with_backoff(
+        lambda: pool_contract.functions.getEModeCategoryData(category_id).call()
+    )
+    return int(result[0]), int(result[1])
+
+
+# ---------------------------------------------------------------------------
 # Reserve fetching
 # ---------------------------------------------------------------------------
 def fetch_reserves(
@@ -316,13 +407,36 @@ def fetch_reserves(
             is_active = bool(config[8])
             is_frozen = bool(config[9])
 
-            # NOTE: `paused`, `siloed_borrowing`, `is_isolated`, `debt_ceiling`,
-            # `liquidation_protocol_fee`, and the eMode fields are NOT exposed by the
-            # minimal getReserveConfigurationData ABI used here. A complete live
-            # implementation reads Pool.getConfiguration(asset) and decodes the packed
-            # ReserveConfigurationMap bitmap (protocol fee = bits 152-167, eMode = bits
-            # 168-175, debtCeiling = bits 212-251, paused = bit 60, siloed = bit 62).
-            # Until that is wired, these fall back to the safe serde defaults below.
+            # Read the full ReserveConfigurationMap bitmap from the Pool contract
+            # and decode remaining edge-case fields (paused, siloed, protocol fee,
+            # eMode category, debt ceiling, isolation flag).
+            pool_contract = w3.eth.contract(
+                address=Web3.to_checksum_address(pool_address),
+                abi=[
+                    {
+                        "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
+                        "name": "getConfiguration",
+                        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+                        "stateMutability": "view",
+                        "type": "function",
+                    },
+                ],
+            )
+            configuration = _retry_with_backoff(
+                lambda a=asset: pool_contract.functions.getConfiguration(a).call()
+            )
+            bitmap = _decode_configuration_bitmap(int(configuration))
+
+            # Fetch eMode category threshold/bonus if the reserve belongs to a category.
+            emode_lt, emode_bonus = 0, 0
+            if bitmap["emode_category"] > 0:
+                try:
+                    emode_lt, emode_bonus = _fetch_emode_category_data(
+                        w3, pool_address, bitmap["emode_category"]
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to fetch eMode data for category %d: %s", bitmap["emode_category"], exc)
+
             reserves.append(
                 Reserve(
                     address=asset,
@@ -339,7 +453,23 @@ def fetch_reserves(
                     variable_debt_token=token_addresses[2],
                     active=is_active,
                     frozen=is_frozen,
-                    # The remaining edge-case fields default; see note above.
+                    paused=bitmap["paused"],
+                    siloed_borrowing=bitmap["siloed_borrowing"],
+                    liquidation_protocol_fee=bitmap["liquidation_protocol_fee"],
+                    emode_category=bitmap["emode_category"],
+                    emode_liquidation_threshold=emode_lt,
+                    emode_liquidation_bonus=emode_bonus,
+                    is_isolated=bitmap["is_isolated"],
+                    debt_ceiling=bitmap["debt_ceiling"],
+                    # Indices / rates / timestamps from getReserveData tuple:
+                    #   [9]=liquidityIndex, [10]=variableBorrowIndex, [7]=stableBorrowRate, [11]=lastUpdateTimestamp
+                    liquidity_index=int(raw_data[9]),
+                    variable_borrow_index=int(raw_data[10]),
+                    stable_borrow_rate=int(raw_data[7]),
+                    last_update_timestamp=int(raw_data[11]),
+                    # id (reserve index) requires Pool.getReserveData, not PoolDataProvider.getReserveData.
+                    # Must call Pool contract directly; defaults to 0 for live snapshots.
+                    id=0,
                 )
             )
             logger.debug("[%d/%d] %s (%s)", idx, len(reserve_list), symbol, asset)
@@ -446,6 +576,56 @@ def fetch_user_positions(
 # ---------------------------------------------------------------------------
 # Serialization
 # ---------------------------------------------------------------------------
+# Fields that must be serialized as decimal strings to avoid JSON integer precision
+# loss for u128 values (serde_json requires `arbitrary_precision` for large ints).
+_U128_STRING_FIELDS = frozenset({
+    "liquidity_rate",
+    "variable_borrow_rate",
+    "total_variable_debt",
+    "liquidity_index",
+    "variable_borrow_index",
+    "stable_borrow_rate",
+})
+
+
+def _validate_live_snapshot(
+    reserves: list[Reserve], positions: dict[str, UserPosition]
+) -> list[str]:
+    """Validate active reserves for a live (non-mock) snapshot.
+
+    Returns a list of human-readable validation error messages. An empty list = valid.
+    """
+    errors: list[str] = []
+    ray = 10**27
+    for r in reserves:
+        if not r.active:
+            continue  # inactive reserves may legitimately carry defaults
+        if r.a_token == "0x0000000000000000000000000000000000000000":
+            errors.append(f"{r.symbol} ({r.address}): a_token is zero address")
+        if r.variable_debt_token == "0x0000000000000000000000000000000000000000":
+            errors.append(f"{r.symbol} ({r.address}): variable_debt_token is zero address")
+        if r.price_usd <= 0.0:
+            errors.append(f"{r.symbol} ({r.address}): price_usd is zero or negative")
+        if r.liquidity_index < ray:
+            errors.append(f"{r.symbol} ({r.address}): liquidity_index {r.liquidity_index} < RAY")
+        if r.variable_borrow_index < ray:
+            errors.append(f"{r.symbol} ({r.address}): variable_borrow_index {r.variable_borrow_index} < RAY")
+        if r.liquidity_rate == 0 and r.variable_borrow_rate == 0:
+            errors.append(f"{r.symbol} ({r.address}): both liquidity_rate and variable_borrow_rate are zero")
+    if not positions:
+        errors.append("no user positions found for live snapshot")
+    return errors
+
+
+def _reserve_to_dict(r: Reserve) -> dict[str, Any]:
+    """Serialize a Reserve to a JSON-safe dict with u128 fields as strings."""
+    d = asdict(r)
+    for key in _U128_STRING_FIELDS:
+        if key in d and isinstance(d[key], int):
+            d[key] = str(d[key])
+    return d
+
+
 def serialize_snapshot(
     reserves: list[Reserve],
     positions: dict[str, UserPosition],
@@ -460,7 +640,7 @@ def serialize_snapshot(
         "block_number": block_number,
         "pool": pool_address,
         "timestamp": int(time.time()),
-        "reserves": [asdict(r) for r in reserves],
+        "reserves": [_reserve_to_dict(r) for r in reserves],
         "users": {addr: asdict(pos) for addr, pos in positions.items()},
     }
 
@@ -506,6 +686,10 @@ def _mock_reserves(chain: str) -> list[Reserve]:
                 emode_liquidation_bonus=10200,
                 is_isolated=False,
                 debt_ceiling="0",
+                liquidity_index=1056789123456789123456789123,
+                variable_borrow_index=1034567891234567891234567891,
+                stable_borrow_rate=0,
+                last_update_timestamp=int(time.time()),
             ),
             Reserve(
                 address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
@@ -530,6 +714,10 @@ def _mock_reserves(chain: str) -> list[Reserve]:
                 emode_liquidation_bonus=0,
                 is_isolated=False,
                 debt_ceiling="0",
+                liquidity_index=1056789123456789123456789123,
+                variable_borrow_index=1034567891234567891234567891,
+                stable_borrow_rate=0,
+                last_update_timestamp=int(time.time()),
             ),
         ]
     # Arbitrum defaults
@@ -558,6 +746,10 @@ def _mock_reserves(chain: str) -> list[Reserve]:
             emode_liquidation_bonus=10200,
             is_isolated=False,
             debt_ceiling="0",
+            liquidity_index=1087654321987654321987654321,
+            variable_borrow_index=1045678912345678912345678912,
+            stable_borrow_rate=0,
+            last_update_timestamp=int(time.time()),
         ),
         Reserve(
             address="0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
@@ -582,6 +774,10 @@ def _mock_reserves(chain: str) -> list[Reserve]:
             emode_liquidation_bonus=0,
             is_isolated=False,
             debt_ceiling="0",
+            liquidity_index=1087654321987654321987654321,
+            variable_borrow_index=1045678912345678912345678912,
+            stable_borrow_rate=0,
+            last_update_timestamp=int(time.time()),
         ),
     ]
 
@@ -685,6 +881,16 @@ def main() -> int:
         reserves = fetch_reserves(w3, pool_address, data_provider)
         reserve_addrs = [r.address for r in reserves]
         positions = fetch_user_positions(w3, pool_address, data_provider, reserve_addrs)
+
+        # Validate live snapshot before writing.
+        val_errors = _validate_live_snapshot(reserves, positions)
+        if val_errors:
+            for err in val_errors:
+                logger.warning("Live snapshot validation: %s", err)
+            logger.info(
+                "Snapshot has %d validation warning(s); writing anyway (--mock to bypass)",
+                len(val_errors),
+            )
 
     serialize_snapshot(reserves, positions, args.chain, block_number, args.output, pool_address)
     return 0

@@ -12,7 +12,7 @@
 //! - `chimera_daily_net_usd`: Gauge of rolling 24h net USD
 //! - `chimera_weekly_net_usd`: Gauge of rolling 7d net USD
 
-use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
+use prometheus::{Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 
 pub struct Metrics {
     pub candidates_seen: IntCounterVec,
@@ -20,11 +20,14 @@ pub struct Metrics {
     pub sim_latency: HistogramVec,
     pub profit_usd: HistogramVec,
     pub reverts: IntCounterVec,
-    pub breaker_state: Gauge,
+    pub breaker_state: GaugeVec,
     pub gas_used: HistogramVec,
     pub l1_fee_wei: Gauge,
-    pub daily_net_usd: Gauge,
-    pub weekly_net_usd: Gauge,
+    pub daily_net_usd: GaugeVec,
+    pub weekly_net_usd: GaugeVec,
+    pub sweep_total: IntCounterVec,
+    pub sweep_skipped_breaker: IntCounterVec,
+    pub sweep_amount_wei: Gauge,
 }
 
 impl Metrics {
@@ -65,8 +68,11 @@ impl Metrics {
             &["reason"],
         )
         .unwrap();
-        let breaker_state =
-            Gauge::new("chimera_breaker_state", "Breaker state: 0=ok, 1=tripped").unwrap();
+        let breaker_state = GaugeVec::new(
+            Opts::new("chimera_breaker_state", "Breaker state: 0=ok, 1=tripped"),
+            &["chain"],
+        )
+        .unwrap();
         let gas_used = HistogramVec::new(
             HistogramOpts::new("chimera_gas_used", "Gas used per liquidation").buckets(vec![
                 100_000.0,
@@ -79,10 +85,32 @@ impl Metrics {
         )
         .unwrap();
         let l1_fee_wei = Gauge::new("chimera_l1_fee_wei", "L1 data fee in wei").unwrap();
-        let daily_net_usd =
-            Gauge::new("chimera_daily_net_usd", "Rolling 24h net USD").unwrap();
-        let weekly_net_usd =
-            Gauge::new("chimera_weekly_net_usd", "Rolling 7d net USD").unwrap();
+        let daily_net_usd = GaugeVec::new(
+            Opts::new("chimera_daily_net_usd", "Rolling 24h net USD"),
+            &["chain"],
+        )
+        .unwrap();
+        let weekly_net_usd = GaugeVec::new(
+            Opts::new("chimera_weekly_net_usd", "Rolling 7d net USD"),
+            &["chain"],
+        )
+        .unwrap();
+
+        let sweep_total = IntCounterVec::new(
+            Opts::new("chimera_sweep_total", "Total sweep/refund operations"),
+            &["type"],
+        )
+        .unwrap();
+        let sweep_skipped_breaker = IntCounterVec::new(
+            Opts::new(
+                "chimera_sweep_skipped_breaker",
+                "Sweep/refund operations skipped due to breaker",
+            ),
+            &["type"],
+        )
+        .unwrap();
+        let sweep_amount_wei =
+            Gauge::new("chimera_sweep_amount_wei", "Last sweep amount in wei").unwrap();
 
         // Register all metrics
         r.register(Box::new(candidates_seen.clone())).ok();
@@ -95,6 +123,9 @@ impl Metrics {
         r.register(Box::new(l1_fee_wei.clone())).ok();
         r.register(Box::new(daily_net_usd.clone())).ok();
         r.register(Box::new(weekly_net_usd.clone())).ok();
+        r.register(Box::new(sweep_total.clone())).ok();
+        r.register(Box::new(sweep_skipped_breaker.clone())).ok();
+        r.register(Box::new(sweep_amount_wei.clone())).ok();
 
         Self {
             candidates_seen,
@@ -107,11 +138,20 @@ impl Metrics {
             l1_fee_wei,
             daily_net_usd,
             weekly_net_usd,
+            sweep_total,
+            sweep_skipped_breaker,
+            sweep_amount_wei,
         }
     }
 
     pub fn observe_candidate(&self, chain: &str) {
         self.candidates_seen.with_label_values(&[chain]).inc();
+    }
+
+    pub fn observe_candidates(&self, chain: &str, count: usize) {
+        self.candidates_seen
+            .with_label_values(&[chain])
+            .inc_by(count as u64);
     }
 
     pub fn observe_sim(
@@ -137,16 +177,29 @@ impl Metrics {
         }
     }
 
-    pub fn set_breaker_state(&self, tripped: bool) {
-        self.breaker_state.set(if tripped { 1.0 } else { 0.0 });
+    pub fn set_breaker_state(&self, chain: &str, tripped: bool) {
+        self.breaker_state
+            .with_label_values(&[chain])
+            .set(if tripped { 1.0 } else { 0.0 });
     }
 
-    pub fn set_daily_net_usd(&self, v: f64) {
-        self.daily_net_usd.set(v);
+    pub fn set_daily_net_usd(&self, chain: &str, v: f64) {
+        self.daily_net_usd.with_label_values(&[chain]).set(v);
     }
 
-    pub fn set_weekly_net_usd(&self, v: f64) {
-        self.weekly_net_usd.set(v);
+    pub fn set_weekly_net_usd(&self, chain: &str, v: f64) {
+        self.weekly_net_usd.with_label_values(&[chain]).set(v);
+    }
+
+    pub fn observe_sweep(&self, sweep_type: &str, amount_wei: f64) {
+        self.sweep_total.with_label_values(&[sweep_type]).inc();
+        self.sweep_amount_wei.set(amount_wei);
+    }
+
+    pub fn observe_sweep_skipped(&self, sweep_type: &str) {
+        self.sweep_skipped_breaker
+            .with_label_values(&[sweep_type])
+            .inc();
     }
 }
 

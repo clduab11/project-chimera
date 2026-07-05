@@ -11,7 +11,7 @@ Renders a five-section operational dashboard for the MEV liquidation bot:
   5. Outcomes - last 5 audit-log entries translated to plain English.
 
 The dashboard is strictly read-only: no files are mutated, no transactions sent.
-Daily/weekly usage is aggregated from `core/state/audit.jsonl` exactly the way
+Daily/weekly usage is aggregated from `core/state/outcomes.jsonl` exactly the way
 `core::state::recovery::CrashRecovery::recover_from_jsonl` aggregates it in
 the Rust core.
 
@@ -71,7 +71,7 @@ logger = logging.getLogger("status")
 # ---------------------------------------------------------------------------
 DEFAULT_STATE_DIR: str = "core/state"
 DEFAULT_CONFIG_DIR: str = "config"
-AUDIT_FILENAME: str = "audit.jsonl"
+AUDIT_FILENAME: str = "outcomes.jsonl"
 EOA_POOL_FILENAME: str = "eoa_pool.json"
 PACING_FILENAME: str = "pacing.yaml"
 
@@ -122,7 +122,7 @@ def load_eoa_pool(config_dir: Path) -> list[dict[str, Any]] | None:
 
 def read_audit_entries(audit_path: Path) -> list[dict[str, Any]]:
     """
-    Stream parse audit.jsonl, skipping corrupted lines.
+    Stream parse outcomes.jsonl, skipping corrupted lines.
 
     Mirrors the tolerance applied by core/src/state/persistence.rs::load_recent:
     a single bad line never aborts the dashboard.
@@ -511,7 +511,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-dir",
         default=DEFAULT_STATE_DIR,
-        help=f"Directory containing audit.jsonl (default: {DEFAULT_STATE_DIR}).",
+        help=f"Directory containing outcomes.jsonl (default: {DEFAULT_STATE_DIR}).",
     )
     parser.add_argument(
         "--config-dir",

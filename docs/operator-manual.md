@@ -1,9 +1,15 @@
 # Project Chimera — Operator Manual
 
-**Version**: 1.0  
-**Last Updated**: 2026-06-16  
-**Audience**: Solo operator running the sovereign L2 MEV engine.  
+**Version**: 1.1
+**Last Updated**: 2026-07-05
+**Audience**: Solo operator running the sovereign L2 MEV engine.
 **Time Commitment**: 10–20 minutes daily.
+
+> **Note:** This document reflects a pre-implementation operator workflow.
+> The current binary uses host-run deployment with metrics on port
+> `9100 + (chain_id % 1000)` (e.g. `:9553` for Base, chain_id=8453).
+> See `docs/runbook-7day-soak.md` and `docs/runbook-keystore-multisig-go-live.md`
+> for updated operator procedures.
 
 ---
 
@@ -18,7 +24,7 @@ Run this checklist before starting the engine or resuming from any pause.
 cd ~/chimera
 
 # 1. Verify pacing config loads without error
-cargo test --test config_load
+cargo test -p chimera-core test_load_valid_config
 # Expected: OK, with values: daily=$2000, weekly=$7500, single=$1000, mode=shadow
 
 # 2. Confirm execute_mode is what you expect
@@ -48,8 +54,8 @@ curl -X POST https://arb1.arbitrum.io/rpc \
 ### 1.3 Wallet Balance Check
 
 ```bash
-# Check EOA pool balances (all 10 clean wallets must have >0.005 ETH for gas)
-python scripts/check_balances.py --chain base
+# Check EOA pool balances. Default --min-balance is 0.0; pass an explicit threshold:
+python scripts/check_balances.py --chain base --min-balance 0.01
 # Expected: All 10 addresses show ≥ 0.01 ETH
 ```
 
@@ -74,13 +80,13 @@ cargo test --test keystore_integrity
 ### 1.5 State File Check
 
 ```bash
-# Ensure pacing state exists and is recent
-ls -la logs/pacing_state.jsonl
+# Ensure the outcomes audit trail exists and is recent
+ls -la core/state/outcomes.jsonl
 # Expected: File exists, modified within last 24h
 
-# Verify JSON is valid
-python -c "import json; json.load(open('logs/pacing_state.jsonl'))"
-# Expected: silent success
+# Verify JSON is valid (first line parsed as sample)
+head -n1 core/state/outcomes.jsonl | python -m json.tool
+# Expected: valid JSON object
 ```
 
 ---
@@ -91,7 +97,7 @@ Perform this routine once per day, ideally at the same local time to establish o
 
 ### 2.1 Grafana Dashboard Review (5 min)
 
-Open `http://localhost:3003` in your browser.
+Open `http://localhost:3002` in your browser.
 
 **Panels to check**:
 
@@ -111,8 +117,8 @@ Open `http://localhost:3003` in your browser.
 ### 2.2 Log Review (5 min)
 
 ```bash
-# Tail recent logs
-tail -n 100 logs/chimera_$(date +%Y-%m-%d).log
+# Tail recent logs (tracing_appender convention: logs/chimera.log.YYYY-MM-DD)
+tail -n 100 logs/chimera.log.$(date +%Y-%m-%d)
 ```
 
 **Keywords to scan for**:
@@ -128,7 +134,7 @@ tail -n 100 logs/chimera_$(date +%Y-%m-%d).log
 | `FeeQueryError` | L1 fee query failed | RPC issue; switch provider |
 
 **Log Location**:
-- Default: `logs/chimera_YYYY-MM-DD.log`
+- Default: `logs/chimera.log.YYYY-MM-DD` (tracing_appender daily rotation convention)
 - Format: Structured JSON, one event per line
 - Retention: Rotate weekly; archive to cold storage monthly
 
@@ -156,8 +162,9 @@ python scripts/update_venues.py --check-liquidity
 ### 2.4 Metrics Server Health
 
 ```bash
-# Verify Prometheus endpoint is responding
-curl http://localhost:9100/metrics | head -n 20
+# Verify Prometheus endpoint is responding (port is 9100 + (chain_id % 1000))
+# Example for Base (chain_id 8453 → port 9553):
+curl http://localhost:9553/metrics | head -n 20
 # Expected: HTTP 200, lines starting with `# HELP` and metric names
 ```
 
@@ -212,13 +219,21 @@ In shadow mode, the engine runs the full pipeline **except** the final on-chain 
 
 ### 3.2 Transitioning to Live Mode
 
-**Step 1**: Edit `config/pacing.yaml`
+**Step 1**: Use `toggle_shadow.py` to set live mode:
+
+```bash
+python scripts/toggle_shadow.py --set-live
+```
+
+This enforces the 7-day shadow rule and writes the mode transition to `core/state/mode.json`.
+
+**Step 2**: Edit `config/pacing.yaml`
 
 ```yaml
 execute_mode: live
 ```
 
-**Step 2**: Reload config (requires restart in v1)
+**Step 3**: Reload config (requires restart in v1)
 
 ```bash
 # Stop current instance
@@ -228,14 +243,14 @@ pkill chimera
 cargo run --release --bin chimera
 ```
 
-**Step 3**: Verify live mode is active
+**Step 4**: Verify live mode is active
 
 ```bash
-tail -f logs/chimera_$(date +%Y-%m-%d).log | grep execute_mode
+tail -f logs/chimera.log.$(date +%Y-%m-%d) | grep execute_mode
 # Expected: "execute_mode: live"
 ```
 
-**Step 4**: First live execution watch
+**Step 5**: First live execution watch
 
 - Stay at the terminal for the first 1–2 hours.
 - Monitor Grafana and logs in real time.
@@ -245,6 +260,8 @@ tail -f logs/chimera_$(date +%Y-%m-%d).log | grep execute_mode
 **Rollback to shadow** (immediate, no restart required in future versions; v1 requires restart):
 
 ```bash
+# Set shadow via toggle script
+python scripts/toggle_shadow.py --set-shadow
 # Edit config back to shadow
 echo "execute_mode: shadow" > config/pacing.yaml
 # Restart engine
@@ -255,26 +272,34 @@ pkill chimera && cargo run --release --bin chimera
 
 ## 4. Monitoring Endpoints & What They Mean
 
-### 4.1 Prometheus Metrics (`:9100`)
+### 4.1 Prometheus Metrics (port = `9100 + (chain_id % 1000)`)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `http://localhost:9100/metrics` | GET | Full Prometheus text dump |
+| `http://localhost:<PORT>/metrics` | GET | Full Prometheus text dump |
 
-**Key metric families**:
+**Key metric families** (all prefixed `chimera_`):
 
 - `chimera_candidates_seen_total{chain="base"}` — How many at-risk positions the detector identified. A sustained drop to zero suggests RPC or snapshot issues.
 - `chimera_sims_run_total{result="success"}` — Successful simulations. Should increase slowly.
 - `chimera_sims_run_total{result="denied"}` — Opportunities blocked by pacing. High values are normal and desired (means caps are working).
 - `chimera_sim_latency_seconds_bucket{le="0.05"}` — Percentage of simulations completing under 50ms. Target: >90% under 100ms.
 - `chimera_profit_usd_bucket{le="50.0"}` — Distribution of estimated profits. Most profitable liquidations on L2 are $10–$200.
-- `chimera_revert_total{reason="insufficient_profit"}` — Simulations that predicted unprofitability. This is the simulator doing its job.
-- `chimera_revert_total{reason="execution_revert"}` — On-chain reverts. **Any value >0 requires immediate investigation.**
-- `chimera_breaker_state` — `0` = safe, `1` = tripped. This is your most important gauge.
+- `chimera_revert_total{reason="<value>"}` — Revert counter with reason label. Verify actual reason values at runtime; the `insufficient_profit` and `execution_revert` values may vary from spec.
+- `chimera_breaker_state{chain="base"}` — `0` = safe, `1` = tripped. This is your most important gauge.
 - `chimera_gas_used_bucket{le="200000.0"}` — Most liquidations consume 150k–300k gas. Spikes indicate complex multi-asset positions.
 - `chimera_l1_fee_wei` — Current L1 data fee estimate. Multiply by 1.15x buffer before profit check.
+- `chimera_daily_net_usd{chain="base"}` — Rolling 24h net USD.
+- `chimera_weekly_net_usd{chain="base"}` — Rolling 7d net USD.
+- `chimera_sweep_total{type="<type>"}` — Total sweep/refund operations.
+- `chimera_sweep_skipped_breaker{type="<type>"}` — Sweeps skipped due to breaker.
+- `chimera_sweep_amount_wei` — Last sweep amount in wei.
 
-### 4.2 Grafana Dashboard (`:3003`)
+**Metrics that do NOT exist** (remove from any dashboard or alert rule):
+- `chimera_txs_submitted_total` — not exported
+- `chimera_txs_confirmed_total` — not exported
+
+### 4.2 Grafana Dashboard (`:3002`)
 
 **Default panels** (import from `grafana/dashboard.json` if available):
 
@@ -296,13 +321,13 @@ pkill chimera && cargo run --release --bin chimera
 
 ### 4.3 Log Locations & How to Read Them
 
-**Primary log**: `logs/chimera_YYYY-MM-DD.log`
+**Primary log**: `logs/chimera.log.YYYY-MM-DD`
 
 Format (one JSON object per line):
 
 ```json
 {
-  "timestamp": "2026-06-16T12:34:56Z",
+  "timestamp": "2026-07-05T12:34:56Z",
   "level": "INFO",
   "target": "chimera::pacing",
   "fields": {
@@ -317,20 +342,9 @@ Format (one JSON object per line):
 }
 ```
 
-**Pacing state**: `logs/pacing_state.jsonl`
+**Outcomes audit trail**: `core/state/outcomes.jsonl`
 
-Format (single JSON object, overwritten on each update):
-
-```json
-{
-  "daily_net_usd": "124.50",
-  "weekly_net_usd": "124.50",
-  "daily_loss_eth": "0.0001",
-  "consecutive_reverts": 0,
-  "last_release": "2026-06-16T12:34:56Z",
-  "breaker_tripped": null
-}
-```
+Format (JSONL, one JSON object per line, appended on each outcome).
 
 **Snapshot files**: `core/snapshots/{chain}_latest.json`
 
@@ -340,16 +354,16 @@ Generated by `scripts/snapshot_generator.py`. Contains reserve data and user pos
 
 ```bash
 # Find all breaker events
-grep "BREAKER" logs/chimera_*.log
+grep "BREAKER" logs/chimera.log.*.log
 
 # Find all denied opportunities for a specific reason
-grep -A2 "PACING: DENIED" logs/chimera_*.log | grep "reason"
+grep -A2 "PACING: DENIED" logs/chimera.log.*.log | grep "reason"
 
 # Find simulation failures
-grep "SimulationFailed" logs/chimera_*.log
+grep "SimulationFailed" logs/chimera.log.*.log
 
 # Pretty-print a single log line
-python -m json.tool < logs/chimera_2026-06-16.log | less
+head -n1 logs/chimera.log.2026-07-05 | python -m json.tool
 ```
 
 ---
@@ -431,10 +445,10 @@ In addition to the daily checklist, perform these tasks once per week:
 
 ## 7. Monthly Tasks
 
-1. **Full system restart**: Stop the engine, clear `logs/pacing_state.jsonl` after archiving, and restart to verify cold-boot behavior.
+1. **Full system restart**: Stop the engine, archive `core/state/outcomes.jsonl`, and restart to verify cold-boot behavior.
 2. **EOA rotation**: Generate a new pool of 10 clean wallets and update `encrypted_keystore/`.
 3. **Config review**: Re-evaluate caps against actual performance. Do not increase without 30 days of shadow data.
-4. **Disaster recovery drill**: Restore `pacing_state.jsonl` from backup and confirm engine resumes correctly.
+4. **Disaster recovery drill**: Restore `outcomes.jsonl` from backup and confirm engine resumes correctly.
 
 ---
 

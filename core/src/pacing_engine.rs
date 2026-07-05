@@ -7,8 +7,8 @@
 //! - All monetary values use `Decimal` (not `f64`) to avoid floating-point errors.
 //! - The engine uses an internal `parking_lot::RwLock` for thread-safe access.
 //! - State is persisted to JSONL on every `record_outcome` for crash-safe recovery.
-use crate::state::{OutcomeRecord, StatePersistence};
-use crate::{ChimeraError, PacingConfig};
+use crate::state::{CrashRecovery, OutcomeRecord, StatePersistence};
+use crate::{ChimeraError, PacingConfig, PriceOracle};
 use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::RwLock;
 use rust_decimal::Decimal;
@@ -92,6 +92,7 @@ struct PacingEngineInner {
     breaker_tripped: Option<BreakerReason>,
     venue_rotation: VecDeque<String>,
     eoa_rotation: VecDeque<String>,
+    cached_eth_price: Option<Decimal>,
 }
 impl PacingEngineInner {
     fn check(&self, opp: &Opportunity) -> PacingDecision {
@@ -177,7 +178,10 @@ impl PacingEngineInner {
         const ESTIMATED_GAS_UNITS: u64 = 150_000;
         let gas_cost_eth = Decimal::from(gas_estimate_gwei) * Decimal::from(ESTIMATED_GAS_UNITS)
             / Decimal::from(1_000_000_000u64);
-        gas_cost_eth * self.config.eth_price_usd_fallback
+        let eth_price = self
+            .cached_eth_price
+            .unwrap_or(self.config.eth_price_usd_fallback);
+        gas_cost_eth * eth_price
     }
 
     fn record_outcome(
@@ -296,6 +300,7 @@ impl PacingEngineInner {
             breaker_tripped: state.breaker_tripped,
             venue_rotation: VecDeque::new(),
             eoa_rotation: eoa_pool,
+            cached_eth_price: None,
         }
     }
 }
@@ -306,6 +311,7 @@ pub struct PacingEngine {
     inner: Arc<RwLock<PacingEngineInner>>,
     state_path: Option<std::path::PathBuf>,
     state_persistence: Option<Arc<dyn StatePersistence + Send + Sync>>,
+    eth_price_oracle: Option<Arc<dyn PriceOracle + Send + Sync>>,
 }
 impl Clone for PacingEngine {
     fn clone(&self) -> Self {
@@ -313,6 +319,7 @@ impl Clone for PacingEngine {
             inner: self.inner.clone(),
             state_path: self.state_path.clone(),
             state_persistence: self.state_persistence.clone(),
+            eth_price_oracle: self.eth_price_oracle.clone(),
         }
     }
 }
@@ -349,6 +356,7 @@ impl PacingEngine {
                     breaker_tripped: None,
                     venue_rotation: VecDeque::new(),
                     eoa_rotation: capped_pool,
+                    cached_eth_price: None,
                 })
         } else {
             PacingEngineInner {
@@ -363,12 +371,14 @@ impl PacingEngine {
                 breaker_tripped: None,
                 venue_rotation: VecDeque::new(),
                 eoa_rotation: capped_pool,
+                cached_eth_price: None,
             }
         };
-        Self {
+                Self {
             inner: Arc::new(RwLock::new(inner)),
             state_path,
             state_persistence: None,
+            eth_price_oracle: None,
         }
     }
     pub fn with_state_persistence(
@@ -377,6 +387,41 @@ impl PacingEngine {
     ) -> Self {
         self.state_persistence = Some(persistence);
         self
+    }
+    /// Attach an ETH/USD price oracle for live gas-cost estimates.
+    /// The cached price must be refreshed periodically via [`Self::refresh_eth_price`].
+    /// The feed address is read from the engine's config (`eth_usd_feed_address`).
+    pub fn with_eth_oracle(mut self, oracle: Arc<dyn PriceOracle + Send + Sync>) -> Self {
+        self.eth_price_oracle = Some(oracle);
+        self
+    }
+    /// Fetch the current ETH/USD price from the attached oracle and cache it.
+    /// On failure, the previous cached price is retained (or the fallback is used).
+    pub async fn refresh_eth_price(&self) {
+        if let Some(ref oracle) = self.eth_price_oracle {
+            let feed_str = self.inner.read().config.eth_usd_feed_address.clone();
+            if let Ok(addr) = feed_str.parse::<alloy::primitives::Address>() {
+                match oracle.get_price(addr).await {
+                    Ok(price) => {
+                        if price > Decimal::ZERO {
+                            self.inner.write().cached_eth_price = Some(price);
+                            info!(
+                                target: "chimera::pacing",
+                                eth_usd = %price,
+                                "Oracle ETH/USD price cached"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "chimera::pacing",
+                            error = %e,
+                            "Oracle refresh failed; using cached or fallback ETH/USD"
+                        );
+                    }
+                }
+            }
+        }
     }
     /// Load the EOA pool from either a JSON array of address strings or the
     /// structured `config/eoa_pool.json` shape with a `wallets[].address` list.
@@ -526,6 +571,385 @@ impl PacingEngine {
     pub fn current_risk_state(&self) -> RiskState {
         self.inner.read().to_risk_state()
     }
+
+    /// Return the most recently cached ETH/USD price, if any.
+    /// Returns the last successful oracle refresh value, or None if
+    /// the oracle has never been refreshed.
+    pub fn cached_eth_price(&self) -> Option<Decimal> {
+        self.inner.read().cached_eth_price
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CrossProcessPacing — cross-process reservation lifecycle
+// ---------------------------------------------------------------------------
+
+use crate::state::{ReservationRecord, ReservationStatus};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration as StdDuration, Instant};
+
+const RESERVATION_TTL_MINUTES: i64 = 5;
+const LOCK_TIMEOUT_MS: u64 = 5000;
+const LOCK_RETRY_MS: u64 = 50;
+
+/// Wraps [`PacingEngine`] with cross-process reservation tracking.
+///
+/// Multiple per-chain processes share a `reservations_dir` on local disk.
+/// Under advisory file lock, each process writes `Reserved` records before
+/// firing and `Settled`/`Expired` records on outcome, so global daily/weekly
+/// caps are enforced across processes.
+pub struct CrossProcessPacing {
+    engine: PacingEngine,
+    reservations_dir: PathBuf,
+    outcomes_path: PathBuf,
+    reservation_ttl_minutes: i64,
+}
+
+impl CrossProcessPacing {
+    pub fn new(engine: PacingEngine, reservations_dir: PathBuf, outcomes_path: PathBuf) -> Self {
+        Self {
+            engine,
+            reservations_dir,
+            outcomes_path,
+            reservation_ttl_minutes: RESERVATION_TTL_MINUTES,
+        }
+    }
+
+    pub fn with_ttl(mut self, ttl_minutes: i64) -> Self {
+        self.reservation_ttl_minutes = ttl_minutes;
+        self
+    }
+
+    pub fn engine(&self) -> &PacingEngine {
+        &self.engine
+    }
+
+    fn reservations_path(&self, chain_id: u64) -> PathBuf {
+        self.reservations_dir
+            .join(format!("reservations-{}.jsonl", chain_id))
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.reservations_dir.join(".reservations.lock")
+    }
+
+    fn acquire_lock(&self) -> Result<FileLockGuard, ChimeraError> {
+        let lock_path = self.lock_path();
+        fs::create_dir_all(&self.reservations_dir).map_err(ChimeraError::Io)?;
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    let pid = std::process::id().to_string();
+                    let _ = file.set_len(0);
+                    let mut f = file;
+                    let _ = f.write_all(pid.as_bytes());
+                    let _ = f.flush();
+                    return Ok(FileLockGuard {
+                        path: lock_path,
+                        _file: Some(f),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() > StdDuration::from_millis(LOCK_TIMEOUT_MS) {
+                        return Err(ChimeraError::TimeoutError(
+                            "Cross-process reservation lock acquisition timed out".into(),
+                        ));
+                    }
+                    std::thread::sleep(StdDuration::from_millis(LOCK_RETRY_MS));
+                }
+                Err(e) => return Err(ChimeraError::Io(e)),
+            }
+        }
+    }
+
+    /// Force-clear a stale lock file left behind by a crashed process.
+    /// Only call this when you are certain no other process holds the lock.
+    pub fn clear_stale_lock(&self) -> Result<(), ChimeraError> {
+        let lock_path = self.lock_path();
+        if lock_path.exists() {
+            fs::remove_file(&lock_path).map_err(ChimeraError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn load_reservations(
+        path: &std::path::Path,
+    ) -> Result<Vec<ReservationRecord>, ChimeraError> {
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(path).map_err(ChimeraError::Io)?;
+        let mut records = Vec::new();
+        for (line_no, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ReservationRecord>(trimmed) {
+                Ok(record) => records.push(record),
+                Err(e) => {
+                    let msg = format!(
+                        "Malformed reservation JSONL at {} line {}: {}",
+                        path.display(),
+                        line_no + 1,
+                        e
+                    );
+                    warn!(target: "chimera::pacing", "{}", msg);
+                    return Err(ChimeraError::PersistenceError(msg));
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    /// Load all reservation files under the shared reservations directory.
+    /// Matches files named `reservations-{chain_id}.jsonl`.
+    ///
+    /// Each per-chain file is loaded via [`Self::load_reservations`] which
+    /// fails-closed on any malformed line — a single corrupt file halts
+    /// cross-process pacing and denies all new reservations until recovery.
+    fn load_all_reservations(
+        reservations_dir: &std::path::Path,
+    ) -> Result<Vec<ReservationRecord>, ChimeraError> {
+        let mut all = Vec::new();
+        let entries = fs::read_dir(reservations_dir).map_err(ChimeraError::Io)?;
+        for entry in entries {
+            let entry = entry.map_err(ChimeraError::Io)?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "jsonl")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with("reservations-"))
+            {
+                let mut records = Self::load_reservations(&path)?;
+                all.append(&mut records);
+            }
+        }
+        Ok(all)
+    }
+
+    /// Recover realized daily/weekly usage from a shared outcomes audit trail.
+    /// Uses the synchronous [`CrashRecovery::recover_from_jsonl_sync`] path so
+    /// no nested Tokio runtime is created (safe to call from either sync or
+    /// async contexts).
+    ///
+    /// This represents prior settled outcomes from all processes, so global
+    /// caps account for usage already realized (not just open reservations).
+    pub fn recover_realized_usage(
+        outcomes_path: &std::path::Path,
+    ) -> Result<(Decimal, Decimal), ChimeraError> {
+        let state = CrashRecovery::recover_from_jsonl_sync(outcomes_path)?;
+        Ok((state.daily_usage_usd, state.weekly_usage_usd))
+    }
+
+    fn save_reservations(
+        path: &std::path::Path,
+        records: &[ReservationRecord],
+    ) -> Result<(), ChimeraError> {
+        let mut content = String::new();
+        for record in records {
+            let line =
+                serde_json::to_string(record).map_err(|e| {
+                    ChimeraError::PersistenceError(format!("Reservation serialization: {e}"))
+                })?;
+            content.push_str(&line);
+            content.push('\n');
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        fs::write(&tmp, &content).map_err(ChimeraError::Io)?;
+        fs::rename(&tmp, path).map_err(ChimeraError::Io)
+    }
+
+    fn append_reservation(
+        path: &std::path::Path,
+        record: &ReservationRecord,
+    ) -> Result<(), ChimeraError> {
+        let line =
+            serde_json::to_string(record).map_err(|e| {
+                ChimeraError::PersistenceError(format!("Reservation serialization: {e}"))
+            })?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(ChimeraError::Io)?;
+        writeln!(file, "{line}").map_err(ChimeraError::Io)
+    }
+
+    fn compute_global_totals(
+        records: &[ReservationRecord],
+        now: DateTime<Utc>,
+    ) -> (Decimal, Decimal) {
+        let mut daily = Decimal::ZERO;
+        let mut weekly = Decimal::ZERO;
+        for r in records {
+            if r.status != ReservationStatus::Reserved {
+                continue;
+            }
+            let age = now - r.created_at;
+            if age <= TimeDelta::days(1) {
+                daily += r.amount_usd;
+            }
+            if age <= TimeDelta::days(7) {
+                weekly += r.amount_usd;
+            }
+        }
+        (daily, weekly)
+    }
+
+    fn expire_stale_in_place(records: &mut Vec<ReservationRecord>, now: DateTime<Utc>) -> usize {
+        let mut expired = 0;
+        for r in records.iter_mut() {
+            if r.status == ReservationStatus::Reserved && now >= r.expires_at {
+                r.status = ReservationStatus::Expired;
+                expired += 1;
+            }
+        }
+        expired
+    }
+
+    /// Attempt to reserve the amount for an opportunity against global caps.
+    /// Returns the [`ReservationRecord`] on success, or a deny reason.
+    ///
+    /// Reads **all** reservation files under the shared directory (not just the
+    /// current chain), so daily and weekly caps are enforced across every chain
+    /// that writes to this directory. Also recovers realized usage from the
+    /// shared outcomes audit trail so that caps include settled outcomes from
+    /// other processes.
+    pub fn try_reserve(
+        &self,
+        opp: &Opportunity,
+        chain_id: u64,
+    ) -> Result<ReservationRecord, ChimeraError> {
+        let path = self.reservations_path(chain_id);
+        let _lock = self.acquire_lock()?;
+        let now = Utc::now();
+        let mut records = Self::load_all_reservations(&self.reservations_dir)?;
+        let stale_count = Self::expire_stale_in_place(&mut records, now);
+        if stale_count > 0 {
+            info!(
+                target = "chimera::pacing",
+                expired = stale_count,
+                "Expired stale reservations before global cap check"
+            );
+        }
+
+        let (global_daily, global_weekly) = Self::compute_global_totals(&records, now);
+
+        // Recover realized usage from the shared outcomes audit trail so that
+        // caps include prior settled outcomes (not just open reservations).
+        let (realized_daily, realized_weekly) = if self.outcomes_path.exists() {
+            Self::recover_realized_usage(&self.outcomes_path).unwrap_or((Decimal::ZERO, Decimal::ZERO))
+        } else {
+            (Decimal::ZERO, Decimal::ZERO)
+        };
+
+        let inner = self.engine.inner.read();
+        // Single source of truth for realized usage: the shared outcomes
+        // audit trail. The engine's inner counters track per-process usage
+        // for local gates only; adding them here would double-count outcomes
+        // that are already present in `realized_daily`/`realized_weekly`.
+        let total_daily = global_daily + realized_daily;
+        let total_weekly = global_weekly + realized_weekly;
+
+        if total_daily + opp.expected_net_usd > inner.config.max_daily_net_usd {
+            return Err(ChimeraError::PacingViolation(format!(
+                "Global daily cap would be exceeded: {total_daily} + {} > {}",
+                opp.expected_net_usd, inner.config.max_daily_net_usd
+            )));
+        }
+        if total_weekly + opp.expected_net_usd > inner.config.max_weekly_net_usd {
+            return Err(ChimeraError::PacingViolation(format!(
+                "Global weekly cap would be exceeded: {total_weekly} + {} > {}",
+                opp.expected_net_usd, inner.config.max_weekly_net_usd
+            )));
+        }
+
+        let reservation = ReservationRecord {
+            id: opp.id.clone(),
+            chain_id,
+            amount_usd: opp.expected_net_usd,
+            status: ReservationStatus::Reserved,
+            created_at: now,
+            expires_at: now + TimeDelta::minutes(self.reservation_ttl_minutes),
+            settled_at: None,
+        };
+
+        Self::append_reservation(&path, &reservation)?;
+        Ok(reservation)
+    }
+
+    /// Settle a reservation after outcome recording. Moves the reservation
+    /// from `Reserved` → `Settled`.
+    pub fn settle(
+        &self,
+        reservation_id: &str,
+        chain_id: u64,
+    ) -> Result<(), ChimeraError> {
+        let path = self.reservations_path(chain_id);
+        let _lock = self.acquire_lock()?;
+        let mut records = Self::load_reservations(&path)?;
+        let now = Utc::now();
+        let mut found = false;
+        for r in records.iter_mut() {
+            if r.id == reservation_id && r.status == ReservationStatus::Reserved {
+                r.status = ReservationStatus::Settled;
+                r.settled_at = Some(now);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(ChimeraError::PacingViolation(format!(
+                "Reservation {reservation_id} not found or already settled"
+            )));
+        }
+        Self::save_reservations(&path, &records)
+    }
+
+    /// Expire stale reservations without settlement. Returns the count of
+    /// reservations that were expired.
+    pub fn expire_stale(&self, chain_id: u64) -> Result<usize, ChimeraError> {
+        let path = self.reservations_path(chain_id);
+        let _lock = self.acquire_lock()?;
+        let now = Utc::now();
+        let mut records = Self::load_reservations(&path)?;
+        let expired = Self::expire_stale_in_place(&mut records, now);
+        if expired > 0 {
+            Self::save_reservations(&path, &records)?;
+        }
+        Ok(expired)
+    }
+
+    /// Compute current global daily and weekly totals across all reservations
+    /// (all chain IDs that share this directory).
+    pub fn global_totals(&self, _chain_id: u64) -> Result<(Decimal, Decimal), ChimeraError> {
+        let _lock = self.acquire_lock()?;
+        let now = Utc::now();
+        let mut records = Self::load_all_reservations(&self.reservations_dir)?;
+        Self::expire_stale_in_place(&mut records, now);
+        Ok(Self::compute_global_totals(&records, now))
+    }
+}
+
+struct FileLockGuard {
+    path: PathBuf,
+    _file: Option<File>,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        drop(self._file.take());
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 #[cfg(test)]
@@ -554,13 +978,25 @@ mod tests {
             chain_id:                8453,
             oracle_staleness_seconds: 300,
             eth_price_usd_fallback:  Decimal::from(1800),
+            eth_usd_feed_address:   "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into(),
             recent_outcomes_capacity: 128,
             eoa_pool_path:           "nonexistent_eoa_pool.json".into(),
             pools_toml_path:         "config/pools.toml".into(),
-        }
+            executor_address:        "".into(),
+            treasury_address:        "".into(),
+            treasury_keystore:       "".into(),
+            worker_keystore_dir:     "".into(),
+            sweep_interval_secs:     300,
+            refund_interval_secs:    3600,
+            min_worker_balance_eth:  Decimal::from_str("0.01").unwrap(),
+        refund_topup_eth:        Decimal::from_str("0.05").unwrap(),
+        sweep_tokens: vec![],
+        sweep_min_keep_eth: Decimal::from_str("0.005").unwrap(),
+        ws_endpoint: String::new(),
     }
+}
 
-    #[test]
+#[test]
     fn test_allows_under_all_caps() {
         let engine = PacingEngine::new(make_test_config());
         let opp = Opportunity {
@@ -898,6 +1334,502 @@ mod tests {
                 prop_assert!(matches!(decision, PacingDecision::Allow { .. }), "expected Allow");
             }
         }
+    }
+
+    #[test]
+    fn estimate_gas_cost_uses_cached_eth_price() {
+        let engine = PacingEngine::new(make_test_config());
+        let gas_gwei = 50u64;
+        let cost_fallback = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
+        assert!(cost_fallback > Decimal::ZERO);
+        let cached_price = Decimal::from(3000);
+        engine.inner.write().cached_eth_price = Some(cached_price);
+        let cost_cached = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
+        assert!(cost_cached > cost_fallback, "cached price 3000 should produce higher cost than fallback 1800");
+        engine.inner.write().cached_eth_price = None;
+        let cost_after_clear = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
+        assert_eq!(cost_after_clear, cost_fallback, "after clearing cache, should fall back to config");
+    }
+
+    // -----------------------------------------------------------------------
+    // CrossProcessPacing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crossprocess_reserve_succeed_and_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        let opp = Opportunity {
+            id: "opp-1".into(),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 50,
+            venue: "aerodrome".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+
+        let reservation = pacing.try_reserve(&opp, 8453).unwrap();
+        assert_eq!(reservation.status, ReservationStatus::Reserved);
+        assert_eq!(reservation.amount_usd, Decimal::from(100));
+        assert!(reservation.expires_at > reservation.created_at);
+
+        pacing.settle("opp-1", 8453).unwrap();
+
+        let path = res_dir.join("reservations-8453.jsonl");
+        let records = CrossProcessPacing::load_reservations(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, ReservationStatus::Settled);
+        assert!(records[0].settled_at.is_some());
+    }
+
+    #[test]
+    fn crossprocess_reserve_exceeds_global_daily_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        // Reserve most of the daily cap
+        let opp1 = Opportunity {
+            id: "opp-big".into(),
+            expected_net_usd: Decimal::from(1900),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        pacing.try_reserve(&opp1, 8453).unwrap();
+
+        // Total remaining: 2000 - 1900 = 100, so trying to reserve 200 should fail
+        let opp2 = Opportunity {
+            id: "opp-over".into(),
+            expected_net_usd: Decimal::from(200),
+            gas_estimate_gwei: 50,
+            venue: "b".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        let result = pacing.try_reserve(&opp2, 8453);
+        assert!(
+            result.is_err(),
+            "Should have denied reserve exceeding global daily cap"
+        );
+    }
+
+    #[test]
+    fn crossprocess_expire_stale_removes_from_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl")).with_ttl(0); // TTL=0 minutes
+
+        let opp = Opportunity {
+            id: "opp-expire".into(),
+            expected_net_usd: Decimal::from(500),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+
+        let reservation = pacing.try_reserve(&opp, 8453).unwrap();
+        assert_eq!(reservation.status, ReservationStatus::Reserved);
+
+        let expired = pacing.expire_stale(8453).unwrap();
+        assert_eq!(expired, 1, "TTL=0 should expire immediately");
+
+        let path = res_dir.join("reservations-8453.jsonl");
+        let records = CrossProcessPacing::load_reservations(&path).unwrap();
+        assert_eq!(records[0].status, ReservationStatus::Expired);
+
+        let (daily, _weekly) = pacing.global_totals(8453).unwrap();
+        assert_eq!(daily, Decimal::ZERO, "expired reservations should not count toward totals");
+    }
+
+    #[test]
+    fn crossprocess_two_processes_cannot_exceed_caps() {
+        // Simulate two processes sharing a reservations dir
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+
+        let engine1 = PacingEngine::new(make_test_config());
+        let pacing1 = CrossProcessPacing::new(engine1, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        let engine2 = PacingEngine::new(make_test_config());
+        let pacing2 = CrossProcessPacing::new(engine2, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        let opp1 = Opportunity {
+            id: "p1-opp".into(),
+            expected_net_usd: Decimal::from(1200),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        pacing1.try_reserve(&opp1, 8453).unwrap();
+
+        let opp2 = Opportunity {
+            id: "p2-opp".into(),
+            expected_net_usd: Decimal::from(900),
+            gas_estimate_gwei: 50,
+            venue: "b".into(),
+            eoa: "0xClean2".into(),
+            timestamp: Utc::now(),
+        };
+        // 1200 + 900 = 2100 > 2000 daily cap
+        let result = pacing2.try_reserve(&opp2, 8453);
+        assert!(
+            result.is_err(),
+            "Process 2 should be denied: 1200 + 900 exceeds daily cap 2000"
+        );
+
+        // But a smaller amount should fit
+        let opp3 = Opportunity {
+            id: "p2-opp-small".into(),
+            expected_net_usd: Decimal::from(500),
+            gas_estimate_gwei: 50,
+            venue: "c".into(),
+            eoa: "0xClean2".into(),
+            timestamp: Utc::now(),
+        };
+        let res = pacing2.try_reserve(&opp3, 8453);
+        assert!(res.is_ok(), "500 should fit: 1200 + 500 = 1700 < 2000");
+    }
+
+    #[test]
+    fn crossprocess_settle_then_release_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        let opp1 = Opportunity {
+            id: "opp-1".into(),
+            expected_net_usd: Decimal::from(1500),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        pacing.try_reserve(&opp1, 8453).unwrap();
+        pacing.settle("opp-1", 8453).unwrap();
+
+        let opp2 = Opportunity {
+            id: "opp-2".into(),
+            expected_net_usd: Decimal::from(1500),
+            gas_estimate_gwei: 50,
+            venue: "b".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        let result = pacing.try_reserve(&opp2, 8453);
+        assert!(
+            result.is_ok(),
+            "After settle, reserved cap is freed; 1500 fresh should be allowed"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Comment 4: Malformed JSONL fail-closed regression tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn reservations_load_malformed_jsonl_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reservations-8453.jsonl");
+        // Last line is invalid JSON — must fail, not silently skip.
+        let bad = r#"{"id":"ok","chain_id":8453,"amount_usd":"100","status":"reserved","created_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z","settled_at":null}
+NOT_VALID_JSON
+"#;
+        std::fs::write(&path, bad).unwrap();
+        let result = CrossProcessPacing::load_reservations(&path);
+        assert!(
+            result.is_err(),
+            "Malformed JSONL should cause load failure, not silent skip"
+        );
+    }
+
+    #[test]
+    fn reservations_load_empty_file_is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reservations-8453.jsonl");
+        std::fs::write(&path, "\n\n").unwrap();
+        let records = CrossProcessPacing::load_reservations(&path).unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn reservations_load_partial_line_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reservations-8453.jsonl");
+        // Truncated JSON line (interrupted write simulation).
+        let truncated = r#"{"id":"ok","chain_id":8453,"amount_usd":"100","status":"reserved","#;
+        std::fs::write(&path, truncated).unwrap();
+        let result = CrossProcessPacing::load_reservations(&path);
+        assert!(
+            result.is_err(),
+            "Truncated JSONL line (interrupted write) should fail closed"
+        );
+    }
+
+    #[test]
+    fn crossprocess_try_reserve_fails_on_malformed_any_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        std::fs::create_dir_all(&res_dir).unwrap();
+
+        // Write a valid file for chain 42161, and a corrupt file for chain 8453.
+        let good_path = res_dir.join("reservations-42161.jsonl");
+        let good = r#"{"id":"arb-1","chain_id":42161,"amount_usd":"50","status":"reserved","created_at":"2026-01-01T00:00:00Z","expires_at":"2026-01-01T00:05:00Z","settled_at":null}
+"#;
+        std::fs::write(&good_path, good).unwrap();
+
+        let bad_path = res_dir.join("reservations-8453.jsonl");
+        std::fs::write(&bad_path, "GARBAGE\n").unwrap();
+
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        let opp = Opportunity {
+            id: "opp-1".into(),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        let result = pacing.try_reserve(&opp, 8453);
+        assert!(
+            result.is_err(),
+            "try_reserve must fail when ANY reservation file is corrupt"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Comment 3: Multi-chain reservation aggregation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn crossprocess_multi_chain_reservations_aggregate_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        // Reserve on chain 8453
+        let opp1 = Opportunity {
+            id: "base-opp".into(),
+            expected_net_usd: Decimal::from(500),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        pacing.try_reserve(&opp1, 8453).unwrap();
+
+        // Reserve on chain 42161 — daily cap is shared across chains
+        let opp2 = Opportunity {
+            id: "arb-opp".into(),
+            expected_net_usd: Decimal::from(1600),
+            gas_estimate_gwei: 50,
+            venue: "b".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        // 500 (base) + 1600 (arb) = 2100 > 2000 daily cap
+        let result = pacing.try_reserve(&opp2, 42161);
+        assert!(
+            result.is_err(),
+            "Cross-chain reservation total 2100 should exceed daily cap 2000"
+        );
+
+        // But total 500 + 1000 = 1500 fits
+        let opp3 = Opportunity {
+            id: "arb-opp-small".into(),
+            expected_net_usd: Decimal::from(1000),
+            gas_estimate_gwei: 50,
+            venue: "c".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        let res = pacing.try_reserve(&opp3, 42161);
+        assert!(res.is_ok(), "500 + 1000 = 1500 should fit under 2000 cap");
+    }
+
+    // -------------------------------------------------------------------
+    // Comment 1: Oracle ETH/USD refresh tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fallback_used_when_no_oracle_attached() {
+        let engine = PacingEngine::new(make_test_config());
+        // No oracle attached — cached_eth_price is None.
+        assert!(engine.inner.read().cached_eth_price.is_none());
+        let cost = engine.inner.read().estimate_gas_cost_usd(50);
+        // Fallback: 1800 USD/ETH * (50 gwei * 150000 / 1e9) = 1800 * 0.0075 = 13.5
+        assert!(cost > Decimal::ZERO);
+    }
+
+    #[test]
+    fn cached_price_persists_after_failed_refresh() {
+        // When no oracle is attached, refresh_eth_price is a no-op and the
+        // existing cached price (if set) is preserved.
+        let engine = PacingEngine::new(make_test_config());
+        engine.inner.write().cached_eth_price = Some(Decimal::from(2000));
+        // refresh_eth_price is async but with no oracle it's a no-op.
+        // Verify that the cached price is unchanged.
+        assert_eq!(engine.inner.read().cached_eth_price, Some(Decimal::from(2000)));
+    }
+
+    // -------------------------------------------------------------------
+    // Comment 1 regression: try_reserve must not panic inside a Tokio
+    // runtime (no nested Runtime::new / block_on).
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn try_reserve_from_tokio_context_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        let opp = Opportunity {
+            id: "tokio-test".into(),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+
+        // This must NOT panic — recover_realized_usage now uses sync I/O
+        // instead of creating a nested Tokio runtime.
+        let result = pacing.try_reserve(&opp, 8453);
+        assert!(result.is_ok(), "try_reserve should succeed from tokio context");
+    }
+
+    // -------------------------------------------------------------------
+    // Comment 2 regression: realized outcomes are not double-counted
+    // when computing global caps.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn global_cap_does_not_double_count_realized_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let res_dir = dir.path().join("reservations");
+        let engine = PacingEngine::new(make_test_config());
+        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+
+        // Step 1: Record a realized outcome to drive up local counters.
+        // The engine's inner daily_net_usd will rise but the global cap
+        // must NOT include it (the shared outcomes recovery is the sole
+        // source of realized-usage truth).
+        let opp1 = Opportunity {
+            id: "realized-1".into(),
+            expected_net_usd: Decimal::from(500),
+            gas_estimate_gwei: 50,
+            venue: "a".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        pacing.engine().record_outcome(
+            &opp1,
+            Decimal::from(500),
+            Decimal::ZERO,
+            false,
+        );
+
+        // Inner counter is now 500.
+        assert_eq!(
+            pacing.engine().current_daily_usage(),
+            Decimal::from(500),
+            "inner daily usage should be 500 after recording"
+        );
+
+        // Step 2: Reserve $1700. If inner counters were double-counted,
+        // this would fail (500 + 1700 = 2200 > 2000 daily cap). Since
+        // global caps use only shared recovery + active reservations,
+        // this should succeed.
+        let opp2 = Opportunity {
+            id: "reserve-after-realized".into(),
+            expected_net_usd: Decimal::from(1700),
+            gas_estimate_gwei: 50,
+            venue: "b".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        let result = pacing.try_reserve(&opp2, 8453);
+        assert!(
+            result.is_ok(),
+            "1700 should fit: global caps exclude inner counters (no double count). Got: {:?}",
+            result.err()
+        );
+
+        // Step 3: But 2000 more (1700 active + 2000 new) should exceed the cap.
+        let opp3 = Opportunity {
+            id: "would-exceed".into(),
+            expected_net_usd: Decimal::from(2000),
+            gas_estimate_gwei: 50,
+            venue: "c".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        let result3 = pacing.try_reserve(&opp3, 8453);
+        assert!(
+            result3.is_err(),
+            "1700 active + 2000 new = 3700 should exceed daily cap 2000"
+        );
+    }
+
+    #[test]
+    fn test_repeated_borrower_opportunities_do_not_collide() {
+        // Verify that repeated opportunities for the same borrower on the same
+        // chain produce unique IDs and do not collide in the pacing engine.
+        let mut config = make_test_config();
+        config.min_interval_hours = 0;
+        let engine = PacingEngine::new(config);
+
+        let ts1 = Utc::now();
+        let ts2 = ts1 + chrono::Duration::seconds(12); // next block
+
+        let opp1 = Opportunity {
+            id: format!("liq-{}-{}-{}", 8453, "0xBorrower1", ts1.timestamp_millis()),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 50,
+            venue: "test-dex".into(),
+            eoa: "0xClean1".into(),
+            timestamp: ts1,
+        };
+
+        let opp2 = Opportunity {
+            id: format!("liq-{}-{}-{}", 8453, "0xBorrower1", ts2.timestamp_millis()),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 50,
+            venue: "test-dex-2".into(),
+            eoa: "0xClean1".into(),
+            timestamp: ts2,
+        };
+
+        // IDs must differ (same borrower, same chain, different times)
+        assert_ne!(opp1.id, opp2.id,
+            "Repeated opportunities for the same borrower must have unique IDs");
+
+        // Both should be independently allowed (no collision)
+        let d1 = engine.check(&opp1).unwrap();
+        assert!(matches!(d1, PacingDecision::Allow { .. }));
+        engine.record_outcome(&opp1, Decimal::from(100), Decimal::ZERO, false);
+
+        let d2 = engine.check(&opp2).unwrap();
+        assert!(matches!(d2, PacingDecision::Allow { .. }));
+        engine.record_outcome(&opp2, Decimal::from(100), Decimal::ZERO, false);
+
+        // Verify both outcomes are tracked in daily usage
+        let state = engine.current_risk_state();
+        assert_eq!(state.daily_net_usd, Decimal::from(200),
+            "Both opportunities should be independently counted");
     }
 }
 

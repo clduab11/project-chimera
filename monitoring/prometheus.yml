@@ -1,4 +1,13 @@
-# Prometheus scrape config for Chimera
+# Prometheus scrape config for Project Chimera (multi-chain, per-process metrics)
+#
+# Port assignment model:
+#   Each chain process binds metrics on: base_metrics_port + (chain_id % 1000)
+#   Default base: 9100
+#   - Base (chain_id=8453): 9100 + 453 = 9553
+#   - Arbitrum (chain_id=42161): 9100 + 161 = 9261
+#
+# These ports are also overridable via --metrics-port-offset CLI flag and
+# CHIMERA_METRICS_PORT env var. See core/src/main.rs for the resolution logic.
 global:
   scrape_interval: 15s
 
@@ -13,7 +22,14 @@ alerting:
 scrape_configs:
   - job_name: 'chimera'
     static_configs:
-      - targets: ['chimera-core:9100']
+      - targets:
+          # Each entry is host:port for a chain-scoped process.
+          # Default ports derived as base_port (9100) + (chain_id % 1000).
+          # Operators should adjust these to match their actual deployment.
+          - 'chimera-core:9553'   # Base (chain_id=8453): 9100 + 453
+          - 'chimera-core:9261'   # Arbitrum (chain_id=42161): 9100 + 161
+        labels:
+          app: 'chimera'
 
   - job_name: 'prometheus'
     static_configs:

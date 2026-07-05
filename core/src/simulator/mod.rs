@@ -122,28 +122,20 @@ pub enum L2ChainType {
 type ForkDb<P> = CacheDB<WrapDatabaseAsync<AlloyDB<Ethereum, P>>>;
 type EvmResultAndState = ExecResultAndState<ExecutionResult>;
 
-#[allow(dead_code)]
 pub struct LiquidationSimulator<P: Provider<Ethereum> + Clone> {
     provider: Arc<P>,
     db: ForkDb<P>,
     aave_pool: Address,
-    price_oracle: Address,
     oracle: Arc<dyn crate::oracle::PriceOracle>,
-    pool_data_provider: Address,
     eth_oracle_asset: Address,
     l2_chain_type: L2ChainType,
-    close_factor_hf_threshold: U256,
-    min_base_max_close_factor: U256,
-    min_leftover_base: U256,
 }
 
 impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
     pub async fn new(
         provider: Arc<P>,
         aave_pool: Address,
-        price_oracle: Address,
         oracle: Arc<dyn crate::oracle::PriceOracle>,
-        pool_data_provider: Address,
         eth_oracle_asset: Address,
     ) -> Result<Self, ChimeraError> {
         let alloy_db = AlloyDB::new((*provider).clone(), BlockId::latest());
@@ -152,22 +144,13 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         })?;
         let db = CacheDB::new(wrapped_db);
 
-        let close_factor_hf_threshold = U256::from(95) * U256::from(10).pow(U256::from(16)); // 0.95e18 RAY
-        let min_base_max_close_factor = U256::from(2000) * U256::from(10).pow(U256::from(8)); // 2000e8
-        let min_leftover_base = min_base_max_close_factor / U256::from(2);
-
         Ok(Self {
             provider,
             db,
             aave_pool,
-            price_oracle,
             oracle,
-            pool_data_provider,
             eth_oracle_asset,
             l2_chain_type: L2ChainType::default(),
-            close_factor_hf_threshold,
-            min_base_max_close_factor,
-            min_leftover_base,
         })
     }
 

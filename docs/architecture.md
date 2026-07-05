@@ -1,7 +1,7 @@
 # Project Chimera — System Architecture
 
-**Version**: 1.0  
-**Last Updated**: 2026-06-16  
+**Version**: 1.1
+**Last Updated**: 2026-07-05
 **Scope**: Sovereign, local-first MEV extraction engine for Aave V3 liquidations on L2 (Base, Arbitrum).
 
 ---
@@ -53,7 +53,7 @@ flowchart LR
     end
 
     subgraph Observability["observability"]
-        M1["Prometheus Metrics<br/>(:9100)"]
+        M1["Prometheus Metrics<br/>(base + chain_id % 1000)"]
         M2["Structured JSON Logs"]
         M3["Grafana Dashboard"]
     end
@@ -195,7 +195,7 @@ flowchart LR
   - **Daily loss > 0.005 ETH**
   - Weekly cap exceeded
   - Single transfer cap exceeded
-- **Crash-safe persistence**: Writes `RiskState` to JSONL on every `record_outcome`. Reloads on restart.
+- **Crash-safe persistence**: Writes outcomes to `core/state/outcomes.jsonl` via `JsonlPersistence` on every `record_outcome`. Reloads on restart.
 - **Thread safety**: Internal `parking_lot::RwLock` allows concurrent reads and exclusive writes.
 
 **Safety Note**: All monetary values use `Decimal` (not `f64`) to eliminate floating-point errors in financial calculations.
@@ -217,6 +217,20 @@ flowchart LR
 - **Profit gate**: Compares `balanceAfter - balanceBefore` against `(gas * gasPrice) + tip + L1_data_fee`. Reverts if profit threshold is not met.
 - **EIP-7702 compatible**: Supports authorized execution via delegated EOAs.
 - **L2-optimized**: Minimal calldata and gas usage for L2 sequencer submission (no bundle complexity).
+
+**Contract functions** (actual exported selectors from `Executor.yul`):
+
+| Function | Selector | Access |
+|----------|----------|--------|
+| `owner()` | `0x8da5cb5b` | Public view |
+| `exec(bytes)` | `0x55f86501` | Owner only |
+| `setPool(address)` | `0xa51b62c1` | Owner only |
+| `withdraw(address,uint256)` | `0xf3fef3a3` | Owner only |
+| `transferOwnership(address)` | `0xf2fde38b` | Owner only |
+| `executeOperation(...)` | `0x1b11d0ff` | Aave callback (restricted to pool caller) |
+
+> **Note:** There is no `pool()` public view getter. To read the pool address,
+> use `cast storage <EXECUTOR_ADDRESS> 1 --rpc-url <RPC_URL>`.
 
 **Current State**: Yul flash-loan executor implementation is present with dispatcher, callback path, multi-leg routing, and balance-delta profit checks. It remains shadow-gated until selector/topic verification, Foundry tests, and external audit checks pass.
 
@@ -262,10 +276,10 @@ flowchart LR
 | Property | Detail |
 |----------|--------|
 | **Source File** | `core/src/metrics.rs` |
-| **Protocol** | Prometheus text format on HTTP `:9100` |
+| **Protocol** | Prometheus text format on HTTP `:9100 + (chain_id % 1000)` |
 | **Dashboard** | Grafana (default: `localhost:3002`) |
 
-**Exported Metrics**:
+**Exported Metrics** (all prefixed `chimera_`):
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -273,12 +287,21 @@ flowchart LR
 | `chimera_sims_run_total` | Counter | `result` | Simulations run (success/denied/revert) |
 | `chimera_sim_latency_seconds` | Histogram | — | REVM simulation latency |
 | `chimera_profit_usd` | Histogram | — | Estimated profit per successful sim |
-| `chimera_revert_total` | Counter | `reason` | On-chain reverts |
-| `chimera_breaker_state` | Gauge | — | `0`=OK, `1`=tripped |
+| `chimera_revert_total` | Counter | `reason` | On-chain reverts (verify reason label values at runtime) |
+| `chimera_breaker_state` | Gauge | `chain` | `0`=OK, `1`=tripped |
 | `chimera_gas_used` | Histogram | — | Gas consumed per liquidation |
 | `chimera_l1_fee_wei` | Gauge | — | L1 data fee in wei |
+| `chimera_daily_net_usd` | Gauge | `chain` | Rolling 24h net USD |
+| `chimera_weekly_net_usd` | Gauge | `chain` | Rolling 7d net USD |
+| `chimera_sweep_total` | Counter | `type` | Total sweep/refund operations |
+| `chimera_sweep_skipped_breaker` | Counter | `type` | Sweeps skipped due to breaker |
+| `chimera_sweep_amount_wei` | Gauge | — | Last sweep amount in wei |
 
-**Log Format**: Structured JSON via `tracing-subscriber` with `env-filter`. Default level: `info`.
+**Metrics that do NOT exist** (remove from any dashboard or alert rule):
+- `chimera_txs_submitted_total` — not exported
+- `chimera_txs_confirmed_total` — not exported
+
+**Log Format**: Structured JSON via `tracing-subscriber` with `env-filter`. Default level: `info`. Logs go to stdout and `logs/chimera.log.YYYY-MM-DD` (daily rotation via `tracing_appender`).
 
 ---
 
@@ -340,7 +363,7 @@ The system is engineered to bound capital at risk, contain operational blast rad
 
 ### 5.5 Recovery & Audit Trail
 
-- Every `record_outcome` persists `RiskState` to JSONL (`pacing_state.jsonl`), enabling full state recovery after crash.
+- Outcomes are persisted to `core/state/outcomes.jsonl` via `JsonlPersistence`, enabling full state recovery after crash.
 - Golden replay tests (`simulator/golden.rs`) archive historical liquidation transactions for regression testing.
 - All pacing decisions, breaker trips, and simulation results are logged with UTC timestamps and unique opportunity IDs.
 
@@ -353,14 +376,15 @@ The system is engineered to bound capital at risk, contain operational blast rad
 │  Operator Workstation (Windows 11)      │
 │  └─ WSL2 Ubuntu (dev/build environment) │
 │     └─ chimera-core binary             │
-│        ├─ Prometheus metrics :9100      │
-│        ├─ Grafana dashboard :3003       │
+│        ├─ Prometheus metrics            │
+│        │  port: 9100 + (chain_id % 1000)│
+│        ├─ Grafana dashboard :3002       │
 │        └─ JSONL state persistence       │
 │                                         │
 │  ├─ config/pacing.yaml                  │
 │  ├─ config/risk.yaml                    │
-│  ├─ config/routing.yaml               │
-│  ├─ encrypted_keystore/               │
+│  ├─ config/routing.yaml                 │
+│  ├─ encrypted_keystore/                 │
 │  └─ logs/                               │
 └─────────────────────────────────────────┘
                     │

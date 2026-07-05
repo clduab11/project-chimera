@@ -1,7 +1,8 @@
 # Project Chimera - Risk & Safety Configuration (v1.0)
 
 max_loss_eth: 0.005          # Daily realized loss (gas + negative outcomes) before full halt
-min_profit: 2.5              # Minimum multiplier over (gas + priority + L1 data fee)
+min_profit: 2.5
+min_profit_fraction: 0.8            # Fraction of expected profit required on-chain (0.8 = 80%)
 auto_halt_reverts: 3         # Consecutive bundle reverts
 max_gas_gwei: 300            # L2 gas price ceiling (prevents bidding wars)
 slippage_max_bps: 50         # 0.5% max acceptable slippage on any leg (L2 adjusted)

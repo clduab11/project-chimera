@@ -1,4 +1,4 @@
-﻿# Project Chimera ΓÇö First-Run Onboarding Guide
+﻿# Project Chimera — First-Run Onboarding Guide
 
 > **Who this is for:** Someone who has just cloned this repository and wants to
 > understand what Chimera does, how it makes money, how to get it running safely,
@@ -13,8 +13,8 @@
 ## 1. What Is Chimera?
 
 Chimera is an automated on-chain liquidation bot targeting the Aave V3 lending
-protocol on Base and Arbitrum. It watches for undercollateralized loans ΓÇö users
-whose collateral has fallen below Aave's minimum health threshold ΓÇö and, when it
+protocol on Base and Arbitrum. It watches for undercollateralized loans — users
+whose collateral has fallen below Aave's minimum health threshold — and, when it
 finds one, steps in to repay part of their debt in exchange for a discounted
 share of their collateral.
 
@@ -28,8 +28,8 @@ flash loan to execute the entire sequence atomically:
 4. Repay the flash loan plus fee
 5. Keep the remainder as profit
 
-If the math does not work out ΓÇö if profit after gas and fees is below the
-configured multiplier threshold ΓÇö Chimera does nothing. It never takes a position
+If the math does not work out — if profit after gas and fees is below the
+configured multiplier threshold — Chimera does nothing. It never takes a position
 it cannot close in the same transaction.
 
 ---
@@ -37,7 +37,7 @@ it cannot close in the same transaction.
 ## 2. How the Money Works
 
 **Revenue source:** The liquidation bonus Aave pays. On most assets this is
-5ΓÇô10% of the repaid debt. Chimera targets only those where the expected net
+5–10% of the repaid debt. Chimera targets only those where the expected net
 return exceeds gas cost by at least `min_profit_multiplier` (default 2.5x, set
 in `config/pacing.yaml`).
 
@@ -52,9 +52,9 @@ Treasury wallet (cold)
         |
    fund_eoa.py
         |
-Worker EOAs (hot, small balances ΓÇö enough for gas)
+Worker EOAs (hot, small balances — enough for gas)
         |
-  Chimera binary (flash-loan execution ΓÇö no capital at risk per-op)
+  Chimera binary (flash-loan execution — no capital at risk per-op)
         |
   Profit lands in worker EOA
         |
@@ -90,7 +90,7 @@ It is safe to run in this mode without any funds at risk.
 `execute_mode: live` is the mode where transactions are submitted. A 7-day shadow
 period is required before the engine will allow a shadow-to-live transition (this
 is enforced in `PacingConfig::validate_mode_transition()`). The current binary
-entrypoint does not implement the full live execution path yet ΓÇö see the notes in
+entrypoint does not implement the full live execution path yet — see the notes in
 Section 9.
 
 **Do not change `execute_mode` to `live` until you have:**
@@ -117,19 +117,19 @@ Section 9.
 > want to use the funding/sweep helpers.
 
 ### Accounts you will need
-- A **treasury wallet** (cold) ΓÇö never touches the engine directly
-- At least one **worker EOA** (hot, small balance) ΓÇö the engine's signing wallet
+- A **treasury wallet** (cold) — never touches the engine directly
+- At least one **worker EOA** (hot, small balance) — the engine's signing wallet
 - A **Base or Arbitrum RPC URL** (Alchemy, Infura, or your own node)
 
 > **Never store private keys in this repository.** The `config/eoa_pool.json`
 > file holds public addresses only. Private keys belong in a separate encrypted
-> keystore outside this repo ΓÇö never in any file tracked by git.
+> keystore outside this repo — never in any file tracked by git.
 
 ---
 
 ## 5. Step-by-Step: First Run (Shadow Mode)
 
-### Step 1 ΓÇö Clone and verify the repo
+### Step 1 — Clone and verify the repo
 
 ```bash
 git clone <repo-url> project-chimera
@@ -141,38 +141,40 @@ You should see at least the three commits from the initial build phases.
 
 ---
 
-### Step 2 ΓÇö Build the Rust binary
+### Step 2 — Build the Rust binary
 
 ```bash
 cargo build -p chimera-core --release
 ```
 
 This compiles the `chimera` binary into `target/release/chimera`. Expect the
-first build to take 2ΓÇô5 minutes while dependencies compile.
+first build to take 2–5 minutes while dependencies compile.
 
 If the build fails:
 - Confirm your Rust toolchain: `rustup show`
-- The project pins stable Rust ΓÇö check `core/rust-toolchain.toml`
+- The project pins stable Rust — check `core/rust-toolchain.toml`
 
 ---
 
-### Step 3 ΓÇö Review and confirm your pacing config
+### Step 3 — Review and confirm your pacing config
 
 Open `config/pacing.yaml` in a text editor. Confirm:
 
-- `execute_mode: shadow` ΓÇö **must be `shadow` for your first run**
-- `max_daily_net_usd` ΓÇö set conservatively (default 2000 is fine)
-- `metrics_port: 9100` ΓÇö this is where the metrics server will listen
-- `eoa_pool_path: config/eoa_pool.json` ΓÇö points to your wallet pool file
+- `execute_mode: shadow` — **must be `shadow` for your first run**
+- `max_daily_net_usd` — set conservatively (default 2000 is fine)
+- `metrics_port: 9100` — the **base** metrics port; the actual port is `9100 + (chain_id % 1000)`, e.g. `:9553` for Base (chain_id 8453)
+- `eoa_pool_path: config/eoa_pool.json` — points to your wallet pool file
 
 Do not change anything else yet. The defaults are conservative by design.
 
 ---
 
-### Step 4 ΓÇö Prepare your EOA pool
+### Step 4 — Prepare your EOA pool
 
 Open `config/eoa_pool.json`. It ships with placeholder public addresses.
 Replace the `address` fields with your actual worker EOA public addresses.
+The `wallets` key is now the canonical shape (the prior `workers` vs `wallets`
+mismatch is resolved; `fund_eoa.py` reads `wallets`).
 
 ```json
 {
@@ -195,7 +197,7 @@ Replace the `address` fields with your actual worker EOA public addresses.
 
 ---
 
-### Step 5 ΓÇö Generate a mock snapshot (optional but recommended)
+### Step 5 — Generate a mock snapshot (optional but recommended)
 
 ```bash
 python scripts/snapshot_generator.py --chain base --mock
@@ -213,22 +215,24 @@ python scripts/snapshot_generator.py --chain base --rpc-url <YOUR_RPC_URL>
 
 ---
 
-### Step 6 ΓÇö Set your RPC URL
+### Step 6 — Set your RPC URL
 
-The binary currently reads a single env var:
+The binary resolves RPC endpoints in order:
+1. `BASE_RPC_URL` (Base) or `ARB_RPC_URL` (Arbitrum)
+2. `RPC_URL` (fallback for either chain)
+3. `http://localhost:8545` (default)
 
 ```bash
-export RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_KEY
+export BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_KEY
 ```
 
-> **Note:** `docker-compose.yml` defines `BASE_RPC_URL` and `ARB_RPC_URL`, but
-> the current `main.rs` entrypoint reads only `RPC_URL`. Use `RPC_URL` when
-> running the binary directly. The multi-chain env var wiring is planned but not
-> yet implemented in the entrypoint.
+> **Note:** Multi-chain RPC wiring via `BASE_RPC_URL` / `ARB_RPC_URL` is now
+> fully supported in `main.rs`. See `resolve_rpc_url()` in `core/src/main.rs:475` for the
+> full resolution order.
 
 ---
 
-### Step 7 ΓÇö Start the binary
+### Step 7 — Start the binary
 
 ```bash
 ./target/release/chimera
@@ -240,31 +244,32 @@ Or with explicit logging:
 RUST_LOG=chimera=debug ./target/release/chimera
 ```
 
-The default log level is `chimera=info`. All logs go to **stdout only** ΓÇö no
-log files are written to disk by the current binary.
+The default log level is `chimera=info`. Logs go to both stdout and
+`logs/chimera.log.YYYY-MM-DD` (daily rotation via tracing_appender).
 
 ---
 
-### Step 8 ΓÇö Verify startup (the 3 things to check)
+### Step 8 — Verify startup (the 3 things to check)
 
 **1. Look for this line in stdout:**
 ```
 INFO chimera::orchestrator: Orchestrator starting chain_id=8453
 ```
 This confirms config loaded, metrics bound, and the main loop started.
-If you do not see this, the config load or port bind failed ΓÇö check stdout for
+If you do not see this, the config load or port bind failed — check stdout for
 the error.
 
 **2. Confirm the metrics endpoint responds:**
 ```bash
-curl http://localhost:9100
+curl http://localhost:9553
 ```
 You should get a `200 OK` response beginning with Prometheus text like:
 ```
 # HELP chimera_candidates_seen_total ...
 ```
-Any response means the metrics server is alive. Port `9100` is the default;
-adjust if you changed `metrics_port` in `config/pacing.yaml`.
+Any response means the metrics server is alive. The actual port is
+`base_metrics_port + (chain_id % 1000)` — for Base (8453): 9100 + 453 = 9553.
+Adjust based on your chain_id and configured `metrics_port`.
 
 **3. Confirm the breaker is not tripped:**
 In the metrics output, look for:
@@ -272,7 +277,7 @@ In the metrics output, look for:
 chimera_breaker_state 0
 ```
 A value of `0` means the pacing engine is healthy. A value of `1` means the
-circuit breaker was tripped ΓÇö check the logs for the reason before proceeding.
+circuit breaker was tripped — check the logs for the reason before proceeding.
 
 ---
 
@@ -290,16 +295,17 @@ docker compose -f docker/docker-compose.yml up -d
 | Prometheus UI | http://localhost:9090 |
 | Qdrant vector store | http://localhost:6333 |
 
-> **Port note:** The operator manual mentions port `3003` for Grafana. That is
-> incorrect. The Docker Compose file maps `3002:3002`. Use `localhost:3002`.
+> **Port note:** The operator manual historically mentioned port `3003` for
+> Grafana. That is incorrect. The Docker Compose file maps `3002:3002`.
+> Use `localhost:3002`.
 
 Prometheus is pre-configured to scrape `chimera-core:9100` (the engine metrics
 port) inside the Docker network. If you run the binary outside Docker, add
-`localhost:9100` as a scrape target in `monitoring/prometheus.yml` or run the
+`localhost:<ACTUAL_PORT>` as a scrape target in `monitoring/prometheus.yml` or run the
 binary inside the compose stack.
 
 A pre-built Grafana dashboard JSON is mounted from
-`monitoring/grafana/dashboards/` ΓÇö it should auto-provision on first start.
+`monitoring/grafana/dashboards/` — it should auto-provision on first start.
 
 ---
 
@@ -330,15 +336,11 @@ state looks like this:
 The funding helper is `scripts/fund_eoa.py`. It uses `web3.py` to send ETH from
 a treasury wallet to each worker EOA that falls below a threshold.
 
-**Before using it, verify the JSON shape.** The script currently expects a
-`workers` key in the EOA pool JSON, but `config/eoa_pool.json` uses a `wallets`
-key. Until this mismatch is resolved, either:
+**The `workers` vs `wallets` JSON-shape mismatch is resolved.** The script now
+reads the `wallets` key from `config/eoa_pool.json`. Verify the shape matches
+before running.
 
-- Edit the script to read `wallets`, or
-- Manually send small amounts (0.02 ETH per worker) from your treasury wallet
-  directly
-
-Worker EOAs need only enough ETH to cover gas ΓÇö roughly `0.02 ETH` per wallet
+Worker EOAs need only enough ETH to cover gas — roughly `0.02 ETH` per wallet
 is the configured default. They should never hold significant balances.
 
 For EOA rotation, use:
@@ -358,13 +360,18 @@ Be aware of the following before assuming docs describe a fully runnable system:
 
 | Feature | Status |
 |---|---|
-| Multi-chain RPC wiring (`BASE_RPC_URL` / `ARB_RPC_URL`) | Planned; `main.rs` reads `RPC_URL` only |
-| JSONL audit trail / state file on disk | Library ready; not wired in `main.rs` yet |
-| EOA pool loaded at startup | Library ready; not wired in `main.rs` yet |
-| Live execution path | Not implemented in current binary |
-| `scripts/check_balances.py` | Referenced in operator manual; does not exist |
+| Live execution path | Not fully implemented in current binary |
+| `scripts/check_balances.py` | Exists and works (`--chain base --min-balance 0.01`) |
 | Keystore integrity test | Mentioned in docs; keystore directory not confirmed present |
-| `fund_eoa.py` compatible with `eoa_pool.json` shape | Mismatch ΓÇö see Section 8 |
+
+**Features that ARE now wired** (previously listed as "planned" or "not wired"):
+
+| Feature | Status |
+|---|---|
+| Multi-chain RPC wiring (`BASE_RPC_URL` / `ARB_RPC_URL`) | **Now supported** — `main.rs` resolves both env vars (see `resolve_rpc_url()` at line 475) |
+| JSONL audit trail / state file on disk | **Now wired** — outcomes written to `core/state/outcomes.jsonl` via `JsonlPersistence` (see `pacing_engine.rs:516-524` and `main.rs:333-337`) |
+| EOA pool loaded at startup | **Now wired** — `SignerRegistry` loads treasury + worker keystores at boot (see `main.rs:11,231-232`) |
+| `fund_eoa.py` compatible with `eoa_pool.json` shape | **Resolved** — script now reads `wallets` key (the `workers` vs `wallets` mismatch is fixed) |
 
 These are not blockers for shadow-mode operation. They matter when you move
 toward live execution.
@@ -376,7 +383,7 @@ toward live execution.
 `scripts/sweep_profits.py` is the profit sweep helper. It moves the balance of
 each worker EOA back to the treasury, keeping a small gas reserve per worker.
 
-This script is present but is currently a skeleton ΓÇö the `__main__` block prints
+This script is present but is currently a skeleton — the `__main__` block prints
 a ready message rather than executing a full sweep. Do not rely on it for
 automated sweeps without reviewing and extending it first.
 
@@ -385,20 +392,20 @@ to your treasury wallet using your own wallet software.
 
 ---
 
-## 11. Safety Rules ΓÇö Read These Before Touching Funds
+## 11. Safety Rules — Read These Before Touching Funds
 
 1. **Never store private keys in this repo.** Not in `config/`, not in `scripts/`,
    not anywhere tracked by git.
 
 2. **Never reuse a worker EOA after it has been used for a liquidation without
-   running rotation first.** The rotation system exists for wallet hygiene ΓÇö it
+   running rotation first.** The rotation system exists for wallet hygiene — it
    prevents forensic linkability between operations.
 
 3. **Keep worker balances small.** Each worker needs `~0.02 ETH` for gas. More
    than that is unnecessary exposure.
 
 4. **Do not change `execute_mode` to `live` without a 7-day shadow period.**
-   The code enforces this, but the check only runs at config load ΓÇö it does not
+   The code enforces this, but the check only runs at config load — it does not
    continuously monitor. Respect the intent.
 
 5. **If the circuit breaker trips, stop and investigate before clearing it.**
@@ -406,7 +413,7 @@ to your treasury wallet using your own wallet software.
    is how small issues become large losses.
 
 6. **Use `emergency_pause.py` if something looks wrong.** It writes a pause flag
-   the engine is designed to respect.
+   the engine is designed to respect. Note: `--state-file` is a required argument.
 
 7. **Caps are there for a reason.** The pacing guardrails in `config/pacing.yaml`
    are conservative by design. Do not raise them until you understand why they are
@@ -426,6 +433,9 @@ cargo build -p chimera-core --release
 # Run tests
 cargo test -p chimera-core
 
+# Test config loading specifically
+cargo test -p chimera-core test_load_valid_config
+
 # Run binary with debug logging
 RUST_LOG=chimera=debug ./target/release/chimera
 
@@ -435,14 +445,14 @@ python scripts/snapshot_generator.py --chain base --mock
 # Start monitoring stack
 docker compose -f docker/docker-compose.yml up -d
 
-# Check metrics
-curl http://localhost:9100
+# Check metrics (adjust port: 9100 + (chain_id % 1000))
+curl http://localhost:9553
 
 # Dry-run EOA rotation
 python scripts/rotate_eoa.py --dry-run
 
-# Emergency pause
-python scripts/emergency_pause.py
+# Emergency pause (--state-file is required)
+python scripts/emergency_pause.py --state-file core/state/emergency.flag --reason "manual breaker"
 
 # Run Foundry contract tests (requires foundry)
 forge test --root contracts/
@@ -465,5 +475,5 @@ forge test --root contracts/
 
 *This document was generated from a recursive analysis of the current repository
 state. Claims marked "Library ready; not wired in main.rs yet" reflect the code
-as of the date above ΓÇö check `core/src/main.rs` directly to confirm whether
+as of the date above — check `core/src/main.rs` directly to confirm whether
 additional wiring has been added since.*

@@ -18,26 +18,55 @@ venues:
     liquidity_usd_min: 50000
     type: "dex"
     kyc: false
+    router_compatibility: "v2"
+    router_address: "0x420DD381b31aEf6683db6b902084cB0FFECe40Da"
+    pairs:
+      - token_in: "0x4200000000000000000000000000000000000006"
+        token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      - token_in: "0x4200000000000000000000000000000000000006"
+        token_out: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"
   - name: "uniswap-v3-base"
     chain: "base"
     liquidity_usd_min: 50000
     type: "dex"
     kyc: false
+    router_compatibility: "v3"
+    router_address: "0x33128a8fC17869897dcE68Ed026d694621f6FdfD"
+    pairs:
+      - token_in: "0x4200000000000000000000000000000000000006"
+        token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
   - name: "sushi-base"
     chain: "base"
     liquidity_usd_min: 50000
     type: "dex"
     kyc: false
+    router_compatibility: "v2"
+    router_address: "0x71524B4f93c58fcbF659783284E38825f0622859"
+    pairs:
+      - token_in: "0x4200000000000000000000000000000000000006"
+        token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
   - name: "camelot-arbitrum"
     chain: "arbitrum"
     liquidity_usd_min: 50000
     type: "dex"
     kyc: false
+    router_compatibility: "v2"
+    router_address: "0x6EcCab422D763aC031210895C81787E87b43a652"
+    pairs:
+      - token_in: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+        token_out: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+      - token_in: "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"
+        token_out: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
   - name: "uniswap-v3-arbitrum"
     chain: "arbitrum"
     liquidity_usd_min: 50000
     type: "dex"
     kyc: false
+    router_compatibility: "v3"
+    router_address: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    pairs:
+      - token_in: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+        token_out: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 
 # Forensic hard filter (addresses from public tag lists + custom)
 forensic_tag_sources:

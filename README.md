@@ -6,6 +6,38 @@
 
 ---
 
+## Documentation Index
+
+All documentation files in the repository, with brief descriptions:
+
+| Document | Description |
+|----------|-------------|
+| [docs/architecture.md](docs/architecture.md) | Component diagram, data flow, trait boundaries, deployment topology |
+| [docs/threat-model.md](docs/threat-model.md) | Threat model and attack surface analysis |
+| [docs/snapshot-schema.md](docs/snapshot-schema.md) | `ReserveData` struct schema — must stay in sync with `core/src/simulator/prewarm.rs` |
+| [docs/first-run-onboarding.md](docs/first-run-onboarding.md) | Click-by-click beginner guide grounded in recursive code analysis |
+| [docs/operator-manual.md](docs/operator-manual.md) | Deploy, config tuning, emergency pause, log triage, EOA rotation |
+| [docs/deployment-checklist.md](docs/deployment-checklist.md) | Pre-deployment checklist for shadow and live modes |
+| [docs/emergency-procedures.md](docs/emergency-procedures.md) | Incident response playbook |
+| [docs/incident-log.md](docs/incident-log.md) | Incident tracking template (new in 0.1.4) |
+| [docs/runbook-7day-soak.md](docs/runbook-7day-soak.md) | 7-day shadow-soak runbook |
+| [docs/runbook-keystore-multisig-go-live.md](docs/runbook-keystore-multisig-go-live.md) | Keystore and multisig go-live runbook |
+| [docs/runbook-testnet-deploy.md](docs/runbook-testnet-deploy.md) | Testnet deployment runbook |
+| [docs/testing-strategy-liquidations.md](docs/testing-strategy-liquidations.md) | Test pyramid: unit, integration, proptest, golden replay, Foundry fork tests |
+| [docs/security-research.md](docs/security-research.md) | CVE/advisory workflow and curated Aave/Solidity/Slither references |
+| [docs/research/aave-v3-liquidation-compendium.md](docs/research/aave-v3-liquidation-compendium.md) | Aave V3 liquidation logic source map and regression scenarios |
+| [docs/research/dependency-cve-triage.md](docs/research/dependency-cve-triage.md) | CVE triage for pinned dependencies |
+| [docs/gate-report-2026-06-16.md](docs/gate-report-2026-06-16.md) | Validation gate run record |
+| [docs/gate-report-2026-06-16-t2.md](docs/gate-report-2026-06-16-t2.md) | Validation gate run record (t2) |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and validation gate instructions (new in 0.1.4) |
+| [SECURITY.md](SECURITY.md) | Vulnerability reporting and security model (new in 0.1.4) |
+| [CHANGELOG.md](CHANGELOG.md) | Release history in Keep a Changelog format |
+| [PHASE6_VALIDATION_GATE.md](PHASE6_VALIDATION_GATE.md) | Phase 6 validation criteria and sign-off checklist |
+
+The `ai-audit/` directory is optional/auxiliary — it contains Slither + local Ollama contract scanning tooling that is independent of the engine and not part of the liquidation funds path.
+
+---
+
 ## How It Earns (Privately)
 
 Chimera is a private, sovereign, autonomous liquidation engine running on L2s (Base, Arbitrum). It exists to capture one specific on-chain inefficiency: Aave V3 pays liquidators a bonus spread when they close underwater positions. The protocol hands that bonus to whoever does the work. Chimera does the work. No humans in the loop once it is running; no counterparties to negotiate with; no permission required from any third party.
@@ -20,7 +52,7 @@ The revenue loop is atomic and capital-light:
 
 4. **Sovereign treasury** — every successful liquidation's bonus spread, net of gas and L1 fees, lands on a worker EOA. `sweep_profits.py` consolidates native ETH and ERC20s (USDT-compatible, no-return-value safe) back to the owner-controlled treasury on a schedule. `fund_eoa.py` tops up workers when their gas falls below threshold, with correct nonce sequencing.
 
-5. **Guardrails that cannot be bypassed** — the pacing engine enforces $2,000 net daily, $7,500 net weekly, $1,000 per liquidation, 6–18h jitter between ops, auto-halt on 3 consecutive reverts, auto-halt on >300 gwei gas, auto-halt on 0.005 ETH daily loss. These are code-enforced; there is no API or config that disables them. `emergency_pause.py` trips the breaker from any operator machine; `clear_breaker` requires `CHIMERA_OPERATOR_TOKEN`. The Executor contract is owner-gated on every state-changing selector (`exec(bytes)`, `setPool`, `withdraw`, `transferOwnership`); ownership is held by a multisig at deployment (`Deploy.s.sol` refuses to deploy to a non-contract multisig), and `transferOwnership` rejects the zero address to prevent lazy-init hijack. `execute_mode` defaults to `shadow`. The `cargo`-gated `shadow-guard` CI job refuses any PR that flips `execute_mode: live` in committed config or fixtures.
+5. **Guardrails that cannot be bypassed** — the pacing engine enforces $2,000 net daily, $7,500 net weekly, $1,000 per liquidation, 6–18h jitter between ops, auto-halt on 3 consecutive reverts, auto-halt on >300 gwei gas, auto-halt on 0.005 ETH daily loss. These are code-enforced; there is no API or config that disables them. `emergency_pause.py` trips the breaker from any operator machine; `clear_breaker` requires `CHIMERA_OPERATOR_TOKEN`. The Executor contract is owner-gated on every state-changing selector (`exec(bytes)`, `setPool`, `withdraw`, `transferOwnership`); ownership is set only at construction via Deploy.s.sol or by explicit self-init from the worker EOA itself. No caller()-based lazy-init exists; arbitrary external callers cannot seize a worker-as-Executor. `execute_mode` defaults to `shadow`. The `cargo`-gated `shadow-guard` CI job refuses any PR that flips `execute_mode: live` in committed config or fixtures.
 
 The engine runs in shadow mode for a mandatory 7-day soak before a live transition is permitted (enforced by `toggle_shadow.py` against `core/state/mode.json`). After the soak, the operator can flip to live — and from that point on, Chimera earns autonomously: it finds the opportunity, validates it, executes it only if profitable, sweeps the profit, funds the next worker, and repeats. The operator watches Grafana and responds to emergency drills; the machine does the rest.
 

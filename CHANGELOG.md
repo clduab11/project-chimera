@@ -5,8 +5,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.1.4] - 2026-07-05 - Documentation cleanup, dead code removal, and repo hygiene
 
+### Added
 
+- LICENSE file (MIT)
+- CONTRIBUTING.md with development setup and validation gate instructions
+- docs/incident-log.md template for incident tracking
+- SECURITY.md with vulnerability reporting and security model
+- Documentation index in README.md cross-referencing all docs
+
+### Changed
+
+- Refactored documentation structure for clarity and cross-referencing
+
+### Removed
+
+- temp_executor.yul (stale duplicate of contracts/src/Executor.yul)
+- test_temp/ directory (developer debug scratch artifacts)
+- core/test_temp/ directory (transient test artifacts)
+- network/internal/ directory (empty scaffold)
+- tests/fixtures/ directory with stale duplicate pacing_canonical.yaml and golden_replays.json
+- core/target/test_tmp/ (stale build artifacts)
+- Dead function resolve_v2_or_err() from core/src/routing/resolver.rs
+- 5 unused struct fields from LiquidationSimulator in core/src/simulator/mod.rs
+- Redundant #[allow(dead_code)] from load_signer() in core/src/main.rs
+- Dead function find_golden_replays_path() from core/src/simulator/golden.rs
+
+### Fixed
+
+- Removed redundant #[allow(dead_code)] attribute masking unused code
+- Eliminated duplicate test fixture files (canonical copies at core/tests/fixtures/)
 
 ## [0.1.3] - 2026-06-16 - Add first-run onboarding guide
 

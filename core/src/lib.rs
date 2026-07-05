@@ -5,12 +5,17 @@ pub mod config;
 pub mod detector;
 pub mod error;
 pub mod executor;
+pub mod mempool;
 pub mod metrics;
 pub mod oracle;
 pub mod orchestrator;
 pub mod pacing_engine;
+pub mod routing;
 pub mod simulator;
 pub mod state;
+pub mod signer_registry;
+pub mod strategy;
+pub mod sweep_scheduler;
 
 pub use simulator::golden;
 pub use simulator::prewarm;
@@ -25,7 +30,12 @@ pub use executor::{
 pub use metrics::{start_metrics_server, Metrics};
 pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use oracle::{AaveOracle, ChainlinkOracle, OraclePrice, PriceOracle};
-pub use pacing_engine::{BreakerReason, Opportunity, PacingDecision, PacingEngine};
+pub use routing::{ResolvedV2Route, RoutingResolver};
+pub use signer_registry::{ManagedSigner, SignerRegistry};
+pub use mempool::{BlockWatch, MempoolWatcher, SequencerFeed, WatchEvent};
+pub use strategy::assembler::StrategyAssembler;
+pub use sweep_scheduler::SweepScheduler;
+pub use pacing_engine::{BreakerReason, CrossProcessPacing, Opportunity, PacingDecision, PacingEngine};
 pub use simulator::{L2ChainType, LiquidationCandidate, LiquidationSimulator, SimulationResult};
-pub use state::{JsonlPersistence, StatePersistence};
+pub use state::{JsonlPersistence, ReservationRecord, ReservationStatus, StatePersistence};
 

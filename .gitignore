@@ -89,3 +89,5 @@ temp_executor.yul
 
 # Misplaced duplicate (canonical copy lives at core/tests/fixtures/)
 tests/fixtures/golden_replays.json
+keystores/
+rustup-init.exe

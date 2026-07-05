@@ -1,0 +1,28 @@
+{
+  "_comment": "Project Chimera testnet practice constants. Base Sepolia only. Addresses sourced from docs/runbook-testnet-deploy.md §3.1/App.A — operator must re-verify against Aave docs before use. Public data only; no secrets belong in this file.",
+  "chain": "base-sepolia",
+  "chain_id": 84532,
+  "rpc_url": "https://sepolia.base.org",
+  "explorer": "https://sepolia.basescan.org",
+  "faucets": [
+    {"name": "Coinbase Developer Platform", "url": "https://portal.cdp.coinbase.com/products/faucet"},
+    {"name": "Alchemy Base Sepolia", "url": "https://www.alchemy.com/faucets/base-sepolia"},
+    {"name": "Superchain Faucet", "url": "https://console.optimism.io/faucet"},
+    {"name": "thirdweb", "url": "https://thirdweb.com/base-sepolia-testnet"}
+  ],
+  "aave": {
+    "pool": "0x07eA79F68B2B3df56440f754B6aA0E498b9B75Fb",
+    "pool_data_provider": "0x86Fc51D0f8A8cA1e27Ee2b9b47368d0A48EB7b9C",
+    "oracle": "0x4B679FE601b16583Fc6FF04f2F008dC1eFfa3B1E"
+  },
+  "tokens": {
+    "weth": "0x4200000000000000000000000000000000000006",
+    "usdc": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+  },
+  "funding": {
+    "treasury_target_eth": 0.1,
+    "worker_topup_eth": 0.02,
+    "min_worker_balance_eth": 0.01
+  },
+  "workers": 3
+}

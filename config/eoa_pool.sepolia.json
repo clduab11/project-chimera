@@ -1,0 +1,39 @@
+{
+  "version": "2.0",
+  "_comment": "Testnet practice pool (Base Sepolia, chain_id 84532). Template only. Store real private keys in separate encrypted keystores; this file should contain public addresses and rotation metadata only. Runtime balances are fetched via RPC; on-disk balances are intentionally zeroed.",
+  "wallets": [
+    {
+      "address": "0x1111111111111111111111111111111111111111",
+      "label": "chimera-sepolia-01",
+      "chain_balances": {
+        "base": "0",
+        "arbitrum": "0"
+      },
+      "last_used": 0,
+      "use_count": 0,
+      "excluded": false
+    },
+    {
+      "address": "0x2222222222222222222222222222222222222222",
+      "label": "chimera-sepolia-02",
+      "chain_balances": {
+        "base": "0",
+        "arbitrum": "0"
+      },
+      "last_used": 0,
+      "use_count": 0,
+      "excluded": false
+    },
+    {
+      "address": "0x3333333333333333333333333333333333333333",
+      "label": "chimera-sepolia-03",
+      "chain_balances": {
+        "base": "0",
+        "arbitrum": "0"
+      },
+      "last_used": 0,
+      "use_count": 0,
+      "excluded": false
+    }
+  ]
+}

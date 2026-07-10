@@ -405,7 +405,7 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
         // current-thread test runtime it only runs at an await point, so poll
         // with a bounded await-based wait instead of asserting immediately.
         for _ in 0..100 {
-            if outcomes_path.exists() {
+            if tokio::fs::metadata(&outcomes_path).await.is_ok() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

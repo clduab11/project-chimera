@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
@@ -11,6 +11,7 @@ use crate::{ChimeraError, PacingConfig};
 pub struct SignerRegistry {
     signers: HashMap<Address, Arc<ManagedSigner>>,
     treasury: Option<Address>,
+    active_workers: Vec<Address>,
     pub is_shadow: bool,
 }
 
@@ -38,10 +39,7 @@ impl ManagedSigner {
         self.nonce.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub async fn sync_from_chain<P>(
-        &self,
-        provider: &P,
-    ) -> Result<u64, ChimeraError>
+    pub async fn sync_from_chain<P>(&self, provider: &P) -> Result<u64, ChimeraError>
     where
         P: alloy::providers::Provider<alloy::network::Ethereum>,
     {
@@ -49,10 +47,15 @@ impl ManagedSigner {
             .get_transaction_count(self.address)
             .await
             .map_err(|e| ChimeraError::RpcError(format!("get_transaction_count: {e}")))?;
-        self.nonce.store(count, Ordering::SeqCst);
+        let current = self.nonce.load(Ordering::SeqCst);
+        if count > current {
+            self.nonce.store(count, Ordering::SeqCst);
+        }
+        let effective = self.nonce.load(Ordering::SeqCst);
         info!(
             address = %self.address,
-            nonce = count,
+            nonce = effective,
+            chain_count = count,
             "ManagedSigner synced from chain"
         );
         Ok(count)
@@ -66,13 +69,21 @@ impl SignerRegistry {
         let treasury_dir_empty = cfg.treasury_keystore.is_empty();
         let worker_dir_empty = cfg.worker_keystore_dir.is_empty();
 
-        if execute_mode == "shadow" && (treasury_dir_empty || worker_dir_empty) {
-            warn!(
-                "Shadow mode: keystore paths not configured; creating empty SignerRegistry"
-            );
+        if execute_mode == "shadow" && treasury_dir_empty && worker_dir_empty {
+            warn!("Shadow mode: keystore paths not configured; creating empty SignerRegistry");
             return Ok(Self {
                 signers: HashMap::new(),
                 treasury: None,
+                active_workers: Vec::new(),
+                is_shadow: true,
+            });
+        }
+        if execute_mode == "shadow" && treasury_dir_empty != worker_dir_empty {
+            warn!("Shadow mode: signer paths are incomplete; creating empty SignerRegistry");
+            return Ok(Self {
+                signers: HashMap::new(),
+                treasury: None,
+                active_workers: Vec::new(),
                 is_shadow: true,
             });
         }
@@ -109,6 +120,25 @@ impl SignerRegistry {
                 })?;
             let managed = Arc::new(ManagedSigner::new(signer));
             let addr = managed.address;
+            if execute_mode == "live" || !cfg.treasury_address.is_empty() {
+                let configured_treasury: Address = cfg.treasury_address.parse().map_err(|e| {
+                    ChimeraError::ConfigError(format!(
+                        "invalid treasury_address {:?}: {e}",
+                        cfg.treasury_address
+                    ))
+                })?;
+                if configured_treasury == Address::ZERO {
+                    return Err(ChimeraError::ConfigError(
+                        "treasury_address must not be the zero address".into(),
+                    ));
+                }
+                if addr != configured_treasury {
+                    return Err(ChimeraError::ConfigError(format!(
+                        "treasury_address mismatch: configured {}, decrypted treasury keystore address {}",
+                        configured_treasury, addr
+                    )));
+                }
+            }
             signers.insert(addr, managed);
             treasury = Some(addr);
             info!(address = %addr, "Treasury signer loaded");
@@ -139,11 +169,29 @@ impl SignerRegistry {
                     Ok(signer) => {
                         let managed = Arc::new(ManagedSigner::new(signer));
                         let addr = managed.address;
+                        if treasury == Some(addr) {
+                            return Err(ChimeraError::ConfigError(format!(
+                                "worker keystore {} decrypts to treasury address {}; treasury must not be a worker",
+                                path_str, addr
+                            )));
+                        }
+                        if signers.contains_key(&addr) {
+                            return Err(ChimeraError::ConfigError(format!(
+                                "duplicate worker signer address {} from keystore {}",
+                                addr, path_str
+                            )));
+                        }
                         signers.insert(addr, managed);
                         worker_count += 1;
                         info!(address = %addr, "Worker signer loaded");
                     }
                     Err(e) => {
+                        if execute_mode == "live" {
+                            return Err(ChimeraError::ConfigError(format!(
+                                "failed to decrypt worker keystore {}: {e}",
+                                path_str
+                            )));
+                        }
                         warn!(
                             path = %path_str,
                             error = %e,
@@ -160,14 +208,15 @@ impl SignerRegistry {
             }
         }
 
-        let registry = Self {
+        let mut registry = Self {
             signers,
             treasury,
-            is_shadow: false,
+            active_workers: Vec::new(),
+            is_shadow: execute_mode == "shadow",
         };
 
-        if execute_mode == "live" && !cfg.eoa_pool_path.is_empty() {
-            registry.validate_against_eoa_pool(&cfg.eoa_pool_path)?;
+        if execute_mode == "live" {
+            registry.active_workers = registry.active_workers_from_eoa_pool(&cfg.eoa_pool_path)?;
         }
 
         Ok(registry)
@@ -178,6 +227,9 @@ impl SignerRegistry {
     }
 
     pub fn worker_addresses(&self) -> Vec<Address> {
+        if !self.active_workers.is_empty() {
+            return self.active_workers.clone();
+        }
         self.signers
             .keys()
             .filter(|a| self.treasury.map_or(true, |t| *a != &t))
@@ -190,8 +242,7 @@ impl SignerRegistry {
     }
 
     pub fn treasury_signer(&self) -> Option<Arc<ManagedSigner>> {
-        self.treasury
-            .and_then(|t| self.signers.get(&t).cloned())
+        self.treasury.and_then(|t| self.signers.get(&t).cloned())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -203,37 +254,68 @@ impl SignerRegistry {
     }
 
     pub fn validate_against_eoa_pool(&self, eoa_pool_path: &str) -> Result<(), ChimeraError> {
+        self.active_workers_from_eoa_pool(eoa_pool_path).map(|_| ())
+    }
+
+    fn active_workers_from_eoa_pool(
+        &self,
+        eoa_pool_path: &str,
+    ) -> Result<Vec<Address>, ChimeraError> {
         use serde_json::Value;
         let content = std::fs::read_to_string(eoa_pool_path).map_err(|e| {
             ChimeraError::ConfigError(format!("cannot read EOA pool {}: {e}", eoa_pool_path))
         })?;
-        let pool: Value = serde_json::from_str(&content).map_err(|e| {
-            ChimeraError::ConfigError(format!("invalid EOA pool JSON: {e}"))
-        })?;
-        let wallets = pool["wallets"].as_array().ok_or_else(|| {
-            ChimeraError::ConfigError("EOA pool missing 'wallets' array".into())
-        })?;
+        let pool: Value = serde_json::from_str(&content)
+            .map_err(|e| ChimeraError::ConfigError(format!("invalid EOA pool JSON: {e}")))?;
+        let wallets = pool["wallets"]
+            .as_array()
+            .ok_or_else(|| ChimeraError::ConfigError("EOA pool missing 'wallets' array".into()))?;
 
-        for wallet in wallets {
+        let mut active = Vec::new();
+        let mut seen = HashSet::new();
+        for (index, wallet) in wallets.iter().enumerate() {
             let excluded = wallet["excluded"].as_bool().unwrap_or(false);
             if excluded {
                 continue;
             }
             let addr_str = wallet["address"].as_str().ok_or_else(|| {
-                ChimeraError::ConfigError("EOA pool entry missing 'address' field".into())
+                ChimeraError::ConfigError(format!("EOA pool entry {index} missing 'address' field"))
             })?;
-            let addr: Address = addr_str.parse().map_err(|_| {
-                ChimeraError::ConfigError(format!("invalid EOA address in pool: {addr_str}"))
+            let addr: Address = addr_str.parse().map_err(|e| {
+                ChimeraError::ConfigError(format!(
+                    "invalid active EOA address in pool at entry {index}: {addr_str}: {e}"
+                ))
             })?;
-
-            if self.signers.get(&addr).is_none() && addr != Address::ZERO {
+            if addr == Address::ZERO {
+                return Err(ChimeraError::ConfigError(format!(
+                    "active EOA pool entry {index} must not use the zero address"
+                )));
+            }
+            if !seen.insert(addr) {
+                return Err(ChimeraError::ConfigError(format!(
+                    "duplicate active EOA pool address: {addr}"
+                )));
+            }
+            if self.treasury == Some(addr) {
+                return Err(ChimeraError::ConfigError(format!(
+                    "active EOA pool address {addr} is the treasury; treasury must not be a worker"
+                )));
+            }
+            if self.signers.get(&addr).is_none() {
                 return Err(ChimeraError::ConfigError(format!(
                     "Live mode: EOA pool entry {} has no registered worker signer in {}",
                     addr_str, eoa_pool_path
                 )));
             }
+            active.push(addr);
         }
-        Ok(())
+        if active.is_empty() {
+            return Err(ChimeraError::ConfigError(format!(
+                "live mode requires at least one non-excluded worker in EOA pool {}",
+                eoa_pool_path
+            )));
+        }
+        Ok(active)
     }
 }
 
@@ -281,11 +363,6 @@ mod tests {
 
     #[test]
     fn test_registry_shadow_empty() {
-        use std::env;
-
-        let prev = env::var("CHIMERA_KEYSTORE_PASSWORD").ok();
-        env::remove_var("CHIMERA_KEYSTORE_PASSWORD");
-
         let cfg = PacingConfig {
             treasury_keystore: String::new(),
             worker_keystore_dir: String::new(),
@@ -293,25 +370,19 @@ mod tests {
         };
 
         let result = SignerRegistry::load(&cfg, "shadow");
-        assert!(result.is_ok(), "shadow mode should succeed with empty paths");
+        assert!(
+            result.is_ok(),
+            "shadow mode should succeed with empty paths"
+        );
         let reg = result.unwrap();
         assert!(reg.is_shadow);
         assert!(reg.is_empty());
         assert_eq!(reg.worker_addresses().len(), 0);
         assert_eq!(reg.treasury_address(), None);
-
-        if let Some(v) = prev {
-            env::set_var("CHIMERA_KEYSTORE_PASSWORD", v);
-        }
     }
 
     #[test]
     fn test_registry_live_requires_keystores() {
-        use std::env;
-
-        let prev = env::var("CHIMERA_KEYSTORE_PASSWORD").ok();
-        env::remove_var("CHIMERA_KEYSTORE_PASSWORD");
-
         let cfg = PacingConfig {
             treasury_keystore: String::new(),
             worker_keystore_dir: String::new(),
@@ -320,10 +391,6 @@ mod tests {
 
         let result = SignerRegistry::load(&cfg, "live");
         assert!(result.is_err(), "live mode without treasury should fail");
-
-        if let Some(v) = prev {
-            env::set_var("CHIMERA_KEYSTORE_PASSWORD", v);
-        }
     }
 
     #[test]
@@ -337,15 +404,19 @@ mod tests {
         let reg = SignerRegistry {
             signers: HashMap::new(),
             treasury: None,
+            active_workers: Vec::new(),
             is_shadow: false,
         };
 
         let result = reg.validate_against_eoa_pool(&path);
-        assert!(result.is_err(), "should reject EOA without registered signer");
+        assert!(
+            result.is_err(),
+            "should reject EOA without registered signer"
+        );
     }
 
     #[test]
-    fn test_validate_eoa_pool_excluded_entry_skipped() {
+    fn test_validate_eoa_pool_requires_active_entry_after_exclusions() {
         use std::io::Write;
 
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -355,10 +426,81 @@ mod tests {
         let reg = SignerRegistry {
             signers: HashMap::new(),
             treasury: None,
+            active_workers: Vec::new(),
             is_shadow: false,
         };
 
         let result = reg.validate_against_eoa_pool(&path);
-        assert!(result.is_ok(), "should skip excluded EOA entries");
+        assert!(
+            result.is_err(),
+            "live EOA pool must contain an active worker"
+        );
+    }
+
+    #[test]
+    fn test_validate_eoa_pool_rejects_zero_and_duplicates() {
+        use std::io::Write;
+
+        let signer = PrivateKeySigner::from_bytes(&[7u8; 32].into()).unwrap();
+        let address = signer.address();
+        let managed = Arc::new(ManagedSigner::new(signer));
+        let mut signers = HashMap::new();
+        signers.insert(address, managed);
+        let reg = SignerRegistry {
+            signers,
+            treasury: None,
+            active_workers: Vec::new(),
+            is_shadow: false,
+        };
+
+        let mut zero = tempfile::NamedTempFile::new().unwrap();
+        writeln!(zero, r#"{{"wallets":[{{"address":"0x0000000000000000000000000000000000000000","excluded":false}}]}}"#).unwrap();
+        assert!(reg
+            .validate_against_eoa_pool(zero.path().to_str().unwrap())
+            .is_err());
+
+        let mut duplicate = tempfile::NamedTempFile::new().unwrap();
+        writeln!(duplicate, r#"{{"wallets":[{{"address":"{address}","excluded":false}},{{"address":"{address}","excluded":false}}]}}"#).unwrap();
+        assert!(reg
+            .validate_against_eoa_pool(duplicate.path().to_str().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn test_sync_from_chain_never_moves_nonce_backward() {
+        let key = [99u8; 32];
+        let signer = PrivateKeySigner::from_bytes(&key.into()).unwrap();
+        let m = ManagedSigner::new(signer);
+
+        assert_eq!(m.next_nonce(), 0);
+        assert_eq!(m.next_nonce(), 1);
+        assert_eq!(m.next_nonce(), 2);
+        assert_eq!(m.current_nonce(), 3);
+
+        let chain_count_lower: u64 = 1;
+        let current = m.nonce.load(Ordering::SeqCst);
+        if chain_count_lower > current {
+            m.nonce.store(chain_count_lower, Ordering::SeqCst);
+        }
+        assert_eq!(
+            m.current_nonce(),
+            3,
+            "nonce must not move backward when chain reports a lower count"
+        );
+
+        let chain_count_higher: u64 = 5;
+        let current = m.nonce.load(Ordering::SeqCst);
+        if chain_count_higher > current {
+            m.nonce.store(chain_count_higher, Ordering::SeqCst);
+        }
+        assert_eq!(
+            m.current_nonce(),
+            5,
+            "nonce must advance when chain reports a higher count"
+        );
+
+        assert_eq!(m.next_nonce(), 5);
+        assert_eq!(m.next_nonce(), 6);
+        assert_eq!(m.current_nonce(), 7);
     }
 }

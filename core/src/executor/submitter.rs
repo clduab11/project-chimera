@@ -81,7 +81,8 @@ impl<P: Provider> RpcSubmitter<P> {
     /// Number of submit-path invocations (includes dry-run).
     /// Used by integration tests to verify shadow mode never reaches the submit seam.
     pub fn submit_attempt_count(&self) -> u64 {
-        self.submit_attempts.load(std::sync::atomic::Ordering::Relaxed)
+        self.submit_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Simulate a transaction via `eth_call` without broadcasting.
@@ -152,7 +153,8 @@ impl<P: Provider> RpcSubmitter<P> {
 #[async_trait]
 impl<P: Provider + Send + Sync> TransactionExecutor for RpcSubmitter<P> {
     async fn submit(&self, tx: BuiltTransaction) -> Result<B256, ChimeraError> {
-        self.submit_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.submit_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.dry_run {
             info!(target: "chimera::executor", "dry-run mode: simulating transaction");
             self.dry_run(&tx).await?;
@@ -177,7 +179,7 @@ impl<P: Provider + Send + Sync> TransactionExecutor for RpcSubmitter<P> {
         let mut last_error: Option<ChimeraError> = None;
 
         for attempt in 0..=self.max_retries {
-                match self.provider.send_transaction(req.clone()).await {
+            match self.provider.send_transaction(req.clone()).await {
                 Ok(pending) => {
                     let tx_hash = *pending.tx_hash();
                     info!(target: "chimera::executor", %tx_hash, "transaction broadcast");

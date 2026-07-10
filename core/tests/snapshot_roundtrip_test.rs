@@ -12,7 +12,7 @@
 
 use alloy::primitives::{address, U256};
 use chimera_core::detector::liquidation::MarketSnapshot as DetectorSnapshot;
-use chimera_core::simulator::prewarm::{MarketSnapshot, pre_warm_db};
+use chimera_core::simulator::prewarm::{pre_warm_db, MarketSnapshot};
 use revm::database::{CacheDB, EmptyDB};
 use std::path::PathBuf;
 
@@ -101,8 +101,8 @@ fn snapshot_fixture_deserializes_prewarm_and_fills_slots() {
 #[test]
 fn snapshot_fixture_deserializes_detector_with_index_fields() {
     let path = fixture_path("snapshot_mock.json");
-    let det_snap = DetectorSnapshot::load_from_file(&path)
-        .expect("detector must load snapshot fixture");
+    let det_snap =
+        DetectorSnapshot::load_from_file(&path).expect("detector must load snapshot fixture");
 
     assert_eq!(det_snap.reserves.len(), 2, "detector must see 2 reserves");
     assert_eq!(det_snap.users.len(), 1, "detector must see 1 user");
@@ -145,10 +145,7 @@ fn snapshot_fixture_deserializes_detector_with_index_fields() {
         weth.emode_liquidation_bonus_bps, 10200,
         "detector eMode bonus must match fixture"
     );
-    assert!(
-        weth.active,
-        "detector active must match fixture"
-    );
+    assert!(weth.active, "detector active must match fixture");
     assert!(!weth.frozen);
     assert!(!weth.paused);
     assert!(!weth.siloed_borrowing);
@@ -168,8 +165,7 @@ fn detector_and_prewarm_consume_same_fixture() {
         serde_json::from_str(&content).expect("prewarm must deserialize");
 
     // Detector path.
-    let _det_snap = DetectorSnapshot::load_from_file(&path)
-        .expect("detector must deserialize");
+    let _det_snap = DetectorSnapshot::load_from_file(&path).expect("detector must deserialize");
 
     // If both succeed, the snapshot shape is compatible with both consumers.
 }
@@ -191,15 +187,46 @@ fn snapshot_generated_by_python_deserializes_and_prewarms() {
     pre_warm_db(&mut db, &snapshot).expect("pre-warming must succeed");
 
     for reserve in &snapshot.reserves {
-        assert!(!reserve.a_token.is_zero(), "a_token must be non-zero for {}", reserve.symbol);
-        assert!(!reserve.variable_debt_token.is_zero(), "variable_debt_token must be non-zero for {}", reserve.symbol);
-        assert!(reserve.liquidity_index > 0, "liquidity_index must be non-zero for {}", reserve.symbol);
-        assert!(reserve.variable_borrow_index > 0, "variable_borrow_index must be non-zero for {}", reserve.symbol);
-        assert!(reserve.liquidity_rate > 0, "liquidity_rate must be non-zero for {}", reserve.symbol);
-        assert!(reserve.variable_borrow_rate > 0, "variable_borrow_rate must be non-zero for {}", reserve.symbol);
-        assert!(reserve.last_update_timestamp > 0, "last_update_timestamp must be non-zero for {}", reserve.symbol);
-        assert!(reserve.emode_liquidation_threshold > 0 || reserve.emode_category == 0,
-            "eMode LT must be set when eMode category is active for {}", reserve.symbol);
+        assert!(
+            !reserve.a_token.is_zero(),
+            "a_token must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            !reserve.variable_debt_token.is_zero(),
+            "variable_debt_token must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            reserve.liquidity_index > 0,
+            "liquidity_index must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            reserve.variable_borrow_index > 0,
+            "variable_borrow_index must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            reserve.liquidity_rate > 0,
+            "liquidity_rate must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            reserve.variable_borrow_rate > 0,
+            "variable_borrow_rate must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            reserve.last_update_timestamp > 0,
+            "last_update_timestamp must be non-zero for {}",
+            reserve.symbol
+        );
+        assert!(
+            reserve.emode_liquidation_threshold > 0 || reserve.emode_category == 0,
+            "eMode LT must be set when eMode category is active for {}",
+            reserve.symbol
+        );
     }
 
     // Spot-check: WETH is the first reserve with eMode category 1.

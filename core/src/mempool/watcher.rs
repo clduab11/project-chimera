@@ -16,7 +16,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::transports::ws::WsConnect;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use url::Url;
 
 /// Event emitted by a [`MempoolWatcher`] when it's time for the orchestrator
@@ -30,9 +30,7 @@ pub enum WatchEvent {
         timestamp: u64,
     },
     /// A new pending transaction was observed (only from feed-based watchers).
-    NewTransaction {
-        hash: B256,
-    },
+    NewTransaction { hash: B256 },
 }
 
 /// Pluggable trigger for the orchestrator's continuous detection loop.
@@ -145,8 +143,7 @@ impl BlockWatch {
                     backoff_secs = 2;
                     warn!(
                         target = "chimera::mempool",
-                        chain_id,
-                        "BlockWatch connection ended; reconnecting..."
+                        chain_id, "BlockWatch connection ended; reconnecting..."
                     );
                 }
                 Err(e) => {
@@ -189,8 +186,7 @@ impl BlockWatch {
 
         info!(
             target = "chimera::mempool",
-            chain_id,
-            "BlockWatch subscription active"
+            chain_id, "BlockWatch subscription active"
         );
 
         while let Some(header) = stream.next().await {
@@ -203,8 +199,7 @@ impl BlockWatch {
                 // Receiver dropped — orchestrator is shutting down.
                 info!(
                     target = "chimera::mempool",
-                    chain_id,
-                    "BlockWatch: receiver dropped; shutting down connection loop"
+                    chain_id, "BlockWatch: receiver dropped; shutting down connection loop"
                 );
                 return Err(ChimeraError::RpcError(
                     "BlockWatch: receiver dropped (orchestrator shutdown)".into(),
@@ -266,18 +261,17 @@ mod tests {
     async fn test_blockwatch_new_returns_promptly() {
         // Use an unreachable endpoint — the constructor must not hang.
         let ws_url = "ws://127.0.0.1:19999".to_string();
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            BlockWatch::new(8453, ws_url),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), BlockWatch::new(8453, ws_url)).await;
 
         match result {
             Ok(Ok(bw)) => {
                 assert_eq!(bw.chain_id(), 8453);
             }
             Ok(Err(e)) => {
-                eprintln!("BlockWatch::new returned error (expected for unreachable endpoint): {e}");
+                eprintln!(
+                    "BlockWatch::new returned error (expected for unreachable endpoint): {e}"
+                );
             }
             Err(_elapsed) => {
                 panic!("BlockWatch::new timed out after 2s — the constructor must return immediately and not enter the forwarding loop inline");

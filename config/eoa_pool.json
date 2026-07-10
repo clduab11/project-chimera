@@ -1,6 +1,6 @@
 {
   "version": "2.0",
-  "_comment": "Template only. Store real private keys in separate encrypted keystores; this file should contain public addresses and rotation metadata only. Runtime balances are fetched via RPC; on-disk balances are intentionally zeroed.",
+  "_comment": "Template only: these placeholder addresses are not operator wallets and must never be funded. Replace or exclude them before live use. Store private keys only in encrypted keystores outside the repo; this file contains public addresses and rotation metadata. Runtime balances are fetched via RPC; on-disk balances are intentionally zeroed.",
   "wallets": [
     {
       "address": "0x1111111111111111111111111111111111111111",

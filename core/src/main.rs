@@ -8,7 +8,8 @@
 //   5. Resolve RPC endpoint (BASE_RPC_URL / ARB_RPC_URL / RPC_URL / localhost).
 //   6. Hydrate the detector snapshot (graceful empty fallback if missing).
 //   7. Load SignerRegistry (worker + treasury keystores); live mode validates all EOA pool entries have signers.
-//   8. Build a read-only provider; the orchestrator and scheduler sign locally with managed signers.
+//   8. Build a read-only provider; live mode validates Executor state and signer funding.
+//   9. Start the simulator, scheduler, and orchestrator.
 //
 // Safety: defaults to "shadow"; never flips to "live"; never logs secrets.
 
@@ -19,9 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::network::Ethereum;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 use tracing_subscriber::prelude::*;
@@ -31,8 +33,16 @@ use chimera_core::{
     start_metrics_server, AaveOracle, BlockWatch, ChainlinkOracle, CrossProcessPacing,
     JsonlPersistence, L2ChainType, LiquidationSimulator, MarketSnapshot, MempoolWatcher, Metrics,
     Orchestrator, OrchestratorConfig, PacingConfig, PacingEngine, PriceOracle, RiskConfig,
-    RoutingConfig, RpcSubmitter, SequencerFeed, SignerRegistry, SweepScheduler, WatchEvent,
+    RoutingConfig, RpcSubmitter, SequencerFeed, SignerRegistry, SweepScheduler, MIN_GAS_BUDGET_WEI,
 };
+
+alloy::sol! {
+    #[sol(rpc)]
+    interface IExecutorStartup {
+        function pool() external view returns (address);
+        function isWorker(address worker) external view returns (bool);
+    }
+}
 
 /// Persistent execute-mode state used to enforce the shadow→live transition rule.
 /// Stored at `core/state/mode.json`.
@@ -50,6 +60,7 @@ fn default_previous_mode() -> String {
 }
 
 /// Resolved Aave V3 addresses for the active chain.
+#[derive(Debug)]
 struct AaveAddresses {
     pool: Address,
     oracle: Address,
@@ -147,7 +158,9 @@ async fn main() -> anyhow::Result<()> {
     // NOTE: The default offset can collide for chain IDs with the same
     // mod-1000 residue (e.g., 8453 and 108453). When running multiple
     // instances on the same host, use --metrics-port-offset explicitly.
-    let port_offset = cli.metrics_port_offset.unwrap_or((pacing_cfg.chain_id % 1000) as u16);
+    let port_offset = cli
+        .metrics_port_offset
+        .unwrap_or((pacing_cfg.chain_id % 1000) as u16);
     pacing_cfg.metrics_port = pacing_cfg.metrics_port.saturating_add(port_offset);
     let risk_cfg = RiskConfig::load("config/risk.yaml").unwrap_or_else(|e| {
         warn!(error = %e, "Failed to load risk.yaml; using defaults");
@@ -159,6 +172,9 @@ async fn main() -> anyhow::Result<()> {
     });
     let metrics = Arc::new(Metrics::new());
     let _metrics_handle = start_metrics_server(pacing_cfg.metrics_port).await?;
+
+    // CLI overrides happen after config loading; revalidate the resulting runtime config.
+    pacing_cfg.validate()?;
 
     // (e) Mode-transition gate. Load core/state/mode.json (default: shadow / no timestamp).
     let mode_path = PathBuf::from("core/state/mode.json");
@@ -225,29 +241,26 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // (c) SignerRegistry — replaces single-signer load_signer().
-    //     Loads treasury + worker keystores from pacing.yaml paths.
-    let signer_registry = Arc::new(
-        SignerRegistry::load(&pacing_cfg, &pacing_cfg.execute_mode)?
-    );
-
-    // Treasury signer is reserved for sweep/refund management (used by the scheduler).
-    // Liquidation execution in live mode uses worker signers from the registry
-    // (the orchestrator signs locally). The provider itself stays read-only.
-    let legacy_signer = load_signer(&pacing_cfg.execute_mode).unwrap_or(None);
-    let signer_address: Option<Address> = legacy_signer.as_ref().map(|s| s.address())
-        .or_else(|| signer_registry.worker_addresses().first().copied());
-
-    // Clone signer_registry and pacing_cfg for the sweep scheduler.
-    let sched_registry = signer_registry.clone();
-    let sched_pacing_cfg = pacing_cfg.clone();
+    // (c) SignerRegistry loads treasury + worker keystores from pacing.yaml paths.
+    let signer_registry = Arc::new(SignerRegistry::load(&pacing_cfg, &pacing_cfg.execute_mode)?);
 
     // Always use read-only provider. Worker signers in the orchestrator
     // sign liquidation transactions locally; the scheduler signs sweep/refund
     // transactions via ManagedSigner. The treasury signer is not used as
     // a provider wallet.
     let provider = Arc::new(ProviderBuilder::new().connect_http(rpc_url));
-    run_with_provider(provider, pacing_cfg, routing_cfg, risk_cfg, metrics, snapshot, snapshot_path, signer_address, sched_registry, sched_pacing_cfg, &cli).await
+    run_with_provider(
+        provider,
+        pacing_cfg,
+        routing_cfg,
+        risk_cfg,
+        metrics,
+        snapshot,
+        snapshot_path,
+        signer_registry,
+        &cli,
+    )
+    .await
 }
 
 /// Construct every runtime component for a concrete provider type and run the loop.
@@ -262,9 +275,7 @@ async fn run_with_provider<P>(
     metrics: Arc<Metrics>,
     snapshot: MarketSnapshot,
     snapshot_path: PathBuf,
-    signer_address: Option<Address>,
-    sched_registry: Arc<SignerRegistry>,
-    sched_pacing_cfg: PacingConfig,
+    signer_registry: Arc<SignerRegistry>,
     cli: &CliArgs,
 ) -> anyhow::Result<()>
 where
@@ -272,21 +283,35 @@ where
 {
     let chain_id = pacing_cfg.chain_id;
     let execute_mode = pacing_cfg.execute_mode.clone();
-    let addrs = resolve_aave_addresses(chain_id);
+    let addrs = resolve_aave_addresses(chain_id)?;
+    let executor = resolve_executor_address(&pacing_cfg)?;
+    let active_workers = signer_registry.worker_addresses();
+    validate_live_executor(
+        &*provider,
+        &execute_mode,
+        executor,
+        addrs.pool,
+        &active_workers,
+    )
+    .await?;
+    validate_live_funding(&*provider, &pacing_cfg, &signer_registry).await?;
     let staleness = Duration::from_secs(pacing_cfg.oracle_staleness_seconds);
 
     // Oracles. Aave is the simulator's primary USD price source; Chainlink is wired
     // with the configured ETH/USD feed so gas-cost pacing can refresh live prices.
     let aave_oracle = AaveOracle::new((*provider).clone(), addrs.oracle, staleness);
     let oracle: Arc<dyn PriceOracle> = Arc::new(aave_oracle);
-    let feed_addr: Address = pacing_cfg
-        .eth_usd_feed_address
-        .parse()
-        .unwrap_or(Address::ZERO);
-    let mut feeds: HashMap<Address, Address> = HashMap::new();
-    if feed_addr != Address::ZERO {
-        feeds.insert(feed_addr, feed_addr);
+    let feed_addr: Address = pacing_cfg.eth_usd_feed_address.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid eth_usd_feed_address {:?}: {e}",
+            pacing_cfg.eth_usd_feed_address
+        )
+    })?;
+    if feed_addr == Address::ZERO {
+        anyhow::bail!("eth_usd_feed_address must not be the zero address");
     }
+    let mut feeds: HashMap<Address, Address> = HashMap::new();
+    feeds.insert(feed_addr, feed_addr);
     let feeds_configured = feeds.len();
     let chainlink = ChainlinkOracle::new((*provider).clone(), feeds, staleness);
     let chainlink_arc: Arc<dyn PriceOracle> = Arc::new(chainlink);
@@ -303,14 +328,9 @@ where
     } else {
         L2ChainType::Base
     };
-    let mut simulator = LiquidationSimulator::new(
-        provider.clone(),
-        addrs.pool,
-        oracle,
-        addrs.weth,
-    )
-    .await?
-    .with_l2_chain_type(chain_type);
+    let mut simulator = LiquidationSimulator::new(provider.clone(), addrs.pool, oracle, addrs.weth)
+        .await?
+        .with_l2_chain_type(chain_type);
 
     // Optional prewarm of the simulator's REVM DB from the same snapshot file (non-fatal).
     if snapshot_path.exists() {
@@ -337,26 +357,6 @@ where
         .with_state_persistence(persistence)
         .with_eth_oracle(chainlink_arc);
 
-    // If live and the EOA pool has entries that don't match the configured signer,
-    // warn that multi-worker EOA rotation is deferred to T7. The orchestrator will
-    // pin all live submissions to the signer address.
-    if execute_mode == "live" {
-        if let Some(ref sa) = signer_address {
-            if let Some(pool_eoa) = pacing_engine.select_next_eoa() {
-                if pool_eoa.parse::<Address>().map_or(true, |a| a != *sa) {
-                    warn!(
-                        target = "chimera::main",
-                        signer = %sa,
-                        pool_eoa = %pool_eoa,
-                        "Live mode: EOA pool entry differs from configured signer. \
-                         All live submissions will use the signer address. \
-                         Multi-worker EOA rotation (T7) is deferred."
-                    );
-                }
-            }
-        }
-    }
-
     // Wrap in CrossProcessPacing so the orchestrator goes through pre-fire
     // reservation and post-outcome settlement/expiry under advisory file locks.
     let pacing_engine_clone = pacing_engine.clone();
@@ -381,7 +381,9 @@ where
     // When a valid ws_endpoint exists, BlockWatch is constructed by default
     // and the orchestrator uses block-driven scans. Fixed-interval polling
     // is reserved for when watcher initialization is unavailable.
-    let resolved_ws = cli.ws_url.clone()
+    let resolved_ws = cli
+        .ws_url
+        .clone()
         .or_else(|| {
             if pacing_cfg.ws_endpoint.is_empty() {
                 None
@@ -389,39 +391,34 @@ where
                 Some(pacing_cfg.ws_endpoint.clone())
             }
         })
-        .or_else(|| {
-            derive_ws_endpoint_from_chain(pacing_cfg.chain_id)
-        });
+        .or_else(|| derive_ws_endpoint_from_chain(pacing_cfg.chain_id));
 
     let mempool_watcher: Option<Arc<dyn MempoolWatcher>> = match resolved_ws {
-        Some(ws_url) => {
-            match BlockWatch::new(chain_id, ws_url.clone()).await {
-                Ok(bw) => {
-                    info!(
-                        target = "chimera::main",
-                        chain_id,
-                        ws_host = %redact_ws_url_log(&ws_url),
-                        "BlockWatch constructed — using block-driven scan trigger"
-                    );
-                    let sequencer = SequencerFeed::from_block_watch(bw, None);
-                    Some(Arc::new(sequencer))
-                }
-                Err(e) => {
-                    warn!(
-                        target = "chimera::main",
-                        chain_id,
-                        error = %e,
-                        "Failed to construct BlockWatch; falling back to fixed-interval polling"
-                    );
-                    None
-                }
+        Some(ws_url) => match BlockWatch::new(chain_id, ws_url.clone()).await {
+            Ok(bw) => {
+                info!(
+                    target = "chimera::main",
+                    chain_id,
+                    ws_host = %redact_ws_url_log(&ws_url),
+                    "BlockWatch constructed — using block-driven scan trigger"
+                );
+                let sequencer = SequencerFeed::from_block_watch(bw, None);
+                Some(Arc::new(sequencer))
             }
-        }
+            Err(e) => {
+                warn!(
+                    target = "chimera::main",
+                    chain_id,
+                    error = %e,
+                    "Failed to construct BlockWatch; falling back to fixed-interval polling"
+                );
+                None
+            }
+        },
         None => {
             info!(
                 target = "chimera::main",
-                chain_id,
-                "No WebSocket endpoint configured; using fixed-interval polling"
+                chain_id, "No WebSocket endpoint configured; using fixed-interval polling"
             );
             None
         }
@@ -430,7 +427,7 @@ where
     let orchestrator = Orchestrator::new(
         OrchestratorConfig::default(),
         pacing,
-        pacing_cfg,
+        pacing_cfg.clone(),
         metrics,
         provider.clone(),
         snapshot,
@@ -438,21 +435,20 @@ where
         Some(simulator),
         submitter,
         execute_mode,
-        addrs.pool,
+        executor,
         routing_cfg,
         risk_cfg,
-        sched_registry.clone(),
-        signer_address,
+        signer_registry.clone(),
         mempool_watcher,
     );
 
     // Spawn sweep/refund scheduler task (must start before orchestrator.run()).
-    if !sched_registry.is_empty() || sched_pacing_cfg.execute_mode == "shadow" {
+    if !signer_registry.is_empty() || pacing_cfg.execute_mode == "shadow" {
         let scheduler = SweepScheduler::new(
-            sched_registry.clone(),
+            signer_registry.clone(),
             provider.clone(),
             Arc::new(pacing_engine_clone),
-            sched_pacing_cfg.clone(),
+            pacing_cfg.clone(),
             chain_id,
         );
         tokio::spawn(async move {
@@ -480,7 +476,10 @@ fn resolve_rpc_url(chain_id: u64) -> (url::Url, String) {
         if let Ok(v) = std::env::var(key) {
             match v.parse::<url::Url>() {
                 Ok(u) => return (u, key.to_string()),
-                Err(_) => warn!(env = key, "RPC URL env var failed to parse; trying next source"),
+                Err(_) => warn!(
+                    env = key,
+                    "RPC URL env var failed to parse; trying next source"
+                ),
             }
         }
     }
@@ -491,70 +490,205 @@ fn resolve_rpc_url(chain_id: u64) -> (url::Url, String) {
 }
 
 /// Per-chain Aave V3 addresses (mirrors `config/pools.toml`), each overridable via env.
-/// Invalid/empty values degrade to `Address::ZERO` so the binary never panics on boot.
-fn resolve_aave_addresses(chain_id: u64) -> AaveAddresses {
-    let addr = |default: &str, env_key: &str| -> Address {
+/// Unknown chains cause a fatal boot error; testnet chains (84532) are explicitly rejected.
+/// Every resolved address is parsed and checked for non-zero before returning.
+fn resolve_aave_addresses(chain_id: u64) -> anyhow::Result<AaveAddresses> {
+    let addr = |default: &str, env_key: &str| -> anyhow::Result<Address> {
         let s = std::env::var(env_key).unwrap_or_else(|_| default.to_string());
-        Address::from_str(&s).unwrap_or(Address::ZERO)
-    };
-    if chain_id == 42161 {
-        AaveAddresses {
-            pool: addr("0x794a61358D6845594F94dc1DB02A252b5b4814aD", "CHIMERA_AAVE_POOL"),
-            oracle: addr("0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7", "CHIMERA_AAVE_ORACLE"),
-            pool_data_provider: addr(
-                "0x243Aa95cAC2a25651eda86e80bEe66114413c43b",
-                "CHIMERA_POOL_DATA_PROVIDER",
-            ),
-            weth: addr(
-                "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
-                "CHIMERA_ETH_ORACLE_ASSET",
-            ),
+        let address = Address::from_str(&s)
+            .map_err(|e| anyhow::anyhow!("invalid {env_key} address {s:?}: {e}"))?;
+        if address == Address::ZERO {
+            anyhow::bail!("{env_key} must not resolve to the zero address");
         }
-    } else {
-        AaveAddresses {
-            pool: addr("0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", "CHIMERA_AAVE_POOL"),
+        Ok(address)
+    };
+    let addresses = match chain_id {
+        8453 => AaveAddresses {
+            pool: addr("0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", "CHIMERA_AAVE_POOL")?,
             oracle: addr(
                 "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156",
                 "CHIMERA_AAVE_ORACLE",
-            ),
+            )?,
             pool_data_provider: addr(
                 "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A",
                 "CHIMERA_POOL_DATA_PROVIDER",
-            ),
+            )?,
             weth: addr(
                 "0x4200000000000000000000000000000000000006",
                 "CHIMERA_ETH_ORACLE_ASSET",
-            ),
-        }
-    }
+            )?,
+        },
+        42161 => AaveAddresses {
+            pool: addr("0x794a61358D6845594F94dc1DB02A252b5b4814aD", "CHIMERA_AAVE_POOL")?,
+            oracle: addr("0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7", "CHIMERA_AAVE_ORACLE")?,
+            pool_data_provider: addr(
+                "0x243Aa95cAC2a25651eda86e80bEe66114413c43b",
+                "CHIMERA_POOL_DATA_PROVIDER",
+            )?,
+            weth: addr(
+                "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+                "CHIMERA_ETH_ORACLE_ASSET",
+            )?,
+        },
+        84532 => anyhow::bail!(
+            "chain_id 84532 (Base Sepolia) is unsupported by the live model; use a testnet-specific process"
+        ),
+        _ => anyhow::bail!(
+            "unknown chain_id {chain_id}; supported chains are 8453 (Base) and 42161 (Arbitrum)"
+        ),
+    };
+    Ok(addresses)
 }
 
-/// Load and decrypt a keystore signer.
-///
-/// - Both `CHIMERA_KEYSTORE_PATH` + `CHIMERA_KEYSTORE_PASSWORD` present => decrypt.
-/// - Missing AND shadow => `Ok(None)` (read-only).
-/// - Missing AND live => error (refuse live without a signer).
-///
-/// Never logs the password or key material.
-fn load_signer(execute_mode: &str) -> anyhow::Result<Option<PrivateKeySigner>> {
-    let path = std::env::var("CHIMERA_KEYSTORE_PATH").ok();
-    let password = std::env::var("CHIMERA_KEYSTORE_PASSWORD").ok();
-    match (path, password) {
-        (Some(p), Some(pw)) => {
-            let signer = PrivateKeySigner::decrypt_keystore(&p, &pw)
-                .map_err(|e| anyhow::anyhow!("keystore decrypt failed: {e}"))?;
-            Ok(Some(signer))
+fn resolve_executor_address(pacing_cfg: &PacingConfig) -> anyhow::Result<Address> {
+    if pacing_cfg.executor_address.trim().is_empty() {
+        if pacing_cfg.execute_mode == "shadow" {
+            warn!(
+                target = "chimera::main",
+                "executor_address is empty in shadow mode; assembled no-op requests will target the zero address until CHIMERA_EXECUTOR_ADDRESS is configured"
+            );
+            return Ok(Address::ZERO);
         }
-        _ => {
-            if execute_mode == "live" {
-                anyhow::bail!(
-                    "execute_mode=live requires CHIMERA_KEYSTORE_PATH and CHIMERA_KEYSTORE_PASSWORD"
-                );
-            }
-            warn!("No keystore configured (CHIMERA_KEYSTORE_PATH/PASSWORD); running read-only shadow");
-            Ok(None)
+        anyhow::bail!("execute_mode=live requires executor_address");
+    }
+
+    let executor = pacing_cfg
+        .executor_address
+        .parse::<Address>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "invalid executor_address {:?}: {e}",
+                pacing_cfg.executor_address
+            )
+        })?;
+    if executor == Address::ZERO {
+        anyhow::bail!("executor_address must not be the zero address");
+    }
+    Ok(executor)
+}
+
+async fn validate_live_executor<P: Provider<Ethereum> + Sync>(
+    provider: &P,
+    execute_mode: &str,
+    executor: Address,
+    expected_pool: Address,
+    active_workers: &[Address],
+) -> anyhow::Result<()> {
+    if execute_mode != "live" {
+        return Ok(());
+    }
+
+    let code = provider.get_code_at(executor).await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to query deployed bytecode for live executor {executor} (expected Aave Pool {expected_pool}): {e}"
+        )
+    })?;
+    if code.is_empty() {
+        anyhow::bail!(
+            "live executor {executor} has no deployed bytecode; verify the executor deployment and chain (expected Aave Pool {expected_pool})"
+        );
+    }
+
+    let contract = IExecutorStartup::new(executor, provider);
+    let configured_pool = contract.pool().call().await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to query pool() on live executor {executor} (expected Aave Pool {expected_pool}): {e}"
+        )
+    })?;
+    if configured_pool != expected_pool {
+        anyhow::bail!(
+            "live executor {executor} pool mismatch: contract returned {configured_pool}, expected Aave Pool {expected_pool}; deploy or configure the executor for this chain"
+        );
+    }
+
+    for &worker in active_workers {
+        let authorized = contract.isWorker(worker).call().await.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to query isWorker({worker}) on live executor {executor} (expected Aave Pool {expected_pool}): {e}"
+            )
+        })?;
+        if !authorized {
+            anyhow::bail!(
+                "live executor {executor} does not authorize active worker {worker}; expected Aave Pool {expected_pool}; authorize the worker before startup"
+            );
         }
     }
+
+    info!(
+        target = "chimera::main",
+        executor = %executor,
+        aave_pool = %expected_pool,
+        active_workers = active_workers.len(),
+        "Live executor deployment and authorization validated"
+    );
+    Ok(())
+}
+
+async fn validate_live_funding<P: Provider<Ethereum> + Sync>(
+    provider: &P,
+    pacing_cfg: &PacingConfig,
+    registry: &SignerRegistry,
+) -> anyhow::Result<()> {
+    if pacing_cfg.execute_mode != "live" {
+        return Ok(());
+    }
+
+    let treasury = registry
+        .treasury_address()
+        .ok_or_else(|| anyhow::anyhow!("live startup requires a decrypted treasury signer"))?;
+    let treasury_balance = provider
+        .get_balance(treasury)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to query treasury balance for {treasury}: {e}"))?;
+
+    let required_treasury_wei = decimal_eth_to_wei(pacing_cfg.refund_topup_eth)?;
+    let min_gas_budget_eth =
+        Decimal::from(MIN_GAS_BUDGET_WEI as u64) / Decimal::from(1_000_000_000_000_000_000u64);
+    let effective_worker_min_eth = pacing_cfg.min_worker_balance_eth.max(min_gas_budget_eth);
+    let required_worker_wei = decimal_eth_to_wei(effective_worker_min_eth)?;
+    let mut failures = Vec::new();
+    if let Some(failure) = funding_shortfall(
+        &format!("treasury {treasury}"),
+        required_treasury_wei,
+        treasury_balance,
+    ) {
+        failures.push(failure);
+    }
+    for worker in registry.worker_addresses() {
+        let balance = provider.get_balance(worker).await.map_err(|e| {
+            anyhow::anyhow!("failed to query active worker balance for {worker}: {e}")
+        })?;
+        if let Some(failure) =
+            funding_shortfall(&format!("worker {worker}"), required_worker_wei, balance)
+        {
+            failures.push(failure);
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "live startup funding validation failed:\n{}",
+            failures.join("\n")
+        );
+    }
+    Ok(())
+}
+
+fn funding_shortfall(subject: &str, required_wei: U256, current_wei: U256) -> Option<String> {
+    (current_wei < required_wei)
+        .then(|| format!("{subject}: required {required_wei} wei, current {current_wei} wei"))
+}
+
+fn decimal_eth_to_wei(eth: Decimal) -> anyhow::Result<U256> {
+    if eth < Decimal::ZERO {
+        anyhow::bail!("ETH funding threshold must not be negative: {eth}");
+    }
+    let scaled = eth * Decimal::from(1_000_000_000_000_000_000u64);
+    if scaled.fract() != Decimal::ZERO {
+        anyhow::bail!("ETH funding threshold has precision below one wei: {eth} ETH");
+    }
+    scaled.to_u128().map(U256::from).ok_or_else(|| {
+        anyhow::anyhow!("ETH funding threshold is outside the supported wei range: {eth} ETH")
+    })
 }
 
 fn load_mode_state(path: &Path) -> Option<ModeState> {
@@ -569,12 +703,8 @@ fn load_mode_state(path: &Path) -> Option<ModeState> {
 /// the `ws_endpoint` config field).
 fn derive_ws_endpoint_from_chain(chain_id: u64) -> Option<String> {
     match chain_id {
-        8453 => {
-            Some("wss://mainnet.base.org".to_string())
-        }
-        42161 => {
-            Some("wss://arb1.arbitrum.io/ws".to_string())
-        }
+        8453 => Some("wss://mainnet.base.org".to_string()),
+        42161 => Some("wss://arb1.arbitrum.io/ws".to_string()),
         _ => None,
     }
 }
@@ -596,4 +726,311 @@ fn redact_ws_url_log(url: &str) -> String {
         return url[..idx + 3 + after_scheme.len()].to_string();
     }
     "(invalid-url)".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{address, Bytes};
+    use alloy::providers::ProviderBuilder;
+    use alloy::sol_types::{SolCall, SolValue};
+    use alloy::transports::mock::Asserter;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ADDRESS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ADDRESS_ENV_KEYS: [&str; 4] = [
+        "CHIMERA_AAVE_POOL",
+        "CHIMERA_AAVE_ORACLE",
+        "CHIMERA_POOL_DATA_PROVIDER",
+        "CHIMERA_ETH_ORACLE_ASSET",
+    ];
+
+    struct AddressEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl AddressEnvGuard {
+        fn new() -> Self {
+            let lock = ADDRESS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = ADDRESS_ENV_KEYS
+                .iter()
+                .map(|&key| (key, std::env::var(key).ok()))
+                .collect();
+            for key in ADDRESS_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for AddressEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
+
+    fn without_address_overrides<T>(test: impl FnOnce() -> T) -> T {
+        let _guard = AddressEnvGuard::new();
+        test()
+    }
+
+    #[test]
+    fn base_aave_defaults_match_pinned_address_book() {
+        without_address_overrides(|| {
+            let addresses = resolve_aave_addresses(8453).unwrap();
+            assert_eq!(
+                addresses.pool,
+                "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+                    .parse::<Address>()
+                    .unwrap()
+            );
+            assert_eq!(
+                addresses.oracle,
+                "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156"
+                    .parse::<Address>()
+                    .unwrap()
+            );
+            assert_eq!(
+                addresses.pool_data_provider,
+                "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
+                    .parse::<Address>()
+                    .unwrap()
+            );
+            assert_eq!(
+                addresses.weth,
+                "0x4200000000000000000000000000000000000006"
+                    .parse::<Address>()
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn every_supported_chain_default_address_is_nonzero() {
+        without_address_overrides(|| {
+            for chain_id in [8453, 42161] {
+                let addresses = resolve_aave_addresses(chain_id).unwrap();
+                for (name, address) in [
+                    ("pool", addresses.pool),
+                    ("oracle", addresses.oracle),
+                    ("pool_data_provider", addresses.pool_data_provider),
+                    ("weth", addresses.weth),
+                ] {
+                    assert_ne!(address, Address::ZERO, "{name} was zero for {chain_id}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn malformed_and_zero_address_overrides_are_actionable_errors() {
+        let _guard = AddressEnvGuard::new();
+
+        std::env::set_var("CHIMERA_AAVE_POOL", "not-an-address");
+        assert!(resolve_aave_addresses(8453)
+            .unwrap_err()
+            .to_string()
+            .contains("CHIMERA_AAVE_POOL"));
+
+        std::env::set_var(
+            "CHIMERA_AAVE_POOL",
+            "0x0000000000000000000000000000000000000000",
+        );
+        assert!(resolve_aave_addresses(8453)
+            .unwrap_err()
+            .to_string()
+            .contains("zero address"));
+    }
+
+    #[tokio::test]
+    async fn live_executor_validation_accepts_deployed_matching_authorized_contract() {
+        let executor = address!("0x1111111111111111111111111111111111111111");
+        let expected_pool = address!("0x2222222222222222222222222222222222222222");
+        let workers = [
+            address!("0x3333333333333333333333333333333333333333"),
+            address!("0x4444444444444444444444444444444444444444"),
+        ];
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from_static(&[0x60, 0x00]));
+        asserter.push_success(&Bytes::from(expected_pool.abi_encode()));
+        for _ in &workers {
+            asserter.push_success(&Bytes::from(true.abi_encode()));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        validate_live_executor(&provider, "live", executor, expected_pool, &workers)
+            .await
+            .expect("matching deployed executor must pass live startup validation");
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shadow_executor_validation_makes_no_rpc_calls() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let configured_executor = address!("0x1111111111111111111111111111111111111111");
+        let expected_pool = address!("0x2222222222222222222222222222222222222222");
+        let worker = address!("0x3333333333333333333333333333333333333333");
+
+        validate_live_executor(
+            &provider,
+            "shadow",
+            configured_executor,
+            expected_pool,
+            &[worker],
+        )
+        .await
+        .expect("shadow startup must skip executor RPC validation");
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn shadow_executor_resolution_only_allows_empty_as_zero() {
+        let empty = PacingConfig::default();
+        assert_eq!(resolve_executor_address(&empty).unwrap(), Address::ZERO);
+
+        let configured_executor = address!("0x1111111111111111111111111111111111111111");
+        let configured = PacingConfig {
+            executor_address: configured_executor.to_string(),
+            ..PacingConfig::default()
+        };
+        assert_eq!(
+            resolve_executor_address(&configured).unwrap(),
+            configured_executor
+        );
+
+        let invalid = PacingConfig {
+            executor_address: "not-an-address".into(),
+            ..PacingConfig::default()
+        };
+        let invalid_error = resolve_executor_address(&invalid).unwrap_err().to_string();
+        assert!(invalid_error.contains("invalid executor_address"));
+        assert!(invalid_error.contains("not-an-address"));
+
+        let zero = PacingConfig {
+            executor_address: format!("{:#x}", Address::ZERO),
+            ..PacingConfig::default()
+        };
+        assert!(resolve_executor_address(&zero)
+            .unwrap_err()
+            .to_string()
+            .contains("must not be the zero address"));
+    }
+
+    #[test]
+    fn executor_startup_calls_use_expected_abi_selectors() {
+        let worker = address!("0x3333333333333333333333333333333333333333");
+        let pool_call = IExecutorStartup::poolCall {}.abi_encode();
+        assert_eq!(
+            &pool_call[..4],
+            &alloy::primitives::keccak256("pool()")[..4]
+        );
+        assert_eq!(pool_call.len(), 4);
+
+        let worker_call = IExecutorStartup::isWorkerCall { worker }.abi_encode();
+        assert_eq!(
+            &worker_call[..4],
+            &alloy::primitives::keccak256("isWorker(address)")[..4]
+        );
+        assert_eq!(worker_call.len(), 4 + 32);
+        assert_eq!(Address::from_slice(&worker_call[16..36]), worker);
+    }
+
+    #[tokio::test]
+    async fn live_executor_validation_rejects_missing_bytecode_actionably() {
+        let executor = address!("0x1111111111111111111111111111111111111111");
+        let expected_pool = address!("0x2222222222222222222222222222222222222222");
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = validate_live_executor(&provider, "live", executor, expected_pool, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&executor.to_string()));
+        assert!(error.contains(&expected_pool.to_string()));
+        assert!(error.contains("no deployed bytecode"));
+    }
+
+    #[tokio::test]
+    async fn live_executor_validation_rejects_pool_mismatch_actionably() {
+        let executor = address!("0x1111111111111111111111111111111111111111");
+        let expected_pool = address!("0x2222222222222222222222222222222222222222");
+        let configured_pool = address!("0x5555555555555555555555555555555555555555");
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from_static(&[0x60, 0x00]));
+        asserter.push_success(&Bytes::from(configured_pool.abi_encode()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = validate_live_executor(&provider, "live", executor, expected_pool, &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&executor.to_string()));
+        assert!(error.contains(&configured_pool.to_string()));
+        assert!(error.contains(&expected_pool.to_string()));
+        assert!(error.contains("pool mismatch"));
+    }
+
+    #[tokio::test]
+    async fn live_executor_validation_rejects_unauthorized_worker_actionably() {
+        let executor = address!("0x1111111111111111111111111111111111111111");
+        let expected_pool = address!("0x2222222222222222222222222222222222222222");
+        let worker = address!("0x3333333333333333333333333333333333333333");
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from_static(&[0x60, 0x00]));
+        asserter.push_success(&Bytes::from(expected_pool.abi_encode()));
+        asserter.push_success(&Bytes::from(false.abi_encode()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let error = validate_live_executor(&provider, "live", executor, expected_pool, &[worker])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&executor.to_string()));
+        assert!(error.contains(&worker.to_string()));
+        assert!(error.contains(&expected_pool.to_string()));
+        assert!(error.contains("does not authorize active worker"));
+    }
+
+    #[test]
+    fn decimal_eth_conversion_is_exact_and_rejects_subwei_precision() {
+        assert_eq!(
+            decimal_eth_to_wei(Decimal::from_str("0.01").unwrap()).unwrap(),
+            U256::from(10_000_000_000_000_000u64)
+        );
+        assert_eq!(
+            decimal_eth_to_wei(Decimal::from_str("0.05").unwrap()).unwrap(),
+            U256::from(50_000_000_000_000_000u64)
+        );
+        assert!(decimal_eth_to_wei(Decimal::from_str("0.0000000000000000001").unwrap()).is_err());
+    }
+
+    #[test]
+    fn funding_shortfall_reports_required_and_current_wei() {
+        let required = U256::from(50_000_000_000_000_000u64);
+        let current = U256::from(49_999_999_999_999_999u64);
+
+        assert_eq!(
+            funding_shortfall("treasury 0x1234", required, current).as_deref(),
+            Some("treasury 0x1234: required 50000000000000000 wei, current 49999999999999999 wei")
+        );
+        assert_eq!(
+            funding_shortfall("treasury 0x1234", required, required),
+            None
+        );
+    }
 }

@@ -155,7 +155,7 @@ impl StatePersistence for JsonlPersistence {
         // Try to rename temp file to final location
         let rename_result = fs::rename(&temp_path, &self.file_path).await;
         match rename_result {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Failed to rename temp file: {:?}", e);
                 // Try to clean up temp file even if rename fails
@@ -231,7 +231,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(target_os = "windows", ignore = "fsync not supported on Windows temp directories")]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "fsync not supported on Windows temp directories"
+    )]
     async fn test_append_and_load_recent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -271,7 +274,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(target_os = "windows", ignore = "fsync not supported on Windows temp directories")]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "fsync not supported on Windows temp directories"
+    )]
     async fn test_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -285,7 +291,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg_attr(target_os = "windows", ignore = "fsync not supported on Windows temp directories")]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "fsync not supported on Windows temp directories"
+    )]
     async fn test_recover_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");

@@ -24,11 +24,11 @@
 | Step | Outcome |
 | --- | --- |
 | Pre-flight validation | All tests pass, binaries compile, audit scanners are clean |
-| Testnet configuration | Config files updated for Base Sepolia (chain_id=84532) |
+| Testnet configuration | Base Sepolia values recorded for contract rehearsal without changing mainnet runtime defaults |
 | Contract deployment | Executor + FundDistributor deployed, multisig-owned |
-| Post-deploy verification | `owner()` == multisig, pool set, FundDistributor ownership accepted |
+| Post-deploy verification | `owner()` == multisig, `pool()` correct, worker enabled through `setWorker`, FundDistributor ownership accepted |
 | Auth-test execution | All auth gates reject unauthorized callers with correct custom errors |
-| Smoke test | One end-to-end flash-loan liquidation on Base Sepolia Aave V3 |
+| Smoke test | Authorized worker calls standalone `Executor.execute(bytes)` for one Base Sepolia rehearsal |
 | Block explorer verification | Source code and constructor args verified on Basescan Sepolia |
 
 ### 1.2 Machine & Toolchain Requirements
@@ -50,9 +50,21 @@ must be replaced.
 | Variable | Description | Example |
 | --- | --- | --- |
 | `CHIMERA_MULTISIG` | Multisig contract on Base Sepolia | `0x...` |
-| `DEPLOYER_PRIVATE_KEY` | Funded deployer EOA (testnet only) | `0x...` |
+| `DEPLOYER_PRIVATE_KEY` | Funded deployer EOA key required by `Deploy.s.sol` (testnet only) | Not shown |
+| `DEPLOYER_ADDRESS` | Public address corresponding to the testnet deployer | `0x...` |
+| `WORKER_ADDRESS` | Testnet worker address the multisig will explicitly authorize | `0x...` |
+| `WORKER_KEYSTORE` | Path to a local encrypted testnet keystore corresponding to `WORKER_ADDRESS` | `/protected/path/worker.json` |
+| `CHIMERA_WORKER` | Optional single worker address for a post-deploy action notice only | `0x...` |
 | `CHIMERA_AAVE_POOL` | Base Sepolia Aave V3 Pool address | See §3.1 |
 | `BASE_SEPOLIA_RPC` | RPC endpoint for Base Sepolia | `https://sepolia.base.org` |
+
+`DEPLOYER_PRIVATE_KEY` is a testnet-only exception required because
+`Deploy.s.sol` reads it directly with `vm.envUint`. Supply it only through a
+protected, ephemeral process environment immediately before deployment. Never
+commit it, save it in a project `.env`, pass it as a command-line argument,
+echo it, enable shell tracing around it, or allow it into logs. Unset it as soon
+as the deployment command finishes. This is not a mainnet deployment or custody
+pattern.
 
 ---
 
@@ -81,20 +93,41 @@ Run each command. Every box must be checked.
     `test_validate_mode_transition_requires_shadow_period`,
     `test_strategy_params_288_byte_abi_layout`.
 - [ ] `forge test --root contracts/ -vvv`
-  - All `Executor.t.sol` tests green. Confirm:
-    - `test_constructor_owner` — owner set from appended arg
-    - `test_exec_owner_only` — non-owner `exec()` reverts with `Unauthorized()`
-    - `test_withdraw_owner_only` — non-owner `withdraw()` reverts with `Unauthorized()`
-    - `test_setPool_owner_only` — non-owner `setPool()` reverts with `Unauthorized()`
-    - `test_executeOperation_pool_gate` — non-pool `executeOperation` reverts with `InvalidPool()`
-    - `test_executeOperation_initiator_gate` — wrong initiator reverts with `Unauthorized()`
-    - `test_profit_gate_no_profit` — profit gate reverts with `ProfitGateFailed()`
-    - `test_executeOperation_emits_profit_event` — `Profit(uint256)` emitted
-    - `test_direct_exec_via_exec` — EIP-7702 `exec(bytes)` path works
-    - `test_withdraw_erc20` + `test_withdraw_eth` — both withdraw paths work
-    - `test_transferOwnership` — ownership transfers, zero-address rejected
-    - `test_profit_gate_overflow_guard` — overflow guards active
-  - All `FundDistributor.t.sol` tests green.
+   - All current `Executor.t.sol` tests green. Confirm these exact names:
+     - `testAuthorizedWorkerExecutesFullFlashLoanFlow`
+     - `testOwnerCanExecute`
+     - `testUnauthorizedWorkerCannotExecute`
+     - `testLegacyDirectExecSelectorIsRemoved`
+     - `testExecuteRejectsWrongPayloadLengths`
+     - `testExecuteRejectsZeroAssetAndAmount`
+     - `testExecuteRejectsUnconfiguredPool`
+     - `testFlashLoanFailureRevertsAtomically`
+     - `testProfitGateStillRevertsFullFlow`
+     - `testExecuteOperationRejectsWrongCaller`
+     - `testExecuteOperationRejectsWrongInitiator`
+     - `testExecuteOperationRejectsWrongPayloadLengths`
+     - `testSetWorkerOnlyOwnerAndViewReflectsChanges`
+     - `testSetPoolOnlyOwner`
+     - `testConstructionOwnerIsConfigured`
+     - `testWithdrawOnlyOwner`
+     - `testWithdrawNativeByOwner`
+     - `testTransferOwnershipOnlyOwner`
+     - `testConstructorRejectsMissingOwnerArgument`
+     - `testRequestAndCallbackShapesAreExact`
+     - `testSelectorsMatchCanonicalSignatures`
+   - `testLegacyDirectExecSelectorIsRemoved` is a removal assertion. It does not
+     document or enable a legacy execution path.
+   - All `FundDistributor.t.sol` tests green.
+- [ ] Opt-in Base mainnet fork tests are understood before enabling them:
+  - `testBaseForkStandaloneExecutorConfiguration` skips when `BASE_FORK_URL` is
+    unset. Set it only in the local environment; never put an RPC URL in docs,
+    source, or committed configuration.
+  - `testBaseForkRealLiquidationWhenConfigured` also requires an explicit,
+    current opportunity through `BASE_LIQUIDATION_USER`,
+    `BASE_COLLATERAL_TOKEN`, `BASE_DEBT_TOKEN`, `BASE_DEBT_AMOUNT`,
+    `BASE_DEX_ROUTER`, and `BASE_AMOUNT_OUT_MIN`; `BASE_MIN_PROFIT` is optional.
+    These values are environment-only, can become stale, and the test never
+    broadcasts.
 - [ ] `python -m compileall scripts ai-audit/scripts`
   - No errors. All `.py` files compile without importing web3.py.
 - [ ] `slither contracts --config-file slither.config.json`
@@ -128,22 +161,31 @@ Run each command. Every box must be checked.
 
 - [ ] `cargo build --release -p chimera-core`
   - Confirm `target/release/chimera` (or `chimera.exe`) exists.
-- [ ] `scripts/dry_run.py --binary target/release/chimera --run-secs 5`
-  - Binary boots in shadow mode, no panic, terminates cleanly.
+
+> **Base Sepolia limitation:** `core/src/main.rs` explicitly rejects chain ID
+> `84532`. Building the binary is part of repository validation, but this
+> runbook does not boot `chimera` against Base Sepolia. The deployed-contract
+> rehearsal and Foundry harness are distinct from the mainnet-only runtime.
 
 ---
 
-## 3. Testnet Configuration
+## 3. Testnet Rehearsal Configuration
 
-### 3.1 Update `config/pools.toml` for Base Sepolia
+All values in this section are testnet-only inputs for deployment, `cast`, and
+Foundry rehearsal. Do not replace the runtime's Base mainnet defaults with chain
+ID `84532`, and do not set `execute_mode: live`. The normal runtime remains in
+its conservative `shadow` default; it is not used to boot Base Sepolia.
 
-Base Sepolia Aave V3 addresses differ from mainnet. Replace the `[base]`
-section in `config/pools.toml` with the following (verify addresses against
+### 3.1 Record Base Sepolia Aave Addresses
+
+Base Sepolia Aave V3 addresses differ from mainnet. Record the following as
+local environment or harness inputs; do not replace the `[base]` mainnet
+section in `config/pools.toml`. Verify addresses against
 [Aave Addresses docs](https://docs.aave.com/developers/deployed-contracts/v3-testnet-addresses)
 before executing):
 
 ```toml
-# config/pools.toml — Base Sepolia Aave V3 testnet addresses
+# Local Base Sepolia rehearsal values; do not commit over mainnet config.
 # Operator: verify each address against Aave docs before proceeding.
 # Source: https://docs.aave.com/developers/deployed-contracts/v3-testnet-addresses
 
@@ -178,18 +220,17 @@ usdc = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
   ```
   Every address must report code length > 2 (non-empty bytecode).
 
-### 3.2 Update `config/routing.yaml` for Testnet
+### 3.2 Record a Testnet V2 Route
 
-The existing `routing.yaml` uses mainnet DEX addresses. For testnet, update
-the router addresses in the `base`-chain venues. Base Sepolia DEX testnet
-counterparts are needed. If no testnet DEX exists for a venue, mark it as
-`excluded` in the comment or remove it temporarily.
+The existing `routing.yaml` uses mainnet DEX addresses. Do not overwrite it for
+this rehearsal. Record one verified Base Sepolia V2-compatible router and pair
+as local harness inputs. If no compatible testnet venue exists, skip the
+end-to-end liquidation and use the fallback validation in §7.5.
 
 For smoke-test purposes, Aerodrome V2 on Base Sepolia uses a different router.
 Verify the correct testnet address before editing.
 
-**Minimum testnet routing configuration** (leave only one V2 venue for the
-smoke test):
+**Illustrative local harness record** (one V2 venue for the smoke test):
 
 ```yaml
 venues:
@@ -205,41 +246,27 @@ venues:
         token_out: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
 ```
 
-- [ ] Verified: all `base`-chain venues in routing.yaml have
-  `router_compatibility: "v2"` or are removed. V3 venues (`router_compatibility:
-  "v3"`) MUST NOT be present for `base` chain — the V2-only routing engine will
-  filter them, but their presence is misleading. Remove `uniswap-v3-base` from
-  the venues list for testnet.
-- [ ] Run `cargo test -p chimera-core` after editing routing.yaml to confirm
-  `test_routing_yaml_new_fields_present` still passes (it checks for at least
-  one venue with `router_address` + `pairs` populated).
+- [ ] Confirm the selected router has deployed code and supports the exact V2
+  `swapExactTokensForTokens` shape used by the Executor.
+- [ ] Do not use a V3-only router; the Executor's active swap path is V2-shaped.
 
-### 3.3 Update `config/pacing.yaml` for Base Sepolia
+### 3.3 Preserve Runtime Pacing Defaults
 
-- [ ] Change `chain_id: 8453` → `chain_id: 84532`:
-  ```bash
-  sed -i 's/chain_id: 8453/chain_id: 84532/' config/pacing.yaml
-  ```
-- [ ] Update `eth_usd_feed_address` to Base Sepolia Chainlink ETH/USD feed.
-  Base Sepolia does not have a Chainlink feed deployed at the mainnet address
-  `0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b`. Use the correct Sepolia feed
-  address or set a fallback. If no feed exists, the `eth_price_usd_fallback`
-  value (`1800`) will be used.
-- [ ] Verify `execute_mode: shadow` is still set (must NOT be `live` for
-  testnet deployment):
+- [ ] Do not change `config/pacing.yaml` to chain ID `84532`; `main.rs` rejects it.
+- [ ] Verify `execute_mode: shadow` remains set:
   ```bash
   grep execute_mode config/pacing.yaml
   # Expected: execute_mode: shadow
   ```
-- [ ] Verify `chain_id: 84532` took effect:
+- [ ] Verify the repository's Base runtime default remains mainnet chain ID `8453`:
   ```bash
   grep chain_id config/pacing.yaml
-  # Expected: chain_id: 84532
+  # Expected: chain_id: 8453
   ```
-- [ ] Run `cargo test -p chimera-core`
-  `test_load_valid_config` to confirm the edited pacing.yaml still parses.
+- [ ] Run `cargo test -p chimera-core test_load_valid_config` to confirm pacing
+  invariants remain intact.
 
-### 3.4 Update `config/risk.yaml`
+### 3.4 Preserve `config/risk.yaml`
 
 No changes needed for testnet. The risk thresholds (`max_loss_eth: 0.005`,
 `min_profit: 2.5`, `slippage_max_bps: 50`, etc.) are conservative defaults
@@ -252,12 +279,12 @@ grep -E "max_loss_eth|min_profit:|slippage_max_bps" config/risk.yaml
 - [ ] `config/risk.yaml` parses: `cargo test -p chimera-core
   test_disk_risk_yaml_parses` passes.
 
-### 3.5 Re-run Pre-flight After Config Changes
+### 3.5 Re-run Pre-flight Before Deployment
 
-- [ ] `cargo test -p chimera-core` — all green with updated configs
-- [ ] `scripts/dry_run.py` — PASS, execute_mode is shadow, pacing parses
-- [ ] `scripts/health_check.py --state-dir core/state` — mode_state reports
-  shadow (or absent, which is acceptable before first boot)
+- [ ] `cargo test -p chimera-core` — all green with repository defaults intact
+- [ ] `forge test --root contracts/ -vvv` — standalone Executor tests green
+- [ ] `execute_mode` is still `shadow`
+- [ ] No attempt has been made to boot `main.rs` with chain ID `84532`
 
 ---
 
@@ -273,8 +300,10 @@ grep -E "max_loss_eth|min_profit:|slippage_max_bps" config/risk.yaml
   ```
 - [ ] `DEPLOYER_PRIVATE_KEY` env var set to a funded EOA on Base Sepolia:
   ```bash
-  DEPLOYER_ADDR=$(cast wallet address "$DEPLOYER_PRIVATE_KEY")
-  cast balance "$DEPLOYER_ADDR" --rpc-url "$BASE_SEPOLIA_RPC"
+  # Presence checks produce no output and do not disclose the key.
+  test -n "${DEPLOYER_PRIVATE_KEY:-}"
+  test -n "${DEPLOYER_ADDRESS:-}"
+  cast balance "$DEPLOYER_ADDRESS" --rpc-url "$BASE_SEPOLIA_RPC"
   # Should show at least 0.02 ETH
   ```
 - [ ] (Optional) `CHIMERA_AAVE_POOL` env var set to the Base Sepolia Aave V3
@@ -284,6 +313,9 @@ grep -E "max_loss_eth|min_profit:|slippage_max_bps" config/risk.yaml
   ```bash
   export CHIMERA_AAVE_POOL="0x07eA79F68B2B3df56440f754B6aA0E498b9B75Fb"
   ```
+- [ ] (Optional) `CHIMERA_WORKER` set to one test worker only if its post-deploy
+  action notice is useful. It does not authorize that worker, and it does not
+  represent the complete worker set.
 - [ ] `forge build` has been run; `out/Executor.yul/Executor.json` exists:
   ```bash
   ls -la out/Executor.yul/Executor.json
@@ -291,26 +323,42 @@ grep -E "max_loss_eth|min_profit:|slippage_max_bps" config/risk.yaml
 
 ### 4.2 Execute Deployment
 
-All verified testnet addresses and keys are in env vars. Run:
+All verified testnet addresses are set, and the testnet-only deployer key is in
+the protected ephemeral environment described in §1.3. Disable shell tracing,
+run the script, and then unset the key:
 
 ```bash
+set +x
+trap 'unset DEPLOYER_PRIVATE_KEY' EXIT
 forge script contracts/script/Deploy.s.sol \
     --rpc-url "$BASE_SEPOLIA_RPC" \
     --broadcast \
-    --private-key "$DEPLOYER_PRIVATE_KEY" \
     --gas-estimate-multiplier 120 \
     -vvvv
+unset DEPLOYER_PRIVATE_KEY
+trap - EXIT
 ```
 
-**Expected output (console.log from Deploy.s.sol):**
+`Deploy.s.sol` reads `DEPLOYER_PRIVATE_KEY` from the environment; do not add a
+`--private-key` argument. On a successful run, the following lines always print:
 
 ```
 Executor deployed: 0x<executor-address>
 FundDistributor deployed: 0x<fund-distributor-address>
 Owner (multisig): 0x<multisig-address>
-ACTION REQUIRED: multisig must call Executor.setPool: 0x07eA79F68B2B3df56440f754B6aA0E498b9B75Fb
+MODEL: worker EOAs send normal execute(bytes) transactions to Executor.
 ACTION REQUIRED: multisig must call FundDistributor.acceptOwnership()
 ```
+
+The remaining notice depends on each optional variable:
+
+- If `CHIMERA_AAVE_POOL` is set, one `Executor.setPool` action notice and its selector print; otherwise a note says the pool can be set later.
+- If `CHIMERA_WORKER` is set, one `Executor.setWorker(worker, true)` action notice and its selector print for that single address; otherwise a note says workers can be authorized later.
+
+`CHIMERA_WORKER` is optional and does not authorize the worker. The deploy script
+can print at most one worker action notice. Every worker intended for the
+rehearsal must still be authorized separately by the multisig with
+`setWorker(worker, true)` and verified through `isWorker(address)`.
 
 ### 4.3 Record Deployment Addresses
 
@@ -330,8 +378,8 @@ echo "FUND_DISTRIBUTOR_ADDRESS=0x..." >> .env
 Per `contracts/script/Deploy.s.sol:112-124`: `setPool` is owner-gated on
 Executor.yul (slot 0 check). The owner is the multisig, which was set at
 construction via appended 32-byte arg. The deployer EOA is NOT the owner, so
-calling `setPool` from the deploy script would revert. The multisig must call
-it separately after deployment (see §5.3).
+calling `setPool` or `setWorker` from the deploy script would revert. The
+multisig must configure both separately after deployment (see §5.3 and §5.4).
 
 ---
 
@@ -353,14 +401,14 @@ cast code "$CHIMERA_MULTISIG" --rpc-url "$BASE_SEPOLIA_RPC" | wc -c
 # Expected: > 2
 ```
 
-### 5.2 Confirm Executor Slot 1 (pool) is Unset
+### 5.2 Confirm Executor `pool()` Is Unset
 
-At this point, `setPool` has NOT been called, so `sload(1)` should return
-`0x0000...0000`:
+At this point, `setPool` has NOT been called, so the public `pool()` getter
+(selector `0x16f0115b`) should return the zero address:
 
 ```bash
-cast storage "$EXECUTOR_ADDRESS" 1 --rpc-url "$BASE_SEPOLIA_RPC"
-# Expected: 0x0000000000000000000000000000000000000000000000000000000000000000
+cast call "$EXECUTOR_ADDRESS" "pool()" --rpc-url "$BASE_SEPOLIA_RPC"
+# Expected: 0x0000000000000000000000000000000000000000
 ```
 
 ### 5.3 Set Pool (Multisig Action)
@@ -369,7 +417,7 @@ The operator (or multisig signer) must execute the following transaction **from
 the multisig**:
 
 ```bash
-# Encode setPool(address) call — selector 0xa51b62c1
+# Encode setPool(address) call — selector 0x4437152a
 POOL_CALLDATA=$(cast calldata "setPool(address)" "$CHIMERA_AAVE_POOL")
 
 # Initiate multisig transaction (Safe example — adapt to your multisig):
@@ -382,21 +430,37 @@ POOL_CALLDATA=$(cast calldata "setPool(address)" "$CHIMERA_AAVE_POOL")
 ```
 
 - [ ] Multisig executes `setPool($CHIMERA_AAVE_POOL)`.
-- [ ] Verify slot 1 now holds the pool address:
+- [ ] Verify `pool()` now returns the exact pool address:
   ```bash
-  cast storage "$EXECUTOR_ADDRESS" 1 --rpc-url "$BASE_SEPOLIA_RPC"
-  # Expected: 0x00000000000000000000000007eA79F68B2B3df56440f754B6aA0E498b9B75Fb
-  ```
-- [ ] Verify `executeOperation` now accepts the pool as caller (auth gate
-  checks `caller() == sload(1)`):
-  ```bash
-  # Read back via staticcall to confirm encoding
-  cast call "$EXECUTOR_ADDRESS" "setPool(address)" "$CHIMERA_AAVE_POOL" \
-      --from "$CHIMERA_MULTISIG" --rpc-url "$BASE_SEPOLIA_RPC"
-  # No revert expected (staticcall shows result; actual tx would set storage)
+  cast call "$EXECUTOR_ADDRESS" "pool()" --rpc-url "$BASE_SEPOLIA_RPC"
+  # Expected: $CHIMERA_AAVE_POOL
   ```
 
-### 5.4 FundDistributor Ownership Acceptance (Multisig Action)
+### 5.4 Authorize the Test Worker (Multisig Action)
+
+The worker is only a transaction signer. It must be explicitly enabled by the
+Executor owner and cannot configure or withdraw from the Executor.
+
+```bash
+# setWorker(address,bool) selector: 0xc373d7f3
+WORKER_CALLDATA=$(cast calldata "setWorker(address,bool)" "$WORKER_ADDRESS" true)
+
+# In the multisig UI, submit:
+#   Target: $EXECUTOR_ADDRESS
+#   Value: 0
+#   Method: setWorker(address,bool)
+#   Parameters: $WORKER_ADDRESS, true
+```
+
+- [ ] Multisig executes `setWorker($WORKER_ADDRESS,true)`.
+- [ ] Verify through `isWorker(address)` (selector `0xaa156645`):
+  ```bash
+  cast call "$EXECUTOR_ADDRESS" "isWorker(address)" "$WORKER_ADDRESS" \
+      --rpc-url "$BASE_SEPOLIA_RPC"
+  # Expected: true
+  ```
+
+### 5.5 FundDistributor Ownership Acceptance (Multisig Action)
 
 The deploy script called `transferOwnership(multisig)` which initiated the
 two-step transfer. The multisig must now accept:
@@ -434,20 +498,21 @@ Verify every authorization gate in Executor.yul. All tests use `cast call`
 (read-only sim) to avoid wasting gas; reverted calls confirm the auth gate
 is active.
 
-### 6.1 Non-Owner `exec(bytes)` Reverts
+### 6.1 Unauthorized `execute(bytes)` Reverts
 
 ```bash
-# exec(bytes) selector: 0x55f86501
-# Call from any non-owner EOA (use a throwaway address or the deployer)
+# execute(bytes) selector: 0x09c5eabe
+# Call from an address that is neither owner nor an enabled worker.
 ALICE_ADDR="0x0000000000000000000000000000000000000001"
-cast call "$EXECUTOR_ADDRESS" "exec(bytes)" "0x" \
+EMPTY_REQUEST=$(cast abi-encode "f(bytes)" "0x")
+cast call "$EXECUTOR_ADDRESS" --data "0x09c5eabe${EMPTY_REQUEST#0x}" \
     --from "$ALICE_ADDR" --rpc-url "$BASE_SEPOLIA_RPC"
 ```
 
 - [ ] Reverts with `Unauthorized()` — selector `0x82b42900`.
   Confirm the revert data first 4 bytes match:
   ```bash
-  cast call "$EXECUTOR_ADDRESS" "exec(bytes)" "0x" \
+  cast call "$EXECUTOR_ADDRESS" --data "0x09c5eabe${EMPTY_REQUEST#0x}" \
       --from "$ALICE_ADDR" --rpc-url "$BASE_SEPOLIA_RPC" 2>&1 | grep -i "82b42900"
   ```
 
@@ -476,7 +541,7 @@ cast call "$EXECUTOR_ADDRESS" "executeOperation(address,uint256,uint256,address,
     --from "$ALICE_ADDR" --rpc-url "$BASE_SEPOLIA_RPC"
 ```
 
-- [ ] Reverts with `InvalidPool()` — selector `0xd0363b78`. Even if the Aave
+- [ ] Reverts with `InvalidPool()` — selector `0x2083cd40`. Even if the Aave
   pool calls it, the initiator must be `address(this)` (the Executor itself).
   A direct external call will fail either `InvalidPool()` or `Unauthorized()`.
 
@@ -501,17 +566,28 @@ cast call "$EXECUTOR_ADDRESS" "withdraw(address,uint256)" \
 - [ ] Does NOT revert. (Staticcall returns nothing on success for `stop()` —
   a successful empty response confirms the auth gate passes.)
 
-### 6.6 All Custom Error Selectors Confirmed
+### 6.6 Non-Owner `setWorker(address,bool)` Reverts
 
-- [ ] `ProfitGateFailed()` — `0x2e5a0d02`
-- [ ] `AtomicFail()` — `0x5fe2e75c`
+```bash
+cast call "$EXECUTOR_ADDRESS" "setWorker(address,bool)" "$ALICE_ADDR" "true" \
+    --from "$ALICE_ADDR" --rpc-url "$BASE_SEPOLIA_RPC"
+```
+
+- [ ] Reverts with `Unauthorized()` (`0x82b42900`).
+- [ ] `isWorker($ALICE_ADDR)` remains false.
+
+### 6.7 All Custom Error Selectors Confirmed
+
+- [ ] `ProfitGateFailed()` — `0x9b89663c`
+- [ ] `AtomicFail()` — `0xc4cae92f`
 - [ ] `Unauthorized()` — `0x82b42900`
-- [ ] `InvalidDexRouter()` — `0x8d4f59a9`
-- [ ] `InvalidPool()` — `0xd0363b78`
-- [ ] `WithdrawFailed()` — `0xf1620b3e`
+- [ ] `InvalidDexRouter()` — `0xd7c4b506`
+- [ ] `InvalidPool()` — `0x2083cd40`
+- [ ] `WithdrawFailed()` — `0x750b219c`
 
-These selectors are defined in `Executor.yul:50-56` and tested in
-`Executor.t.sol:68-73`. Confirm the test file matches the Yul source.
+These selectors are the active constants in `Executor.yul`; the contract tests
+exercise the corresponding paths. Confirm source and tests still agree before
+deployment.
 
 ---
 
@@ -541,60 +617,55 @@ Record:
 
 ### 7.2 Build StrategyParams for the Liquidation
 
-The Executor expects `StrategyParams` as a tightly packed 288-byte (9×32) blob
-in the `params` field of the `executeOperation` callback. Use the encoded
-format documented at `Executor.yul:99-107` and `core/src/config.rs:558-594`.
+The worker sends `execute(bytes)` an exactly 352-byte (11×32) request:
+`asset`, `amount`, `collateralAsset`, `userToLiquidate`, `debtToCover`,
+`receiveAToken`, `dexRouter`, `amountOutMin`, `minProfit`, `tip`, `deadline`.
+The Executor passes the final nine words (288 bytes) to the callback.
 
 The Executor's `executeOperation` can only be called by the Aave Pool as a
 flash-loan callback. To trigger this atomically:
 
-1. **Flash-loan the debt amount from Aave** — call `flashLoanSimple` on the
-   Aave Pool with the Executor as the receiver.
-2. **The Aave Pool calls `executeOperation`** on the Executor with the
-   StrategyParams encoded in the `params` bytes.
-3. **The Executor** liquidates, swaps, repays the flash loan, and emits
-   `Profit`.
+1. **Authorized worker calls `Executor.execute(bytes)`** with the exact
+   352-byte request.
+2. **Executor calls Aave `flashLoanSimple`** with `receiverAddress=Executor`.
+3. **Aave Pool calls `Executor.executeOperation`** with `caller=Pool`,
+   `initiator=Executor`, and the final nine request words as callback params.
+4. **Executor** liquidates, swaps, approves repayment, emits `Profit`, and
+   retains the debt-token profit.
 
 ### 7.3 Execute the Smoke Test Transaction
 
-Using `cast`, construct and send the flash-loan initiation transaction from a
-worker EOA (the "initiator" in Worker-as-Executor model):
+Using `cast`, construct and send `Executor.execute(bytes)` from the explicitly
+authorized worker through a local encrypted testnet keystore. The Executor, not
+the worker, is Aave's flash-loan initiator and receiver:
 
 ```bash
-# Address of the Worker EOA that will act as the initiator
-WORKER_EOA="0x<worker-eoa-address>"
+# Build the 352-byte request with cast abi-encode or a local harness.
+# Do not place keys, RPC URLs, or opportunity values in committed files.
+EXECUTOR_REQUEST_352_BYTES="0x<exact-11-word-request>"
+test -r "$WORKER_KEYSTORE"
 
-# Build StrategyParams (288 bytes, 9×32 words)
-# Format: collateralAsset, userToLiquidate, debtToCover, receiveAToken,
-#         dexRouter, amountOutMin, minProfit, tip, deadline
-
-# Example encoding — operator must fill in actual values:
-# (This is illustrative — use the Rust StrategyParams::encode() in production,
-#  or construct manually with abi.encodePacked-like assembly)
-
-# For the smoke test, the simplest approach is to call flashLoanSimple
-# directly from cast:
-AMOUNT_TO_FLASH_LOAN="<debt-token-amount-in-wei>"
-
-# Encode the flash loan call
-cast send "$CHIMERA_AAVE_POOL" \
-    "flashLoanSimple(address,address,uint256,bytes,uint16)" \
-    "$EXECUTOR_ADDRESS" \
-    "$DEBT_ASSET_ADDRESS" \
-    "$AMOUNT_TO_FLASH_LOAN" \
-    "$STRATEGY_PARAMS_288_BYTES" \
-    "0" \
-    --private-key "$WORKER_PRIVATE_KEY" \
+cast send "$EXECUTOR_ADDRESS" \
+    "execute(bytes)" \
+    "$EXECUTOR_REQUEST_352_BYTES" \
+    --keystore "$WORKER_KEYSTORE" \
     --rpc-url "$BASE_SEPOLIA_RPC"
 ```
 
-> **Note:** The exact `cast` command depends on the constructed 288-byte
-> StrategyParams. In practice, the Rust orchestrator binary handles this
-> encoding via `StrategyParams::encode()`. For a manual smoke test, the
-> operator can:
-> - Use a Rust helper script that calls `encode()` and prints hex.
-> - Use `cast abi-encode` with careful manual construction.
-> - Deploy a Solidity helper contract that constructs and forwards the call.
+Enter the keystore password only at `cast`'s hidden interactive prompt; do not
+put it in the command or logs. If the test worker is held on a supported
+hardware wallet, replace `--keystore "$WORKER_KEYSTORE"` with
+`--ledger --from "$WORKER_ADDRESS"` (or the corresponding reviewed
+hardware-wallet option).
+This manual `cast send` flow is testnet-only and is not the mainnet worker
+custody pattern; mainnet operation uses the protected deployment-local encrypted
+keystores loaded by Chimera's signer registry.
+
+> **Do not call `Pool.flashLoanSimple` from the worker.** Such a call makes the
+> worker the Aave initiator, but `executeOperation` requires
+> `initiator=Executor`; it is not the supported standalone flow. The main Rust
+> binary also cannot be used for this Base Sepolia rehearsal because it rejects
+> chain ID `84532`; use `cast` or the Foundry harness.
 
 ### 7.4 Verify Smoke Test Success
 
@@ -614,21 +685,16 @@ If the full flash-loan smoke test is not feasible (e.g., no liquidatable
 position exists on Base Sepolia), execute this minimal validation instead:
 
 - [ ] `setPool` set correctly (confirmed in §5.3).
+- [ ] `setWorker` set and `isWorker()` true (confirmed in §5.4).
 - [ ] `owner()` == multisig (confirmed in §5.1).
 - [ ] All auth gates reject unauthorized callers (confirmed in §6).
 - [ ] Deploy script assertions passed (confirmed in §4.2 output).
-- [ ] Run the Rust binary in shadow mode for 60 seconds against Base Sepolia:
-  ```bash
-  CHIMERA_EXECUTE_MODE=shadow \
-  CHIMERA_CHAIN_ID=84532 \
-  CHIMERA_EXECUTOR_ADDRESS="$EXECUTOR_ADDRESS" \
-  target/release/chimera &
-  CHIMERA_PID=$!
-  sleep 60
-  kill $CHIMERA_PID
-  ```
-  Check logs for `PASS`/no `panic` and that the orchestrator successfully
-  detected testnet Aave reserves without errors.
+- [ ] Run `forge test --root contracts/ --match-path test/Executor.t.sol -vvv`.
+- [ ] Optionally run the Base mainnet fork configuration test with a locally set
+  `BASE_FORK_URL`; it skips when the variable is absent and never broadcasts.
+
+This fallback validates the standalone contract and harness. It does not claim
+that `main.rs` boots on Base Sepolia.
 
 ---
 
@@ -683,29 +749,31 @@ checked:
 - [ ] `slither contracts --config-file slither.config.json` — clean/triaged
 
 ### Configuration
-- [ ] `pools.toml` updated with Base Sepolia Aave V3 addresses
-- [ ] `routing.yaml` restricted to V2-only venues for base chain
-- [ ] `pacing.yaml` chain_id=84532, execute_mode=shadow
+- [ ] Base Sepolia Aave V3 addresses verified as local rehearsal inputs
+- [ ] V2-compatible testnet route verified as a local rehearsal input
+- [ ] `pacing.yaml` mainnet chain_id remains 8453 and execute_mode remains shadow
 - [ ] `risk.yaml` unchanged, parses
-- [ ] Re-run `cargo test -p chimera-core` after config changes — green
+- [ ] `cargo test -p chimera-core` with repository defaults — green
 
 ### Deployment
 - [ ] Executor deployed, deployed address recorded
 - [ ] FundDistributor deployed, deployed address recorded
 - [ ] `owner()` == multisig (Executor)
 - [ ] Multisig code.length > 0
-- [ ] `setPool(aaveV3Pool)` executed by multisig, slot 1 confirmed
+- [ ] `setPool(aaveV3Pool)` executed by multisig, `pool()` confirmed
+- [ ] `setWorker(worker,true)` executed by multisig, `isWorker(worker)` confirmed
 
 ### Auth Tests
-- [ ] Non-owner `exec()` → `Unauthorized()` (0x82b42900)
+- [ ] Unauthorized `execute(bytes)` → `Unauthorized()` (0x82b42900)
 - [ ] Non-owner `withdraw()` → `Unauthorized()` (0x82b42900)
-- [ ] Non-pool `executeOperation` → `InvalidPool()` (0xd0363b78)
+- [ ] Non-pool `executeOperation` → `InvalidPool()` (0x2083cd40)
 - [ ] Non-owner `setPool()` → `Unauthorized()` (0x82b42900)
+- [ ] Non-owner `setWorker()` → `Unauthorized()` (0x82b42900)
 - [ ] Owner `withdraw()` staticcall passes
 
 ### Smoke Test
-- [ ] End-to-end liquidation on Base Sepolia OR shadow-mode boot test
-- [ ] `Profit` event confirmed or no panic in shadow boot
+- [ ] End-to-end `Executor.execute(bytes)` liquidation OR contract/harness fallback
+- [ ] `Profit` event and retained Executor profit confirmed when liquidation runs
 
 ### Block Explorer
 - [ ] Executor source verified on Basescan Sepolia
@@ -735,12 +803,12 @@ checked:
 
 | Error | Selector | Defined at |
 | --- | --- | --- |
-| `ProfitGateFailed()` | `0x2e5a0d02` | Executor.yul:51 |
-| `AtomicFail()` | `0x5fe2e75c` | Executor.yul:52 |
-| `Unauthorized()` | `0x82b42900` | Executor.yul:53 |
-| `InvalidDexRouter()` | `0x8d4f59a9` | Executor.yul:54 |
-| `InvalidPool()` | `0xd0363b78` | Executor.yul:55 |
-| `WithdrawFailed()` | `0xf1620b3e` | Executor.yul:56 |
+| `ProfitGateFailed()` | `0x9b89663c` | Active Yul constant |
+| `AtomicFail()` | `0xc4cae92f` | Active Yul constant |
+| `Unauthorized()` | `0x82b42900` | Active Yul constant |
+| `InvalidDexRouter()` | `0xd7c4b506` | Active Yul constant |
+| `InvalidPool()` | `0x2083cd40` | Active Yul constant |
+| `WithdrawFailed()` | `0x750b219c` | Active Yul constant |
 
 ## C. Troubleshooting Quick Reference
 
@@ -750,6 +818,8 @@ checked:
 | `forge script` fails "executor deploy failed" | CREATE reverted (gas, nonce, or bytecode) | Increase gas multiplier; check deployer balance |
 | `cast call owner()` returns wrong address | Constructor arg not appended correctly | Re-run deploy script with correct `CHIMERA_MULTISIG` |
 | `setPool` call reverts | Caller is not the multisig | Confirm `cast call` uses `--from $CHIMERA_MULTISIG` |
+| `execute(bytes)` returns `Unauthorized()` | Worker was not enabled or was revoked | Confirm `isWorker($WORKER_ADDRESS)` and have multisig call `setWorker(...,true)` |
+| Base Sepolia binary boot fails as unsupported | `main.rs` rejects chain ID 84532 | Use contract rehearsal/Foundry harness; do not claim runtime support |
 | Slither fails on `Executor.yul` | Slither cannot analyze Yul | Already excluded in `slither.config.json` `filter_paths` |
 | `cargo test` fails after config edits | Config validation rejected a value | Check pacing.yaml against invariants in `config.rs::validate()` |
 | Cannot verify Yul contract on Basescan | Yul not natively supported | Use bytecode verification tab; provide source inline |

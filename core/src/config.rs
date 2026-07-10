@@ -1,5 +1,6 @@
-﻿//! Configuration loading and validation for Chimera.
+//! Configuration loading and validation for Chimera.
 use crate::ChimeraError;
+use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -166,7 +167,8 @@ impl PacingConfig {
     /// Load from YAML, then override any field with a matching `CHIMERA_*` env var
     /// (e.g. `CHIMERA_MAX_DAILY_NET_USD` overrides `max_daily_net_usd`).
     pub fn load_with_env(path: impl AsRef<Path>) -> Result<Self, ChimeraError> {
-        let mut cfg = Self::load(path)?;
+        let contents = std::fs::read_to_string(path)?;
+        let mut cfg: PacingConfig = serde_yaml::from_str(&contents)?;
         cfg.apply_env_overrides()?;
         cfg.validate()?;
         Ok(cfg)
@@ -180,7 +182,7 @@ impl PacingConfig {
     }
 
     /// Validate hard invariants. Never relax without explicit operator decision.
-    fn validate(&self) -> Result<(), ChimeraError> {
+    pub fn validate(&self) -> Result<(), ChimeraError> {
         if self.max_daily_net_usd > Decimal::from(2000) {
             return Err(ChimeraError::ConfigError(
                 "max_daily_net_usd exceeds conservative risk threshold (2000)".into(),
@@ -211,32 +213,129 @@ impl PacingConfig {
                 "metrics_port must be > 1024 and < 65535".into(),
             ));
         }
+        Self::parse_nonzero_address("eth_usd_feed_address", &self.eth_usd_feed_address)?;
+        if self.execute_mode == "live" {
+            self.validate_live_fields()?;
+            self.validate_live_paths()?;
+        }
         Ok(())
     }
 
-    /// Validate `execute_mode` transition from shadow to live.
-    /// Requires a 7-day shadow period tracked in external state (`shadow_since`).
+    /// Validate live-only values without touching the filesystem. Keeping this
+    /// separate makes address and required-field validation deterministic in tests.
+    fn validate_live_fields(&self) -> Result<(), ChimeraError> {
+        for (field, value) in [
+            ("executor_address", self.executor_address.as_str()),
+            ("treasury_address", self.treasury_address.as_str()),
+            ("treasury_keystore", self.treasury_keystore.as_str()),
+            ("worker_keystore_dir", self.worker_keystore_dir.as_str()),
+            ("eoa_pool_path", self.eoa_pool_path.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ChimeraError::ConfigError(format!(
+                    "execute_mode=live requires nonempty {field}; set it in pacing.yaml or the corresponding CHIMERA_* environment variable"
+                )));
+            }
+        }
+
+        Self::parse_nonzero_address("executor_address", &self.executor_address)?;
+        Self::parse_nonzero_address("treasury_address", &self.treasury_address)?;
+        if self.min_worker_balance_eth <= Decimal::ZERO {
+            return Err(ChimeraError::ConfigError(
+                "execute_mode=live requires min_worker_balance_eth > 0".into(),
+            ));
+        }
+        if self.refund_topup_eth <= Decimal::ZERO {
+            return Err(ChimeraError::ConfigError(
+                "execute_mode=live requires refund_topup_eth > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_live_paths(&self) -> Result<(), ChimeraError> {
+        Self::require_file("treasury_keystore", &self.treasury_keystore)?;
+        Self::require_dir("worker_keystore_dir", &self.worker_keystore_dir)?;
+        Self::require_file("eoa_pool_path", &self.eoa_pool_path)?;
+        Ok(())
+    }
+
+    fn parse_nonzero_address(field: &str, value: &str) -> Result<Address, ChimeraError> {
+        let address = value.parse::<Address>().map_err(|e| {
+            ChimeraError::ConfigError(format!(
+                "{field} must be a valid EVM address; got {value:?}: {e}"
+            ))
+        })?;
+        if address == Address::ZERO {
+            return Err(ChimeraError::ConfigError(format!(
+                "{field} must not be the zero address"
+            )));
+        }
+        Ok(address)
+    }
+
+    fn require_file(field: &str, value: &str) -> Result<(), ChimeraError> {
+        let path = Path::new(value);
+        if !path.exists() {
+            return Err(ChimeraError::ConfigError(format!(
+                "execute_mode=live {field} does not exist: {}",
+                path.display()
+            )));
+        }
+        if !path.is_file() {
+            return Err(ChimeraError::ConfigError(format!(
+                "execute_mode=live {field} must be a file: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_dir(field: &str, value: &str) -> Result<(), ChimeraError> {
+        let path = Path::new(value);
+        if !path.exists() {
+            return Err(ChimeraError::ConfigError(format!(
+                "execute_mode=live {field} does not exist: {}",
+                path.display()
+            )));
+        }
+        if !path.is_dir() {
+            return Err(ChimeraError::ConfigError(format!(
+                "execute_mode=live {field} must be a directory: {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate the shadow soak whenever the effective `execute_mode` is live.
+    /// Requires a 7-day shadow period tracked in external state (`shadow_since`),
+    /// regardless of the informational `previous_mode` value.
     pub fn validate_mode_transition(
         &self,
-        previous_mode: &str,
+        _previous_mode: &str,
         shadow_since: Option<SystemTime>,
     ) -> Result<(), ChimeraError> {
-        if previous_mode == "shadow" && self.execute_mode == "live" {
+        if self.execute_mode == "live" {
             match shadow_since {
                 Some(since) => {
-                    let elapsed = since.elapsed().map_err(|e| {
-                        ChimeraError::ConfigError(format!("Invalid shadow_since timestamp: {e}"))
+                    let elapsed = SystemTime::now().duration_since(since).map_err(|_| {
+                        ChimeraError::ConfigError(
+                            "execute_mode=live requires shadow_since to be a valid past timestamp; correct the future timestamp in mode state"
+                                .into(),
+                        )
                     })?;
                     if elapsed.as_secs() < 7 * 24 * 60 * 60 {
-                        return Err(ChimeraError::ConfigError(
-                            "execute_mode transition from shadow to live requires 7-day shadow period"
-                                .into(),
-                        ));
+                        return Err(ChimeraError::ConfigError(format!(
+                            "execute_mode=live requires shadow_since to be at least 604800 seconds old; current age is {} seconds, so wait at least {} more seconds",
+                            elapsed.as_secs(),
+                            7 * 24 * 60 * 60 - elapsed.as_secs()
+                        )));
                     }
                 }
                 None => {
                     return Err(ChimeraError::ConfigError(
-                        "execute_mode transition from shadow to live requires shadow_since timestamp in state"
+                        "execute_mode=live requires a stamped shadow_since timestamp in mode state; run scripts/toggle_shadow.py --set-shadow and complete the 7-day soak"
                             .into(),
                     ));
                 }
@@ -265,38 +364,100 @@ impl PacingConfig {
             };
         }
 
-        override_decimal!("CHIMERA_MAX_DAILY_NET_USD",        self.max_daily_net_usd);
-        override_decimal!("CHIMERA_MAX_WEEKLY_NET_USD",       self.max_weekly_net_usd);
-        override_decimal!("CHIMERA_MAX_SINGLE_TRANSFER_USD",  self.max_single_transfer_usd);
-        override_decimal!("CHIMERA_MAX_DAILY_LOSS_ETH",       self.max_daily_loss_eth);
-        override_decimal!("CHIMERA_MIN_PROFIT_MULTIPLIER",    self.min_profit_multiplier);
-        override_decimal!("CHIMERA_ETH_PRICE_USD_FALLBACK",   self.eth_price_usd_fallback);
+        override_decimal!("CHIMERA_MAX_DAILY_NET_USD", self.max_daily_net_usd);
+        override_decimal!("CHIMERA_MAX_WEEKLY_NET_USD", self.max_weekly_net_usd);
+        override_decimal!(
+            "CHIMERA_MAX_SINGLE_TRANSFER_USD",
+            self.max_single_transfer_usd
+        );
+        override_decimal!("CHIMERA_MAX_DAILY_LOSS_ETH", self.max_daily_loss_eth);
+        override_decimal!("CHIMERA_MIN_PROFIT_MULTIPLIER", self.min_profit_multiplier);
+        override_decimal!(
+            "CHIMERA_ETH_PRICE_USD_FALLBACK",
+            self.eth_price_usd_fallback
+        );
 
-        override_parse!("CHIMERA_MIN_INTERVAL_HOURS",        self.min_interval_hours,        u64);
-        override_parse!("CHIMERA_MAX_JITTER_HOURS",          self.max_jitter_hours,          u64);
-        override_parse!("CHIMERA_VENUE_ROTATION_COUNT",      self.venue_rotation_count,      u64);
-        override_parse!("CHIMERA_CLEAN_EOA_POOL_SIZE",       self.clean_eoa_pool_size,       usize);
-        override_parse!("CHIMERA_AUTO_HALT_ON_REVERTS",      self.auto_halt_on_reverts,      u32);
-        override_parse!("CHIMERA_MAX_GAS_GWEI",              self.max_gas_gwei,              u64);
-        override_parse!("CHIMERA_METRICS_PORT",              self.metrics_port,              u16);
-        override_parse!("CHIMERA_CHAIN_ID",                  self.chain_id,                  u64);
-        override_parse!("CHIMERA_ORACLE_STALENESS_SECONDS",  self.oracle_staleness_seconds,  u64);
+        override_parse!("CHIMERA_MIN_INTERVAL_HOURS", self.min_interval_hours, u64);
+        override_parse!("CHIMERA_MAX_JITTER_HOURS", self.max_jitter_hours, u64);
+        override_parse!(
+            "CHIMERA_VENUE_ROTATION_COUNT",
+            self.venue_rotation_count,
+            u64
+        );
+        override_parse!(
+            "CHIMERA_CLEAN_EOA_POOL_SIZE",
+            self.clean_eoa_pool_size,
+            usize
+        );
+        override_parse!(
+            "CHIMERA_AUTO_HALT_ON_REVERTS",
+            self.auto_halt_on_reverts,
+            u32
+        );
+        override_parse!("CHIMERA_MAX_GAS_GWEI", self.max_gas_gwei, u64);
+        override_parse!("CHIMERA_METRICS_PORT", self.metrics_port, u16);
+        override_parse!("CHIMERA_CHAIN_ID", self.chain_id, u64);
+        override_parse!(
+            "CHIMERA_ORACLE_STALENESS_SECONDS",
+            self.oracle_staleness_seconds,
+            u64
+        );
 
-        if let Ok(v) = std::env::var("CHIMERA_EXECUTE_MODE") { self.execute_mode = v; }
-        if let Ok(v) = std::env::var("CHIMERA_LOG_LEVEL")    { self.log_level    = v; }
-        if let Ok(v) = std::env::var("CHIMERA_ETH_USD_FEED_ADDRESS")    { self.eth_usd_feed_address    = v; }
-        if let Ok(v) = std::env::var("CHIMERA_EOA_POOL_PATH")    { self.eoa_pool_path    = v; }
-        if let Ok(v) = std::env::var("CHIMERA_POOLS_TOML_PATH")  { self.pools_toml_path  = v; }
-        if let Ok(v) = std::env::var("CHIMERA_EXECUTOR_ADDRESS") { self.executor_address = v; }
-        if let Ok(v) = std::env::var("CHIMERA_TREASURY_ADDRESS") { self.treasury_address = v; }
-        if let Ok(v) = std::env::var("CHIMERA_TREASURY_KEYSTORE") { self.treasury_keystore = v; }
-        if let Ok(v) = std::env::var("CHIMERA_WORKER_KEYSTORE_DIR") { self.worker_keystore_dir = v; }
+        if let Ok(v) = std::env::var("CHIMERA_EXECUTE_MODE") {
+            self.execute_mode = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_LOG_LEVEL") {
+            self.log_level = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_ETH_USD_FEED_ADDRESS") {
+            self.eth_usd_feed_address = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_EOA_POOL_PATH") {
+            self.eoa_pool_path = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_POOLS_TOML_PATH") {
+            self.pools_toml_path = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_EXECUTOR_ADDRESS") {
+            self.executor_address = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_TREASURY_ADDRESS") {
+            self.treasury_address = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_TREASURY_KEYSTORE") {
+            self.treasury_keystore = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_WORKER_KEYSTORE_DIR") {
+            self.worker_keystore_dir = v;
+        }
         override_parse!("CHIMERA_SWEEP_INTERVAL_SECS", self.sweep_interval_secs, u64);
-        override_parse!("CHIMERA_REFUND_INTERVAL_SECS", self.refund_interval_secs, u64);
-        override_decimal!("CHIMERA_MIN_WORKER_BALANCE_ETH", self.min_worker_balance_eth);
+        override_parse!(
+            "CHIMERA_REFUND_INTERVAL_SECS",
+            self.refund_interval_secs,
+            u64
+        );
+        override_decimal!(
+            "CHIMERA_MIN_WORKER_BALANCE_ETH",
+            self.min_worker_balance_eth
+        );
         override_decimal!("CHIMERA_REFUND_TOPUP_ETH", self.refund_topup_eth);
+        override_parse!(
+            "CHIMERA_RECENT_OUTCOMES_CAPACITY",
+            self.recent_outcomes_capacity,
+            usize
+        );
+        override_decimal!("CHIMERA_SWEEP_MIN_KEEP_ETH", self.sweep_min_keep_eth);
+        if let Ok(v) = std::env::var("CHIMERA_SWEEP_TOKENS") {
+            self.sweep_tokens = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
 
-        if let Ok(v) = std::env::var("CHIMERA_WS_ENDPOINT") { self.ws_endpoint = v; }
+        if let Ok(v) = std::env::var("CHIMERA_WS_ENDPOINT") {
+            self.ws_endpoint = v;
+        }
 
         Ok(())
     }
@@ -306,11 +467,81 @@ impl PacingConfig {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
     use tempfile::NamedTempFile;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const PACING_ENV_KEYS: &[&str] = &[
+        "CHIMERA_MAX_DAILY_NET_USD",
+        "CHIMERA_MAX_WEEKLY_NET_USD",
+        "CHIMERA_MAX_SINGLE_TRANSFER_USD",
+        "CHIMERA_MAX_DAILY_LOSS_ETH",
+        "CHIMERA_MIN_PROFIT_MULTIPLIER",
+        "CHIMERA_ETH_PRICE_USD_FALLBACK",
+        "CHIMERA_MIN_INTERVAL_HOURS",
+        "CHIMERA_MAX_JITTER_HOURS",
+        "CHIMERA_VENUE_ROTATION_COUNT",
+        "CHIMERA_CLEAN_EOA_POOL_SIZE",
+        "CHIMERA_AUTO_HALT_ON_REVERTS",
+        "CHIMERA_MAX_GAS_GWEI",
+        "CHIMERA_METRICS_PORT",
+        "CHIMERA_CHAIN_ID",
+        "CHIMERA_ORACLE_STALENESS_SECONDS",
+        "CHIMERA_EXECUTE_MODE",
+        "CHIMERA_LOG_LEVEL",
+        "CHIMERA_ETH_USD_FEED_ADDRESS",
+        "CHIMERA_EOA_POOL_PATH",
+        "CHIMERA_POOLS_TOML_PATH",
+        "CHIMERA_EXECUTOR_ADDRESS",
+        "CHIMERA_TREASURY_ADDRESS",
+        "CHIMERA_TREASURY_KEYSTORE",
+        "CHIMERA_WORKER_KEYSTORE_DIR",
+        "CHIMERA_SWEEP_INTERVAL_SECS",
+        "CHIMERA_REFUND_INTERVAL_SECS",
+        "CHIMERA_MIN_WORKER_BALANCE_ETH",
+        "CHIMERA_REFUND_TOPUP_ETH",
+        "CHIMERA_RECENT_OUTCOMES_CAPACITY",
+        "CHIMERA_SWEEP_MIN_KEEP_ETH",
+        "CHIMERA_SWEEP_TOKENS",
+        "CHIMERA_WS_ENDPOINT",
+    ];
+
+    struct PacingEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl PacingEnvGuard {
+        fn new() -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = PACING_ENV_KEYS
+                .iter()
+                .map(|&key| (key, std::env::var(key).ok()))
+                .collect();
+            for &key in PACING_ENV_KEYS {
+                std::env::remove_var(key);
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for PacingEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.previous {
+                match value {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
 
     fn valid_yaml() -> String {
         "max_daily_net_usd: 2000
@@ -345,7 +576,8 @@ refund_topup_eth: 0.05
 sweep_tokens: []
 sweep_min_keep_eth: 0.005
 ws_endpoint: \"\"
-".to_string()
+"
+        .to_string()
     }
 
     #[test]
@@ -353,16 +585,19 @@ ws_endpoint: \"\"
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "{}", valid_yaml()).unwrap();
         let cfg = PacingConfig::load(tmp.path()).unwrap();
-        assert_eq!(cfg.max_daily_net_usd,       Decimal::from(2000));
-        assert_eq!(cfg.max_weekly_net_usd,      Decimal::from(7500));
+        assert_eq!(cfg.max_daily_net_usd, Decimal::from(2000));
+        assert_eq!(cfg.max_weekly_net_usd, Decimal::from(7500));
         assert_eq!(cfg.max_single_transfer_usd, Decimal::from(1000));
-        assert_eq!(cfg.execute_mode,            "shadow");
-        assert_eq!(cfg.chain_id,                8453);
+        assert_eq!(cfg.execute_mode, "shadow");
+        assert_eq!(cfg.chain_id, 8453);
         assert_eq!(cfg.oracle_staleness_seconds, 300);
-        assert_eq!(cfg.eth_price_usd_fallback,  Decimal::from(1800));
-        assert_eq!(cfg.eth_usd_feed_address,   "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b");
-        assert_eq!(cfg.eoa_pool_path,           "config/eoa_pool.json");
-        assert_eq!(cfg.pools_toml_path,         "config/pools.toml");
+        assert_eq!(cfg.eth_price_usd_fallback, Decimal::from(1800));
+        assert_eq!(
+            cfg.eth_usd_feed_address,
+            "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b"
+        );
+        assert_eq!(cfg.eoa_pool_path, "config/eoa_pool.json");
+        assert_eq!(cfg.pools_toml_path, "config/pools.toml");
     }
 
     #[test]
@@ -375,19 +610,45 @@ ws_endpoint: \"\"
     }
 
     #[test]
-    fn test_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
+    fn test_env_override_recent_outcomes_capacity() {
+        let _guard = PacingEnvGuard::new();
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "{}", valid_yaml()).unwrap();
-        std::env::remove_var("CHIMERA_CHAIN_ID");
-        std::env::remove_var("CHIMERA_MAX_WEEKLY_NET_USD");
+        std::env::set_var("CHIMERA_RECENT_OUTCOMES_CAPACITY", "256");
+        let cfg = PacingConfig::load_with_env(tmp.path()).unwrap();
+        assert_eq!(cfg.recent_outcomes_capacity, 256);
+    }
+
+    #[test]
+    fn test_env_override_sweep_min_keep_eth() {
+        let _guard = PacingEnvGuard::new();
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_yaml()).unwrap();
+        std::env::set_var("CHIMERA_SWEEP_MIN_KEEP_ETH", "0.01");
+        let cfg = PacingConfig::load_with_env(tmp.path()).unwrap();
+        assert_eq!(cfg.sweep_min_keep_eth, Decimal::from_str("0.01").unwrap());
+    }
+
+    #[test]
+    fn test_env_override_sweep_tokens() {
+        let _guard = PacingEnvGuard::new();
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_yaml()).unwrap();
+        std::env::set_var("CHIMERA_SWEEP_TOKENS", "0xUSDC,0xUSDT , 0xDAI");
+        let cfg = PacingConfig::load_with_env(tmp.path()).unwrap();
+        assert_eq!(cfg.sweep_tokens, vec!["0xUSDC", "0xUSDT", "0xDAI"]);
+    }
+
+    #[test]
+    fn test_env_override() {
+        let _guard = PacingEnvGuard::new();
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_yaml()).unwrap();
         std::env::set_var("CHIMERA_MAX_WEEKLY_NET_USD", "4999");
         std::env::set_var("CHIMERA_CHAIN_ID", "1");
         let cfg = PacingConfig::load_with_env(tmp.path()).unwrap();
         assert_eq!(cfg.max_weekly_net_usd, Decimal::from(4999));
         assert_eq!(cfg.chain_id, 1);
-        std::env::remove_var("CHIMERA_MAX_WEEKLY_NET_USD");
-        std::env::remove_var("CHIMERA_CHAIN_ID");
     }
 
     #[test]
@@ -415,6 +676,109 @@ ws_endpoint: \"\"
     }
 
     #[test]
+    fn test_rejects_invalid_or_zero_eth_usd_feed() {
+        let mut cfg = PacingConfig::default();
+        cfg.eth_usd_feed_address = "not-an-address".into();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("eth_usd_feed_address"));
+
+        cfg.eth_usd_feed_address = format!("{:#x}", Address::ZERO);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("zero address"));
+    }
+
+    #[test]
+    fn test_live_field_validation_is_pure_and_actionable() {
+        let mut cfg = PacingConfig {
+            execute_mode: "live".into(),
+            ..PacingConfig::default()
+        };
+        assert!(cfg
+            .validate_live_fields()
+            .unwrap_err()
+            .to_string()
+            .contains("executor_address"));
+
+        cfg.executor_address = "0x1111111111111111111111111111111111111111".into();
+        cfg.treasury_address = "0x2222222222222222222222222222222222222222".into();
+        cfg.treasury_keystore = "not-created-treasury.json".into();
+        cfg.worker_keystore_dir = "not-created-workers".into();
+        cfg.eoa_pool_path = "not-created-pool.json".into();
+        cfg.validate_live_fields()
+            .expect("pure live field validation must not require real keystores");
+    }
+
+    #[test]
+    fn test_executor_address_validation_is_nonzero_and_live_only() {
+        let mut cfg = PacingConfig {
+            executor_address: format!("{:#x}", Address::ZERO),
+            ..PacingConfig::default()
+        };
+        cfg.validate()
+            .expect("shadow config must not require or validate executor_address");
+
+        cfg.execute_mode = "live".into();
+        cfg.treasury_address = "0x2222222222222222222222222222222222222222".into();
+        cfg.treasury_keystore = "treasury.json".into();
+        cfg.worker_keystore_dir = "workers".into();
+        cfg.eoa_pool_path = "eoa_pool.json".into();
+        let error = cfg.validate_live_fields().unwrap_err().to_string();
+        assert!(error.contains("executor_address"));
+        assert!(error.contains("zero address"));
+    }
+
+    #[test]
+    fn test_live_validation_requires_positive_refund_topup() {
+        let cfg = PacingConfig {
+            execute_mode: "live".into(),
+            executor_address: "0x1111111111111111111111111111111111111111".into(),
+            treasury_address: "0x2222222222222222222222222222222222222222".into(),
+            treasury_keystore: "treasury.json".into(),
+            worker_keystore_dir: "workers".into(),
+            eoa_pool_path: "eoa_pool.json".into(),
+            refund_topup_eth: Decimal::ZERO,
+            ..PacingConfig::default()
+        };
+
+        let error = cfg.validate_live_fields().unwrap_err().to_string();
+        assert!(error.contains("refund_topup_eth > 0"));
+    }
+
+    #[test]
+    fn test_live_validation_requires_correct_path_types() {
+        let treasury = NamedTempFile::new().unwrap();
+        let pool = NamedTempFile::new().unwrap();
+        let workers = tempfile::tempdir().unwrap();
+        let cfg = PacingConfig {
+            execute_mode: "live".into(),
+            executor_address: "0x1111111111111111111111111111111111111111".into(),
+            treasury_address: "0x2222222222222222222222222222222222222222".into(),
+            treasury_keystore: treasury.path().to_string_lossy().into_owned(),
+            worker_keystore_dir: workers.path().to_string_lossy().into_owned(),
+            eoa_pool_path: pool.path().to_string_lossy().into_owned(),
+            ..PacingConfig::default()
+        };
+        cfg.validate()
+            .expect("valid live path types should pass config validation");
+
+        let wrong_type = PacingConfig {
+            worker_keystore_dir: treasury.path().to_string_lossy().into_owned(),
+            ..cfg
+        };
+        assert!(wrong_type
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be a directory"));
+    }
+
+    #[test]
     fn test_validate_mode_transition_requires_shadow_period() {
         let cfg = PacingConfig {
             execute_mode: "live".into(),
@@ -431,16 +795,40 @@ ws_endpoint: \"\"
         let old = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
         let result = cfg.validate_mode_transition("shadow", Some(old));
         assert!(result.is_ok());
-        // No transition (already live) => succeeds
+
+        // A stored previous_mode=live cannot bypass the same checks.
         let result = cfg.validate_mode_transition("live", None);
+        assert!(result.is_err());
+        let result = cfg.validate_mode_transition("live", Some(recent));
+        assert!(result.is_err());
+        let result = cfg.validate_mode_transition("live", Some(old));
         assert!(result.is_ok());
     }
 
     #[test]
+    fn test_validate_mode_transition_allows_effective_shadow_mode() {
+        let cfg = PacingConfig::default();
+        cfg.validate_mode_transition("live", None)
+            .expect("effective shadow mode must not require a shadow_since timestamp");
+    }
+
+    #[test]
+    fn test_validate_mode_transition_rejects_future_shadow_timestamp() {
+        let cfg = PacingConfig {
+            execute_mode: "live".into(),
+            ..PacingConfig::default()
+        };
+        let future = SystemTime::now() + Duration::from_secs(60 * 60);
+        let error = cfg
+            .validate_mode_transition("live", Some(future))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("future"));
+    }
+
+    #[test]
     fn test_reload() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CHIMERA_MAX_DAILY_NET_USD");
-        std::env::remove_var("CHIMERA_CHAIN_ID");
+        let _guard = PacingEnvGuard::new();
         let mut tmp = NamedTempFile::new().unwrap();
         writeln!(tmp, "{}", valid_yaml()).unwrap();
         let mut cfg = PacingConfig::load(tmp.path()).unwrap();
@@ -548,12 +936,12 @@ impl RiskConfig {
 }
 
 // ---------------------------------------------------------------------------
-// StrategyParams — ABI layout matching Executor.yul (9 * 32 = 288 bytes)
+// StrategyParams — nine-word strategy tail inside Executor execute(bytes)
 // ---------------------------------------------------------------------------
 
-/// StrategyParams — explicit 9-word (288-byte) ABI layout for Executor.yul.
-/// Every field occupies a full 32-byte word; addresses are left-padded to 32 bytes.
-/// Field order matches Yul `calldataload` offsets documented in Executor.yul:85.
+/// Explicit nine-word (288-byte) strategy tail. In the deployed Executor's
+/// eleven-word `execute(bytes)` payload, these fields occupy words 2 through 10
+/// after the debt asset and flash-loan amount.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StrategyParams {
     /// word 0: collateralAsset (address, left-padded)
@@ -658,10 +1046,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             primary: "alchemy-base-private".into(),
-            fallbacks: vec![
-                "public-base-rpc".into(),
-                "public-arbitrum-rpc".into(),
-            ],
+            fallbacks: vec!["public-base-rpc".into(), "public-arbitrum-rpc".into()],
             submission_style: "single_atomic_tx".into(),
             venues: Vec::new(),
             forensic_tag_sources: Vec::new(),
@@ -772,15 +1157,15 @@ forensic_tag_sources:
         writeln!(tmp, "{}", valid_risk_yaml()).unwrap();
         let cfg = RiskConfig::load(tmp.path()).unwrap();
         let defaults = RiskConfig::default();
-        assert_eq!(cfg.max_loss_eth,           defaults.max_loss_eth);
-        assert_eq!(cfg.min_profit,             defaults.min_profit);
-        assert_eq!(cfg.auto_halt_reverts,      defaults.auto_halt_reverts);
-        assert_eq!(cfg.max_gas_gwei,           defaults.max_gas_gwei);
-        assert_eq!(cfg.slippage_max_bps,       defaults.slippage_max_bps);
-        assert_eq!(cfg.simulation_timeout_ms,  defaults.simulation_timeout_ms);
-        assert_eq!(cfg.l1_fee_scalar_buffer,   defaults.l1_fee_scalar_buffer);
-        assert_eq!(cfg.sequencer_stall_ms,     defaults.sequencer_stall_ms);
-        assert_eq!(cfg.bounty_min_severity,    defaults.bounty_min_severity);
+        assert_eq!(cfg.max_loss_eth, defaults.max_loss_eth);
+        assert_eq!(cfg.min_profit, defaults.min_profit);
+        assert_eq!(cfg.auto_halt_reverts, defaults.auto_halt_reverts);
+        assert_eq!(cfg.max_gas_gwei, defaults.max_gas_gwei);
+        assert_eq!(cfg.slippage_max_bps, defaults.slippage_max_bps);
+        assert_eq!(cfg.simulation_timeout_ms, defaults.simulation_timeout_ms);
+        assert_eq!(cfg.l1_fee_scalar_buffer, defaults.l1_fee_scalar_buffer);
+        assert_eq!(cfg.sequencer_stall_ms, defaults.sequencer_stall_ms);
+        assert_eq!(cfg.bounty_min_severity, defaults.bounty_min_severity);
     }
 
     #[test]
@@ -802,7 +1187,8 @@ forensic_tag_sources:
     #[test]
     fn test_risk_config_rejects_low_l1_buffer() {
         let mut tmp = NamedTempFile::new().unwrap();
-        let yaml = valid_risk_yaml().replace("l1_fee_scalar_buffer: 1.15", "l1_fee_scalar_buffer: 0.9");
+        let yaml =
+            valid_risk_yaml().replace("l1_fee_scalar_buffer: 1.15", "l1_fee_scalar_buffer: 0.9");
         writeln!(tmp, "{}", yaml).unwrap();
         assert!(RiskConfig::load(tmp.path()).is_err());
     }
@@ -868,7 +1254,8 @@ forensic_tag_sources:
     #[test]
     fn test_routing_rejects_low_liquidity_venue() {
         let mut tmp = NamedTempFile::new().unwrap();
-        let yaml = valid_routing_yaml().replace("liquidity_usd_min: 50000", "liquidity_usd_min: 10000");
+        let yaml =
+            valid_routing_yaml().replace("liquidity_usd_min: 50000", "liquidity_usd_min: 10000");
         writeln!(tmp, "{}", yaml).unwrap();
         assert!(RoutingConfig::load(tmp.path()).is_err());
     }
@@ -876,7 +1263,10 @@ forensic_tag_sources:
     #[test]
     fn test_routing_rejects_invalid_submission_style() {
         let mut tmp = NamedTempFile::new().unwrap();
-        let yaml = valid_routing_yaml().replace("submission_style: single_atomic_tx", "submission_style: flashbots_bundle");
+        let yaml = valid_routing_yaml().replace(
+            "submission_style: single_atomic_tx",
+            "submission_style: flashbots_bundle",
+        );
         writeln!(tmp, "{}", yaml).unwrap();
         assert!(RoutingConfig::load(tmp.path()).is_err());
     }
@@ -884,7 +1274,11 @@ forensic_tag_sources:
     #[test]
     fn test_disk_risk_yaml_parses() {
         let path = std::path::Path::new("../config/risk.yaml");
-        let path = if path.exists() { path } else { std::path::Path::new("config/risk.yaml") };
+        let path = if path.exists() {
+            path
+        } else {
+            std::path::Path::new("config/risk.yaml")
+        };
         if path.exists() {
             RiskConfig::load(path).expect("config/risk.yaml must parse as RiskConfig");
         }
@@ -893,21 +1287,33 @@ forensic_tag_sources:
     #[test]
     fn test_routing_yaml_new_fields_present() {
         let path = std::path::Path::new("../config/routing.yaml");
-        let path = if path.exists() { path } else { std::path::Path::new("config/routing.yaml") };
+        let path = if path.exists() {
+            path
+        } else {
+            std::path::Path::new("config/routing.yaml")
+        };
         if path.exists() {
             let cfg = RoutingConfig::load(path).expect("routing.yaml must parse");
             // At least one venue must have the new T3 routing fields populated
-            let has_new_fields = cfg.venues.iter().any(|v| {
-                !v.router_address.is_empty() && !v.pairs.is_empty()
-            });
-            assert!(has_new_fields, "checked-in routing.yaml must contain router_address + pairs for ≥1 venue");
+            let has_new_fields = cfg
+                .venues
+                .iter()
+                .any(|v| !v.router_address.is_empty() && !v.pairs.is_empty());
+            assert!(
+                has_new_fields,
+                "checked-in routing.yaml must contain router_address + pairs for ≥1 venue"
+            );
         }
     }
 
     #[test]
     fn test_disk_routing_yaml_parses() {
         let path = std::path::Path::new("../config/routing.yaml");
-        let path = if path.exists() { path } else { std::path::Path::new("config/routing.yaml") };
+        let path = if path.exists() {
+            path
+        } else {
+            std::path::Path::new("config/routing.yaml")
+        };
         if path.exists() {
             RoutingConfig::load(path).expect("config/routing.yaml must parse as RoutingConfig");
         }
@@ -939,9 +1345,13 @@ forensic_tag_sources:
         p.deadline[24..32].copy_from_slice(&999999u64.to_be_bytes());
 
         let encoded = p.encode();
-        assert_eq!(encoded.len(), 288, "StrategyParams must encode to exactly 288 bytes");
+        assert_eq!(
+            encoded.len(),
+            288,
+            "StrategyParams must encode to exactly 288 bytes"
+        );
 
-        // Offsets documented in Executor.yul:99-107
+        // Offsets within the nine-word strategy tail.
         assert_eq!(&encoded[0..32], &p.collateral_asset, "word0 offset 0");
         assert_eq!(&encoded[32..64], &p.user_to_liquidate, "word1 offset 32");
         assert_eq!(&encoded[64..96], &p.debt_to_cover, "word2 offset 64");
@@ -953,5 +1363,3 @@ forensic_tag_sources:
         assert_eq!(&encoded[256..288], &p.deadline, "word8 offset 256");
     }
 }
-
-

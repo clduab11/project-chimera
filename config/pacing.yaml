@@ -36,6 +36,8 @@ eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b"
 recent_outcomes_capacity: 128
 eoa_pool_path: config/eoa_pool.json
 pools_toml_path: config/pools.toml
+# Operator runtime fields are intentionally empty in the checked-in shadow config.
+# Set them through CHIMERA_* environment variables or a deployment-local config before live startup.
 executor_address: ""
 treasury_address: ""
 treasury_keystore: ""

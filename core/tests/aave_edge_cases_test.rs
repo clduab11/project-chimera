@@ -130,19 +130,28 @@ fn test_frozen_reserve_excluded_from_candidates() {
     // Control: seizable collateral => one candidate targeting COLL_A.
     let active = mk_reserve(usd8(1000), 8000, 10500);
     let det = LiquidationDetector::new(
-        snapshot(base_reserves(active), vec![(Address::from(USER), base_user())]),
+        snapshot(
+            base_reserves(active),
+            vec![(Address::from(USER), base_user())],
+        ),
         8453,
     );
     let candidates = det.find_at_risk_positions();
     assert_eq!(candidates.len(), 1, "seizable collateral should be emitted");
     assert_eq!(candidates[0].collateral_asset, Address::from(COLL_A));
-    assert!(!candidates[0].bad_debt, "emitted candidate must not be bad debt");
+    assert!(
+        !candidates[0].bad_debt,
+        "emitted candidate must not be bad debt"
+    );
 
     // Frozen collateral => excluded => no candidate.
     let mut frozen = mk_reserve(usd8(1000), 8000, 10500);
     frozen.frozen = true;
     let det = LiquidationDetector::new(
-        snapshot(base_reserves(frozen), vec![(Address::from(USER), base_user())]),
+        snapshot(
+            base_reserves(frozen),
+            vec![(Address::from(USER), base_user())],
+        ),
         8453,
     );
     assert!(
@@ -156,7 +165,10 @@ fn test_paused_reserve_excluded() {
     let mut paused = mk_reserve(usd8(1000), 8000, 10500);
     paused.paused = true;
     let det = LiquidationDetector::new(
-        snapshot(base_reserves(paused), vec![(Address::from(USER), base_user())]),
+        snapshot(
+            base_reserves(paused),
+            vec![(Address::from(USER), base_user())],
+        ),
         8453,
     );
     assert!(
@@ -200,10 +212,7 @@ fn test_bad_debt_position_not_emitted() {
         (Address::from(COLL_A), coll),
         (Address::from(DEBT), mk_reserve(usd8(1000), 8000, 10500)),
     ];
-    let det = LiquidationDetector::new(
-        snapshot(reserves, vec![(Address::from(USER), user)]),
-        8453,
-    );
+    let det = LiquidationDetector::new(snapshot(reserves, vec![(Address::from(USER), user)]), 8453);
     assert!(
         det.find_at_risk_positions().is_empty(),
         "bad-debt position (collateral < debt) must not be emitted"
@@ -221,10 +230,7 @@ fn test_bad_debt_position_not_emitted() {
         (Address::from(COLL_A), coll),
         (Address::from(DEBT), mk_reserve(usd8(1000), 8000, 10500)),
     ];
-    let det = LiquidationDetector::new(
-        snapshot(reserves, vec![(Address::from(USER), user)]),
-        8453,
-    );
+    let det = LiquidationDetector::new(snapshot(reserves, vec![(Address::from(USER), user)]), 8453);
     assert_eq!(
         det.find_at_risk_positions().len(),
         1,
@@ -258,7 +264,10 @@ fn test_emode_raises_liquidation_threshold() {
     // Without eMode (user emode 0): at risk.
     let user_plain = user_position(vec![(COLL_A, coll_bal)], vec![(DEBT, debt_bal)], 0, false);
     let det = LiquidationDetector::new(
-        snapshot(reserves.clone_for_test(), vec![(Address::from(USER), user_plain)]),
+        snapshot(
+            reserves.clone_for_test(),
+            vec![(Address::from(USER), user_plain)],
+        ),
         8453,
     );
     assert_eq!(
@@ -299,15 +308,18 @@ fn test_isolation_mode_position_handled() {
     ];
 
     let collateral = vec![
-        (COLL_ISO, 1_000_000_000_000_000_000u128),       // 1e18
-        (COLL_NONISO, 10_000_000_000_000_000_000u128),   // 10e18
+        (COLL_ISO, 1_000_000_000_000_000_000u128),     // 1e18
+        (COLL_NONISO, 10_000_000_000_000_000_000u128), // 10e18
     ];
     let debt = vec![(DEBT, 950_000_000_000_000_000u128)]; // 9.5e17 => 9.5e20 USD
 
     // Isolated user: only the isolated asset counts => still at risk (collateral NOT overstated).
     let user_iso = user_position(collateral.clone(), debt.clone(), 0, true);
     let det = LiquidationDetector::new(
-        snapshot(reserves.clone_for_test(), vec![(Address::from(USER), user_iso)]),
+        snapshot(
+            reserves.clone_for_test(),
+            vec![(Address::from(USER), user_iso)],
+        ),
         8453,
     );
     assert_eq!(
@@ -363,7 +375,10 @@ fn test_siloed_flag_roundtrips_and_close_factor_single_asset() {
     let snap = MarketSnapshot::load_from_file(&path).expect("snapshot must hydrate");
     let silo = Address::from([0xD4u8; 20]);
     let reserve = snap.reserves.get(&silo).expect("SILO reserve present");
-    assert!(reserve.siloed_borrowing, "siloed_borrowing must round-trip true");
+    assert!(
+        reserve.siloed_borrowing,
+        "siloed_borrowing must round-trip true"
+    );
     assert_eq!(reserve.liquidation_protocol_fee_bps, 1000);
     assert_eq!(reserve.debt_ceiling, U256::from(1_000_000u64));
 
@@ -389,12 +404,12 @@ fn test_siloed_flag_roundtrips_and_close_factor_single_asset() {
         (Address::from(DEBT), debt_reserve),
         (Address::from(DEBT2), debt_reserve2),
     ];
-    let det = LiquidationDetector::new(
-        snapshot(reserves, vec![(Address::from(USER), user)]),
-        8453,
-    );
+    let det = LiquidationDetector::new(snapshot(reserves, vec![(Address::from(USER), user)]), 8453);
     let candidates = det.find_at_risk_positions();
-    assert!(!candidates.is_empty(), "multi-debt at-risk user should be emitted");
+    assert!(
+        !candidates.is_empty(),
+        "multi-debt at-risk user should be emitted"
+    );
     for c in &candidates {
         assert!(
             c.debt_to_cover <= U256::from(max_single),

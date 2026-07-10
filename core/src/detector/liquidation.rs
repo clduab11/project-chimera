@@ -156,9 +156,7 @@ fn parse_addr_or_zero(s: &str) -> Address {
 }
 
 /// Parse a `{ address_string -> decimal_amount_string }` map into `Address -> U256`.
-fn parse_balance_map(
-    raw: HashMap<String, String>,
-) -> Result<HashMap<Address, U256>, ChimeraError> {
+fn parse_balance_map(raw: HashMap<String, String>) -> Result<HashMap<Address, U256>, ChimeraError> {
     let mut out = HashMap::with_capacity(raw.len());
     for (k, v) in raw {
         let asset = Address::from_str(&k).map_err(|e| {
@@ -192,14 +190,17 @@ fn chain_name_to_id(chain: &str) -> u64 {
 
 impl RawSnapshot {
     fn into_market_snapshot(self) -> Result<MarketSnapshot, ChimeraError> {
-            let chain_id = chain_name_to_id(&self.chain);
-            // Index fields now sourced from the snapshot JSON; fall back to RAY for
-            // pre-edge-case snapshots that lack the keys (backward compatible).
+        let chain_id = chain_name_to_id(&self.chain);
+        // Index fields now sourced from the snapshot JSON; fall back to RAY for
+        // pre-edge-case snapshots that lack the keys (backward compatible).
 
-            let mut reserves = HashMap::with_capacity(self.reserves.len());
+        let mut reserves = HashMap::with_capacity(self.reserves.len());
         for r in self.reserves {
             let addr = Address::from_str(&r.address).map_err(|e| {
-                ChimeraError::ConfigError(format!("snapshot bad reserve address {}: {e}", r.address))
+                ChimeraError::ConfigError(format!(
+                    "snapshot bad reserve address {}: {e}",
+                    r.address
+                ))
             })?;
             // Oracle USD price is 8-decimal fixed point (matches detector convention).
             let price_usd = if r.price_usd.is_finite() && r.price_usd > 0.0 {

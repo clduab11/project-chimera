@@ -103,7 +103,10 @@ mod tests {
             assert!(f.get("_verified").is_some(), "Missing _verified field");
             assert!(f.get("_source").is_some(), "Missing _source field");
             assert!(f.get("user").is_some(), "Missing user field");
-            assert!(f.get("debt_to_cover").is_some(), "Missing debt_to_cover field");
+            assert!(
+                f.get("debt_to_cover").is_some(),
+                "Missing debt_to_cover field"
+            );
         }
     }
 }

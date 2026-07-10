@@ -23,7 +23,7 @@ pub struct ResolvedV2Route {
     /// Minimum output amount for the swap leg, computed from
     /// `debt_to_cover` adjusted by flash-loan premium and `slippage_max_bps`.
     ///
-    /// Executor.yul swaps collateral → debt (step 2), so `amountOutMin` is
+    /// The Executor swaps collateral → debt, so `amountOutMin` is
     /// denominated in the debt-asset's units.
     pub amount_out_min: U256,
     /// Name of the DEX venue that resolved the route.
@@ -87,7 +87,7 @@ impl<'a> RoutingResolver<'a> {
             };
 
             // Check if any trading pair matches our collateral→debt swap direction.
-            // Executor.yul swaps seized collateral → debt at step 2;
+            // The Executor swaps seized collateral → debt;
             // pairs in routing.yaml are declared as collateral→debt.
             if let Some(pair) = Self::find_matching_pair(&venue.pairs, collateral, debt) {
                 let amount_out_min =
@@ -112,12 +112,11 @@ impl<'a> RoutingResolver<'a> {
         None
     }
 
-
     /// Find a matching trading pair. Returns `Some((collateral, debt))` if:
     /// - `token_in` == collateral AND `token_out` == debt.
     ///
     /// This matches the routing.yaml config where pairs are declared as collateral→debt,
-    /// consistent with Executor.yul step 2 which swaps seized collateral → debt.
+    /// consistent with the Executor swap from seized collateral to debt.
     fn find_matching_pair(
         pairs: &[TradingPair],
         collateral: Address,
@@ -133,7 +132,7 @@ impl<'a> RoutingResolver<'a> {
                 Err(_) => continue,
             };
 
-            // Match: collateral → debt (Executor.yul swaps seized collateral → debt at step 2)
+            // Match: collateral → debt (the Executor swaps seized collateral to debt)
             if token_in == collateral && token_out == debt {
                 return Some((token_in, token_out));
             }
@@ -143,7 +142,7 @@ impl<'a> RoutingResolver<'a> {
 
     /// Compute `amountOutMin` from `debt_to_cover`, the flash-loan premium, and slippage.
     ///
-    /// The Executor.yul swap leg converts seized collateral back to the debt asset (collateral → debt).
+    /// The Executor swap leg converts seized collateral back to the debt asset.
     /// This minimum output must be high enough that the swap covers the flash-loan repayment
     /// (`debt_to_cover + premium`) after slippage.
     ///
@@ -170,23 +169,19 @@ mod tests {
             primary: "test".into(),
             fallbacks: vec![],
             submission_style: "single_atomic_tx".into(),
-            venues: vec![
-                VenueEntry {
-                    name: "test-dex".into(),
-                    chain: "base".into(),
-                    liquidity_usd_min: 50_000,
-                    venue_type: "dex".into(),
-                    kyc: false,
-                    router_compatibility: "v2".into(),
-                    router_address: "0x1111111111111111111111111111111111111111".into(),
-                    pairs: vec![
-                        TradingPair {
-                            token_in: "0x3333333333333333333333333333333333333333".into(),
-                            token_out: "0x2222222222222222222222222222222222222222".into(),
-                        },
-                    ],
-                },
-            ],
+            venues: vec![VenueEntry {
+                name: "test-dex".into(),
+                chain: "base".into(),
+                liquidity_usd_min: 50_000,
+                venue_type: "dex".into(),
+                kyc: false,
+                router_compatibility: "v2".into(),
+                router_address: "0x1111111111111111111111111111111111111111".into(),
+                pairs: vec![TradingPair {
+                    token_in: "0x3333333333333333333333333333333333333333".into(),
+                    token_out: "0x2222222222222222222222222222222222222222".into(),
+                }],
+            }],
             forensic_tag_sources: vec![],
         }
     }
@@ -293,7 +288,10 @@ mod tests {
         let debt = address!("0x2222222222222222222222222222222222222222");
         let collateral = address!("0x3333333333333333333333333333333333333333");
         let result = resolver.resolve_v2(collateral, debt, "base", U256::from(1000));
-        assert!(result.is_none(), "venue with empty router should be skipped");
+        assert!(
+            result.is_none(),
+            "venue with empty router should be skipped"
+        );
     }
 
     #[test]
@@ -319,7 +317,10 @@ mod tests {
         let result = RoutingResolver::compute_amount_out_min(debt, 50);
         // With 50 bps slippage and 5 bps premium: 1e18 * (10000 + 5 - 50) / 10000 = 1e18 * 0.9955
         let expected = U256::from(995_500_000_000_000_000u128);
-        assert_eq!(result, expected, "amountOutMin should include premium adjustment");
+        assert_eq!(
+            result, expected,
+            "amountOutMin should include premium adjustment"
+        );
     }
 
     #[test]
@@ -331,7 +332,10 @@ mod tests {
         // 1e9 * (10000 + 5 - 50) / 10000 = 1e9 * 0.9955 = 995_500_000
         let expected = U256::from(995_500_000u128);
         assert_eq!(result, expected, "6-decimal USDC should scale correctly");
-        assert!(result < debt, "slippage should reduce amountOutMin from debt_to_cover");
+        assert!(
+            result < debt,
+            "slippage should reduce amountOutMin from debt_to_cover"
+        );
     }
 
     #[test]

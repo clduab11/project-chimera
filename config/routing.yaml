@@ -19,7 +19,7 @@ venues:
     type: "dex"
     kyc: false
     router_compatibility: "v2"
-    router_address: "0x420DD381b31aEf6683db6b902084cB0FFECe40Da"
+    router_address: "0x71524B4f93c58fcbF659783284E38825f0622859"
     pairs:
       - token_in: "0x4200000000000000000000000000000000000006"
         token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"

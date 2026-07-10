@@ -1,8 +1,8 @@
 //! Strategy assembly module for Chimera Core.
 //!
-//! Builds flash-loan atomic liquidation transactions using the
-//! worker-as-Executor pattern. Consumes resolved V2 routes and
-//! assembles structurally-exact `flashLoanSimple` calldata.
+//! Builds atomic liquidation requests for the standalone deployed Executor.
+//! Consumes resolved V2 routes and assembles structurally exact
+//! `execute(bytes)` calldata.
 
 pub mod assembler;
 

@@ -99,7 +99,9 @@ def _resolve_repo_path(value: str) -> Path:
 
 
 def load_testnet_config(path: Path) -> dict[str, Any]:
-    """stdlib json load + shape check (chain_id / rpc_url / funding)."""
+    """stdlib json load + shape check (chain_id / rpc_url / funding).
+    Chain ID is hardcoded to 84532 (Base Sepolia) — never accepts any other
+    testnet, even if the config file declares a different chain_id."""
     if not path.exists():
         logger.error("Testnet config not found at %s", path)
         raise SystemExit(EXIT_FAIL)
@@ -111,6 +113,14 @@ def load_testnet_config(path: Path) -> dict[str, Any]:
         raise SystemExit(EXIT_FAIL)
     if not isinstance(config.get("chain_id"), int):
         logger.error("Testnet config %s: 'chain_id' must be an integer.", path)
+        raise SystemExit(EXIT_FAIL)
+    if config["chain_id"] != 84532:
+        logger.error(
+            "Testnet config %s: chain_id %s is not 84532 (Base Sepolia). "
+            "This harness is hardcoded to Base Sepolia only.",
+            path,
+            config["chain_id"],
+        )
         raise SystemExit(EXIT_FAIL)
     return config
 
@@ -126,22 +136,23 @@ def _build_web3(rpc: str) -> Any:
     return Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
 
 
-def make_guarded_web3(rpc: str, expected_chain_id: int) -> Any:
+def make_guarded_web3(rpc: str, expected_chain_id: int | None = None) -> Any:
     """Connect, then check eth chain_id FIRST; SystemExit(EXIT_CHAIN_GUARD) on
-    mismatch before any other RPC/account/balance call (§5.2)."""
+    mismatch before any other RPC/account/balance call. The chain guard is
+    hardcoded to 84532 (Base Sepolia) regardless of the config or caller."""
     w3 = _build_web3(rpc)
     try:
         actual = w3.eth.chain_id  # the FIRST and only pre-guard RPC call
     except Exception as exc:  # noqa: BLE001 - surface provider errors cleanly
         logger.error("Failed to fetch chain id from %s: %s", rpc, exc)
         raise SystemExit(EXIT_FAIL)
-    if actual != expected_chain_id:
+    if actual != 84532:
         logger.error(
-            "CHAIN GUARD: RPC %s reports chain_id %s but the testnet config "
-            "requires %s. Refusing to proceed — there is no override.",
+            "CHAIN GUARD: RPC %s reports chain_id %s but the testnet harness "
+            "is hardcoded to 84532 (Base Sepolia). Refusing to proceed — "
+            "there is no override.",
             rpc,
             actual,
-            expected_chain_id,
         )
         raise SystemExit(EXIT_CHAIN_GUARD)
     return w3
@@ -408,7 +419,7 @@ def cmd_faucet(args: argparse.Namespace) -> int:
         logger.error(_WEB3_MISSING_MSG)
         return EXIT_USAGE
 
-    w3 = make_guarded_web3(config["rpc_url"], config["chain_id"])
+    w3 = make_guarded_web3(config["rpc_url"])
     checksum = w3.to_checksum_address(address)
     target_wei = int(target_eth * WEI_PER_ETH)
     while True:
@@ -446,13 +457,13 @@ def cmd_fund(args: argparse.Namespace) -> int:
         return EXIT_USAGE
 
     # Chain guard: the very first RPC call, before password/decryption (§5.2).
-    make_guarded_web3(rpc, chain_id)
+    make_guarded_web3(rpc)
 
     password = read_password_from_env()
     treasury_key = decrypt_treasury_in_memory(treasury_path, password)
 
     # Re-assert the guard immediately before delegating to the send loop.
-    make_guarded_web3(rpc, chain_id)
+    make_guarded_web3(rpc)
 
     logger.info(
         "Delegating to fund_eoa.fund_wallets (pool=%s, min=%s ETH, top-up=%s "
@@ -501,8 +512,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         if Web3 is None:
             logger.error(_WEB3_MISSING_MSG)
             return EXIT_USAGE
-        # Chain guard before any balance call (§5.2).
-        make_guarded_web3(rpc, config["chain_id"])
+        # Chain guard before any balance call.
+        make_guarded_web3(rpc)
 
     try:
         results = check_balances.collect_balances(

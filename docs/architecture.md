@@ -1,7 +1,7 @@
 # Project Chimera — System Architecture
 
-**Version**: 1.1
-**Last Updated**: 2026-07-05
+**Version**: 1.2
+**Last Updated**: 2026-07-09
 **Scope**: Sovereign, local-first MEV extraction engine for Aave V3 liquidations on L2 (Base, Arbitrum).
 
 ---
@@ -47,9 +47,9 @@ flowchart LR
     end
 
     subgraph ExecutorModule["executor"]
-        E1["Executor.yul<br/>(atomic flash-loan)"]
-        E2["Private RPC /<br/>Sequencer Submit"]
-        E3["EOA Rotation<br/>& Clean Wallet Pool"]
+        E1["Standalone Executor.yul<br/>(atomic flash-loan receiver)"]
+        E2["Standard JSON-RPC<br/>Submission"]
+        E3["Authorized Worker Signers<br/>& Native-Gas Scheduler"]
     end
 
     subgraph Observability["observability"]
@@ -66,14 +66,14 @@ flowchart LR
     S1 --> S2 --> S3 --> S4
     S4 --> P1
     P1 --> P2 --> P3
-    P3 -->|Allow| E1
+    P3 -->|Allow| E3
     P3 -->|Deny / Trip| P4
-    E1 --> E2 --> E3
-    E3 -->|Outcome| P4
+    E3 --> E2 --> E1
+    E1 -->|Outcome| P4
 
     S4 --> M1
     P3 --> M1
-    E3 --> M1
+    E1 --> M1
     M1 --> M3
     M2 --> M3
 ```
@@ -113,11 +113,12 @@ flowchart LR
 └────────────────────────┬────────────────────────────────────────────────────┘
                          ▼ (only if Allowed)
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ EXECUTOR (Executor.yul + Rust submit layer)                                  │
-│ • Build atomic tx: flash-loan → liquidation → swap → repay → profit check    │
-│ • Submit via private RPC or direct sequencer (single_atomic_tx, not bundle) │
-│ • Rotate EOA from clean pool (10 addresses)                                 │
-│ • Record outcome back to PacingEngine + Metrics                             │
+│ EXECUTOR (standalone Executor.yul + Rust submit layer)                       │
+│ • Authorized worker signs Executor.execute(bytes)                           │
+│ • Executor calls Aave flashLoanSimple(receiver=Executor)                    │
+│ • Pool callbacks executeOperation(caller=Pool, initiator=Executor)           │
+│ • Executor liquidates, swaps, approves repayment, and retains token profit  │
+│ • Submit through standard JSON-RPC; record outcome to pacing + metrics       │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -213,26 +214,39 @@ flowchart LR
 
 **Responsibilities**:
 
-- **Atomic composition**: Flash-loan → liquidation → DEX swap → repay → profit check. Any failure reverts the entire transaction.
-- **Profit gate**: Compares `balanceAfter - balanceBefore` against `(gas * gasPrice) + tip + L1_data_fee`. Reverts if profit threshold is not met.
-- **EIP-7702 compatible**: Supports authorized execution via delegated EOAs.
-- **L2-optimized**: Minimal calldata and gas usage for L2 sequencer submission (no bundle complexity).
+- **Standalone entry point**: The owner or an address explicitly enabled with `setWorker(address,true)` calls `Executor.execute(bytes)`. The worker is only the transaction signer; it is not the Executor or Aave flash-loan receiver.
+- **Atomic composition**: `Executor.execute(bytes)` calls Aave `flashLoanSimple` with `receiverAddress=Executor`. Aave then calls `executeOperation` with `caller=Pool` and `initiator=Executor`; the Executor performs liquidation → DEX swap → repayment approval → profit check. Any failure reverts the entire transaction.
+- **Profit custody**: Debt-token profit remains in the standalone Executor. Only the owner can move ERC20 or native balances with `withdraw(address,uint256)`.
+- **On-chain profit gate**: The callback requires `balanceAfter > balanceBefore + premium + minProfit + tip`, with overflow checks. Rust computes opportunity economics, including L2 execution gas and L1 data fees, and translates the protected portion into `minProfit`. The Yul contract does not read `gasPrice` or calculate L1 fees directly.
+- **Submission**: The current submitter broadcasts the worker-signed call through standard JSON-RPC. Private submission is not currently wired.
+- **L2-optimized**: Fixed-shape calldata and a single atomic transaction avoid bundle complexity.
 
 **Contract functions** (actual exported selectors from `Executor.yul`):
 
 | Function | Selector | Access |
 |----------|----------|--------|
+| `execute(bytes)` | `0x09c5eabe` | Owner or explicitly authorized worker |
+| `executeOperation(address,uint256,uint256,address,bytes)` | `0x1b11d0ff` | Configured Aave Pool only; initiator must be Executor |
 | `owner()` | `0x8da5cb5b` | Public view |
-| `exec(bytes)` | `0x55f86501` | Owner only |
-| `setPool(address)` | `0xa51b62c1` | Owner only |
+| `pool()` | `0x16f0115b` | Public view |
+| `setPool(address)` | `0x4437152a` | Owner only |
+| `setWorker(address,bool)` | `0xc373d7f3` | Owner only |
+| `isWorker(address)` | `0xaa156645` | Public view |
 | `withdraw(address,uint256)` | `0xf3fef3a3` | Owner only |
 | `transferOwnership(address)` | `0xf2fde38b` | Owner only |
-| `executeOperation(...)` | `0x1b11d0ff` | Aave callback (restricted to pool caller) |
 
-> **Note:** There is no `pool()` public view getter. To read the pool address,
-> use `cast storage <EXECUTOR_ADDRESS> 1 --rpc-url <RPC_URL>`.
+**Custom errors**:
 
-**Current State**: Yul flash-loan executor implementation is present with dispatcher, callback path, multi-leg routing, and balance-delta profit checks. It remains shadow-gated until selector/topic verification, Foundry tests, and external audit checks pass.
+| Error | Selector |
+|-------|----------|
+| `ProfitGateFailed()` | `0x9b89663c` |
+| `AtomicFail()` | `0xc4cae92f` |
+| `Unauthorized()` | `0x82b42900` |
+| `InvalidDexRouter()` | `0xd7c4b506` |
+| `InvalidPool()` | `0x2083cd40` |
+| `WithdrawFailed()` | `0x750b219c` |
+
+**Current State**: The standalone Yul flash-loan Executor, worker allowlist, callback path, V2 routing, retained-profit accounting, Rust JSONL outcome wiring, and Foundry tests are present. Live transition remains shadow-gated and subject to the validation and audit controls.
 
 ---
 
@@ -329,7 +343,7 @@ flowchart LR
 Project Chimera is designed to run entirely on operator-controlled infrastructure:
 
 - **No cloud dependencies**: RPC endpoints are operator-configured (Alchemy, QuickNode, or self-hosted). No telemetry or control plane phones home.
-- **Self-custody**: All EOA keys live in an encrypted local keystore. No third-party custody or multi-sig.
+- **Self-custody**: Worker keys live in encrypted local keystores. The deployed Executor is owned by the operator-controlled multisig, which alone manages Pool/worker configuration and withdrawals.
 - **Deterministic builds**: `Cargo.lock` + `foundry.toml` pin exact dependency versions. Reproducible builds via `cargo build --release`.
 
 ### 5.2 Encrypted Keystore
@@ -347,7 +361,7 @@ The system is engineered to bound capital at risk, contain operational blast rad
 | **Daily cap** | $2,000 USD | Bounds maximum daily capital at risk |
 | **Single transfer cap** | $1,000 USD | Limits per-transaction exposure and error blast radius |
 | **Jittered intervals** | 6–18h randomized | Reduces gas-war collisions and predictable load spikes |
-| **Wallet rotation** | 10 EOAs, rotated every 5 txs | Key hygiene; isolates blast radius if a key is compromised |
+| **Worker rotation** | Authorized worker pool, rotated every 5 txs | Key hygiene; workers sign calls and hold native gas only |
 | **Profit multiplier** | 2.5x after all costs | Ensures every tx is independently profitable |
 | **Auto-halt** | Reverts / gas / loss breakers | Self-limiting safety response to anomalies |
 | **On-chain DEX venues** | Aerodrome, Uni V3, Camelot | Transparent, auditable on-chain settlement |
@@ -397,8 +411,8 @@ The system is engineered to bound capital at risk, contain operational blast rad
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│  Aave V3 Pool + Price Oracle           │
-│  └─ Executor.yul (deployed on-chain)   │
+│  Standalone Executor.yul               │
+│  └─ Aave V3 Pool + Price Oracle        │
 └─────────────────────────────────────────┘
 ```
 

@@ -271,7 +271,7 @@ def test_fund_delegates_to_fund_eoa(
     monkeypatch.setattr(
         th, "decrypt_treasury_in_memory", lambda path, password: in_memory_key
     )
-    monkeypatch.setattr(th, "make_guarded_web3", lambda rpc, chain_id: object())
+    monkeypatch.setattr(th, "make_guarded_web3", lambda rpc, expected_chain_id=None: object())
     monkeypatch.setenv(PASSWORD_ENV, "unit-test-password-123")
     # cmd_fund gates on web3 availability before the (patched) guard.
     monkeypatch.setattr(th, "Web3", object())

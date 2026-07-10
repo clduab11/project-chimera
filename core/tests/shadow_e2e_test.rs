@@ -28,14 +28,12 @@ use alloy::primitives::{address, Address, U256};
 use alloy::providers::ProviderBuilder;
 use chimera_core::{
     config::{PacingConfig, RiskConfig, RoutingConfig, TradingPair, VenueEntry},
-    detector::liquidation::{
-        LiquidationDetector, MarketSnapshot, ReserveData, UserPosition,
-    },
+    detector::liquidation::{LiquidationDetector, MarketSnapshot, ReserveData, UserPosition},
     routing::RoutingResolver,
     state::{CrashRecovery, ReservationRecord, ReservationStatus},
-    BreakerReason, CrossProcessPacing, JsonlPersistence, Metrics, Opportunity,
-    Orchestrator, OrchestratorConfig, PacingDecision, PacingEngine, RpcSubmitter,
-    SimulationResult, SignerRegistry, StrategyAssembler,
+    BreakerReason, CrossProcessPacing, JsonlPersistence, Metrics, Opportunity, Orchestrator,
+    OrchestratorConfig, PacingDecision, PacingEngine, RpcSubmitter, SignerRegistry,
+    SimulationResult, StrategyAssembler,
 };
 use chrono::{TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -55,7 +53,8 @@ const COLL_WETH: Address = address!("0x4200000000000000000000000000000000000006"
 const DEBT_USDC: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const DEBT_USDT: Address = address!("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2");
 const ROUTER: Address = address!("0xA0b86a33E6441e0A421e56E4773C3C4b0Db7E5b0");
-const AAVE_POOL: Address = address!("0xA238Dd80C259a72e81d7e4664a9801593F98d1Ab");
+const AAVE_POOL: Address = address!("0xA238Dd80C259a72e81d7e4664a9801593F98d1c5");
+const EXECUTOR: Address = address!("0x9999999999999999999999999999999999999999");
 const WORKER_EOA: Address = address!("0xEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE");
 
 fn ray() -> U256 {
@@ -138,7 +137,7 @@ fn test_pacing_config(eoa_pool_path: &str) -> PacingConfig {
         recent_outcomes_capacity: 128,
         eoa_pool_path: eoa_pool_path.to_string(),
         pools_toml_path: "config/pools.toml".into(),
-        executor_address: String::new(),
+        executor_address: format!("{:#x}", EXECUTOR),
         treasury_address: String::new(),
         treasury_keystore: String::new(),
         worker_keystore_dir: String::new(),
@@ -180,18 +179,12 @@ fn test_risk_config() -> RiskConfig {
 
 fn make_at_risk_snapshot() -> MarketSnapshot {
     let reserves: HashMap<Address, ReserveData> = vec![
-        (
-            COLL_WETH,
-            mk_reserve(usd8(3400), 8250, 10500),
-        ),
-        (
-            DEBT_USDC,
-            {
-                let mut r = mk_reserve(usd8(1), 0, 0);
-                r.decimals = 6;
-                r
-            },
-        ),
+        (COLL_WETH, mk_reserve(usd8(3400), 8250, 10500)),
+        (DEBT_USDC, {
+            let mut r = mk_reserve(usd8(1), 0, 0);
+            r.decimals = 6;
+            r
+        }),
     ]
     .into_iter()
     .collect();
@@ -219,26 +212,17 @@ fn make_at_risk_snapshot() -> MarketSnapshot {
 
 fn make_multi_user_snapshot() -> MarketSnapshot {
     let reserves: HashMap<Address, ReserveData> = vec![
-        (
-            COLL_WETH,
-            mk_reserve(usd8(3400), 8250, 10500),
-        ),
-        (
-            DEBT_USDC,
-            {
-                let mut r = mk_reserve(usd8(1), 0, 0);
-                r.decimals = 6;
-                r
-            },
-        ),
-        (
-            DEBT_USDT,
-            {
-                let mut r = mk_reserve(usd8(1), 0, 0);
-                r.decimals = 6;
-                r
-            },
-        ),
+        (COLL_WETH, mk_reserve(usd8(3400), 8250, 10500)),
+        (DEBT_USDC, {
+            let mut r = mk_reserve(usd8(1), 0, 0);
+            r.decimals = 6;
+            r
+        }),
+        (DEBT_USDT, {
+            let mut r = mk_reserve(usd8(1), 0, 0);
+            r.decimals = 6;
+            r
+        }),
     ]
     .into_iter()
     .collect();
@@ -297,17 +281,21 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
     let pacing_cfg = test_pacing_config(pool_path.to_str().unwrap());
 
     // --- JSONL persistence wired into the pacing engine ---
-    let outcomes_path = std::path::PathBuf::from("test_temp/shadow_e2e_orchestrator_outcomes.jsonl");
+    let outcomes_path =
+        std::path::PathBuf::from("test_temp/shadow_e2e_orchestrator_outcomes.jsonl");
     let _ = std::fs::create_dir_all(outcomes_path.parent().unwrap());
     let persistence = Arc::new(JsonlPersistence::new(outcomes_path.clone(), 50, 5));
-    let pacing_engine = PacingEngine::new(pacing_cfg.clone())
-        .with_state_persistence(persistence);
+    let pacing_engine = PacingEngine::new(pacing_cfg.clone()).with_state_persistence(persistence);
 
     // --- Cross-process pacing ---
     let reservations_dir = std::path::PathBuf::from("test_temp/shadow_e2e_reservations");
     let _ = std::fs::create_dir_all(&reservations_dir);
     let engine_for_assertions = pacing_engine.clone();
-    let pacing = CrossProcessPacing::new(pacing_engine, reservations_dir.clone(), outcomes_path.clone());
+    let pacing = CrossProcessPacing::new(
+        pacing_engine,
+        reservations_dir.clone(),
+        outcomes_path.clone(),
+    );
     pacing.clear_stale_lock().ok();
 
     // --- Metrics ---
@@ -321,19 +309,15 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
     let risk_config = test_risk_config();
 
     // --- Provider: connected to an unreachable address (never called due to mocks) ---
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .connect_http(Url::parse("http://127.0.0.1:1").unwrap()),
-    );
+    let provider =
+        Arc::new(ProviderBuilder::new().connect_http(Url::parse("http://127.0.0.1:1").unwrap()));
 
     // --- Submitter in dry-run mode ---
-    let submitter = RpcSubmitter::new((*provider).clone(), chain_id)
-        .with_dry_run(true);
+    let submitter = RpcSubmitter::new((*provider).clone(), chain_id).with_dry_run(true);
 
     // --- Signer registry (shadow mode, empty paths) ---
     let signer_registry = Arc::new(
-        SignerRegistry::load(&pacing_cfg, execute_mode)
-            .expect("shadow signer registry must load"),
+        SignerRegistry::load(&pacing_cfg, execute_mode).expect("shadow signer registry must load"),
     );
 
     // --- Build the Orchestrator ---
@@ -348,11 +332,10 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
         None, // no real LiquidationSimulator — mock sim fn below
         submitter,
         execute_mode.to_string(),
-        AAVE_POOL,
+        EXECUTOR,
         routing_config.clone(),
         risk_config.clone(),
         signer_registry,
-        None, // no signer address
         None, // no mempool watcher
     );
 
@@ -401,9 +384,7 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
     // (error code 5: Access denied). On non-Windows platforms, verify full roundtrip.
     #[cfg(not(target_os = "windows"))]
     {
-        // record_outcome spawns the JSONL append as a detached task; on the
-        // current-thread test runtime it only runs at an await point, so poll
-        // with a bounded await-based wait instead of asserting immediately.
+        // record_outcome appends asynchronously; yield until the bounded write appears.
         for _ in 0..100 {
             if tokio::fs::metadata(&outcomes_path).await.is_ok() {
                 break;
@@ -558,7 +539,11 @@ fn test_cross_process_reservation_lifecycle() {
     let engine = PacingEngine::new(cfg);
     let chain_id = 8453u64;
 
-    let pacing = CrossProcessPacing::new(engine, reservations_dir.clone(), dir.path().join("outcomes.jsonl"));
+    let pacing = CrossProcessPacing::new(
+        engine,
+        reservations_dir.clone(),
+        dir.path().join("outcomes.jsonl"),
+    );
     pacing.clear_stale_lock().ok();
 
     let opp = Opportunity {
@@ -571,12 +556,16 @@ fn test_cross_process_reservation_lifecycle() {
     };
 
     // Reserve.
-    let reservation = pacing.try_reserve(&opp, chain_id).expect("reservation must succeed");
+    let reservation = pacing
+        .try_reserve(&opp, chain_id)
+        .expect("reservation must succeed");
     assert_eq!(reservation.status, ReservationStatus::Reserved);
     assert_eq!(reservation.amount_usd, dec!(150));
 
     // Settle.
-    pacing.settle(&opp.id, chain_id).expect("settle must succeed");
+    pacing
+        .settle(&opp.id, chain_id)
+        .expect("settle must succeed");
 
     // Double-settle must fail.
     assert!(pacing.settle(&opp.id, chain_id).is_err());
@@ -708,8 +697,7 @@ fn test_strategy_assembly_with_detector_output() {
         .expect("route must resolve");
 
     let shadow_tx = StrategyAssembler::build_shadow_transaction(
-        AAVE_POOL,
-        WORKER_EOA,
+        EXECUTOR,
         &route,
         candidate.collateral_asset,
         candidate.user,
@@ -719,27 +707,34 @@ fn test_strategy_assembly_with_detector_output() {
         0,
     );
 
-    assert_eq!(shadow_tx.to, AAVE_POOL);
+    assert_eq!(shadow_tx.to, EXECUTOR);
+    assert_ne!(shadow_tx.to, WORKER_EOA);
+    assert_ne!(shadow_tx.to, AAVE_POOL);
     assert_eq!(shadow_tx.value, U256::ZERO);
     assert!(!shadow_tx.data.is_empty());
 
-    // flashLoanSimple selector (0x42b0b77c)
-    assert_eq!(&shadow_tx.data[..4], &[0x42u8, 0xb0, 0xb7, 0x7c]);
+    let execute_selector = &alloy::primitives::keccak256("execute(bytes)")[..4];
+    assert_eq!(&shadow_tx.data[..4], execute_selector);
 
-    // Verify embedded StrategyParams at correct offset (196 = 4 + 5*32 + 32)
-    let params_start = 4 + 5 * 32 + 32;
-    let strategy_params = &shadow_tx.data[params_start..params_start + 288];
+    // execute(bytes) outer head + dynamic length, followed by exactly 11 ABI words.
+    let params_start = 4 + 32 + 32;
+    let strategy_params = &shadow_tx.data[params_start..params_start + 11 * 32];
+    assert_eq!(strategy_params.len(), 352);
 
-    // Word 0: collateral_asset
-    let decoded = Address::from_slice(&strategy_params[12..32]);
+    // Word 0: asset, word 1: amount, word 2: collateral.
+    assert_eq!(
+        Address::from_slice(&strategy_params[12..32]),
+        candidate.debt_asset
+    );
+    let decoded = Address::from_slice(&strategy_params[64 + 12..64 + 32]);
     assert_eq!(decoded, candidate.collateral_asset);
 
-    // Word 1: user_to_liquidate
-    let decoded = Address::from_slice(&strategy_params[44..64]);
+    // Word 3: user_to_liquidate
+    let decoded = Address::from_slice(&strategy_params[96 + 12..96 + 32]);
     assert_eq!(decoded, candidate.user);
 
-    // Shadow params: words 6-8 (min_profit, tip, deadline) must be zero
-    let shadow_tail = &strategy_params[192..288];
+    // Shadow payload: words 8-10 (min_profit, tip, deadline) must be zero.
+    let shadow_tail = &strategy_params[8 * 32..11 * 32];
     assert!(shadow_tail.iter().all(|&b| b == 0));
 }
 

@@ -5,8 +5,7 @@
 > and what to watch out for before touching real funds.
 >
 > **What this is not:** A shortcut to live trading. Every section below is
-> grounded in the actual current code. Where something is planned but not yet
-> fully wired, this guide says so explicitly.
+> grounded in the actual current code and its shadow-first operating gates.
 
 ---
 
@@ -46,22 +45,27 @@ in `config/pacing.yaml`).
 - L1 data fee for posting the transaction to Ethereum
 - DEX swap slippage (capped at `slippage_max_bps` in `config/risk.yaml`)
 
-**Capital flow (simplified):**
+**Capital and custody flow (simplified):**
 ```
-Treasury wallet (cold)
-        |
-   fund_eoa.py
-        |
-Worker EOAs (hot, small balances — enough for gas)
-        |
-  Chimera binary (flash-loan execution — no capital at risk per-op)
-        |
-  Profit lands in worker EOA
-        |
-  sweep_profits.py
-        |
-Treasury wallet (cold)
+Gas treasury signer -- Rust refund scheduler --> authorized worker EOAs
+        ^                                      (gas ETH only)
+        | Rust native-ETH sweep                       |
+        +---------------------------------------------+
+
+Authorized worker -- ordinary EIP-1559 execute(bytes) --> standalone Executor
+                                                            |
+                                                     Aave flash loan
+                                                            |
+                                                  debt-token profit stays
+                                                     in Executor
+                                                            |
+                                              multisig withdraw(token, amount)
 ```
+
+Initial treasury/worker deposits are **gas ETH only**, not trading or
+liquidation capital. Aave's flash loan supplies liquidation capital. The gas
+treasury needs ETH for automated refunds, and every active worker must meet
+`min_worker_balance_eth` at live startup.
 
 **Pacing guardrails (from `config/pacing.yaml`):**
 
@@ -81,23 +85,24 @@ them trips the circuit breaker and halts the engine without operator action.
 
 ## 3. Shadow Mode vs Live Mode
 
-**The current repository status is shadow mode only.**
+**The repository is shadow-first; live execution is implemented but explicitly gated.**
 
 `execute_mode: shadow` (the default in `config/pacing.yaml`) means the engine
 runs the full detection and pacing logic but does not submit transactions on-chain.
 It is safe to run in this mode without any funds at risk.
 
 `execute_mode: live` is the mode where transactions are submitted. A 7-day shadow
-period is required before the engine will allow a shadow-to-live transition (this
-is enforced in `PacingConfig::validate_mode_transition()`). The current binary
-entrypoint does not implement the full live execution path yet — see the notes in
-Section 9.
+period is required before the engine will allow a shadow-to-live transition.
+`toggle_shadow.py` enforces the soak against `core/state/mode.json`; live mode
+never enables itself.
 
 **Do not change `execute_mode` to `live` until you have:**
 - Run shadow mode for at least 7 days
 - Verified the metrics look healthy (Section 7)
-- Confirmed EOA funding and rotation work correctly
+- Confirmed Executor bytecode, canonical `pool()`, multisig ownership, and every active worker's `isWorker` authorization
+- Confirmed encrypted signer/EOA-pool parity and gas funding
 - Read `docs/emergency-procedures.md`
+- Evaluated private/protected transaction submission; the current path broadcasts raw transactions to a standard RPC
 
 ---
 
@@ -117,8 +122,10 @@ Section 9.
 > want to use the funding/sweep helpers.
 
 ### Accounts you will need
-- A **treasury wallet** (cold) — never touches the engine directly
-- At least one **worker EOA** (hot, small balance) — the engine's signing wallet
+- A **multisig** — owns/configures Executor and withdraws Executor profit
+- A **gas treasury signer** — encrypted keystore used for worker gas refunds
+- At least one **authorized worker EOA** — encrypted keystore used to sign ordinary EIP-1559 calls to Executor
+- A deployed **standalone Executor** configured with the canonical Aave Pool
 - A **Base or Arbitrum RPC URL** (Alchemy, Infura, or your own node)
 
 > **Never store private keys in this repository.** The `config/eoa_pool.json`
@@ -172,7 +179,8 @@ Do not change anything else yet. The defaults are conservative by design.
 ### Step 4 — Prepare your EOA pool
 
 Open `config/eoa_pool.json`. It ships with placeholder public addresses.
-Replace the `address` fields with your actual worker EOA public addresses.
+The placeholders are not operator wallets and must never be funded. Replace
+them with your actual worker EOA public addresses or mark unused rows excluded.
 The `wallets` key is now the canonical shape (the prior `workers` vs `wallets`
 mismatch is resolved; `fund_eoa.py` reads `wallets`).
 
@@ -190,10 +198,8 @@ mismatch is resolved; `fund_eoa.py` reads `wallets`).
 }
 ```
 
-> **Important:** `chain_balances` in this file is metadata only. The rotation
-> script currently reads this value from the file rather than from live RPC.
-> Keep it updated manually or via `scripts/rotate_eoa.py` until live RPC balance
-> checking is wired in.
+> **Important:** `chain_balances` is non-authoritative metadata and remains
+> zeroed in the checked-in template. Runtime balance checks use RPC.
 
 ---
 
@@ -218,17 +224,15 @@ python scripts/snapshot_generator.py --chain base --rpc-url <YOUR_RPC_URL>
 ### Step 6 — Set your RPC URL
 
 The binary resolves RPC endpoints in order:
-1. `BASE_RPC_URL` (Base) or `ARB_RPC_URL` (Arbitrum)
-2. `RPC_URL` (fallback for either chain)
-3. `http://localhost:8545` (default)
+1. `BASE_RPC_URL`
+2. `RPC_URL`
+3. `http://localhost:8545` (shadow/development fallback)
 
 ```bash
 export BASE_RPC_URL=https://base-mainnet.g.alchemy.com/v2/YOUR_KEY
 ```
 
-> **Note:** Multi-chain RPC wiring via `BASE_RPC_URL` / `ARB_RPC_URL` is now
-> fully supported in `main.rs`. See `resolve_rpc_url()` in `core/src/main.rs:475` for the
-> full resolution order.
+Do not place an RPC credential in checked-in config or logs.
 
 ---
 
@@ -328,20 +332,21 @@ state looks like this:
 
 ---
 
-## 8. How to Fund Worker EOAs
+## 8. Worker Gas Funding
 
 > **Do not fund worker EOAs until you have confirmed shadow mode is running
 > cleanly for at least a day.**
 
-The funding helper is `scripts/fund_eoa.py`. It uses `web3.py` to send ETH from
-a treasury wallet to each worker EOA that falls below a threshold.
+Worker EOAs and the gas treasury need native ETH only for gas. They do not
+provide liquidation capital. Before live startup, every active worker must have
+at least `min_worker_balance_eth`, while the treasury must have ETH available
+for refunds.
 
-**The `workers` vs `wallets` JSON-shape mismatch is resolved.** The script now
-reads the `wallets` key from `config/eoa_pool.json`. Verify the shape matches
-before running.
-
-Worker EOAs need only enough ETH to cover gas — roughly `0.02 ETH` per wallet
-is the configured default. They should never hold significant balances.
+The primary automated path is the Rust `SweepScheduler`: it refunds workers
+below the configured threshold from the encrypted treasury signer and sweeps
+excess native worker ETH back to `treasury_address`. It does not sweep ERC20
+tokens; `sweep_tokens` is currently unused. Use the wallet provisioning and
+testnet runbooks to rehearse funding without exposing keys on a command line.
 
 For EOA rotation, use:
 
@@ -354,41 +359,30 @@ writes to `config/eoa_pool.json`.
 
 ---
 
-## 9. What Is Not Fully Wired Yet
-
-Be aware of the following before assuming docs describe a fully runnable system:
+## 9. Live Runtime Status
 
 | Feature | Status |
 |---|---|
-| Live execution path | Not fully implemented in current binary |
-| `scripts/check_balances.py` | Exists and works (`--chain base --min-balance 0.01`) |
-| Keystore integrity test | Mentioned in docs; keystore directory not confirmed present |
-
-**Features that ARE now wired** (previously listed as "planned" or "not wired"):
-
-| Feature | Status |
-|---|---|
-| Multi-chain RPC wiring (`BASE_RPC_URL` / `ARB_RPC_URL`) | **Now supported** — `main.rs` resolves both env vars (see `resolve_rpc_url()` at line 475) |
-| JSONL audit trail / state file on disk | **Now wired** — outcomes written to `core/state/outcomes.jsonl` via `JsonlPersistence` (see `pacing_engine.rs:516-524` and `main.rs:333-337`) |
-| EOA pool loaded at startup | **Now wired** — `SignerRegistry` loads treasury + worker keystores at boot (see `main.rs:11,231-232`) |
-| `fund_eoa.py` compatible with `eoa_pool.json` shape | **Resolved** — script now reads `wallets` key (the `workers` vs `wallets` mismatch is fixed) |
-
-These are not blockers for shadow-mode operation. They matter when you move
-toward live execution.
+| Live execution | Wired: workers sign ordinary EIP-1559 transactions to configured Executor `execute(bytes)`; no EIP-7702/delegation |
+| Executor flash loan | Executor calls configured Aave Pool `flashLoanSimple` with itself as receiver; callback requires Pool caller and `initiator == Executor` |
+| Live startup validation | Checks Executor bytecode, `pool()` equality, `isWorker` for all active workers, treasury signer/address parity, signer/pool parity, and funding |
+| RPC, JSONL, and EOA pool | Wired; `BASE_RPC_URL` or `RPC_URL`, JSONL persistence, and active EOA-pool loading are operational |
+| Protected submission | **Not wired**: raw transactions go to the configured standard RPC. Add private/protected submission before real-money use |
 
 ---
 
-## 10. How to Sweep Profits (When Live)
+## 10. Profit Consolidation and Gas Sweeps
 
-`scripts/sweep_profits.py` is the profit sweep helper. It moves the balance of
-each worker EOA back to the treasury, keeping a small gas reserve per worker.
+Successful debt-token profit remains in Executor, not in worker EOAs. The
+multisig owner consolidates it by calling `withdraw(token, amount)` through the
+multisig UI or reviewed calldata. An amount of `0` withdraws the full balance of
+that token.
 
-This script is present but is currently a skeleton — the `__main__` block prints
-a ready message rather than executing a full sweep. Do not rely on it for
-automated sweeps without reviewing and extending it first.
-
-For now, sweep manually: send everything above `0.005 ETH` from each worker EOA
-to your treasury wallet using your own wallet software.
+The Rust `SweepScheduler` separately manages **native gas ETH** on workers:
+excess goes to the gas treasury and underfunded workers receive refunds. It does
+not sweep ERC20s. `scripts/sweep_profits.py` is implemented but legacy/manual,
+uses raw key files/CLI rather than encrypted `SignerRegistry` keystores, and is
+neither the Executor-profit path nor the primary scheduled workflow.
 
 ---
 
@@ -397,9 +391,9 @@ to your treasury wallet using your own wallet software.
 1. **Never store private keys in this repo.** Not in `config/`, not in `scripts/`,
    not anywhere tracked by git.
 
-2. **Never reuse a worker EOA after it has been used for a liquidation without
-   running rotation first.** The rotation system exists for wallet hygiene — it
-   prevents forensic linkability between operations.
+2. **Keep the active-worker set synchronized.** Every non-excluded EOA-pool
+   address needs a matching encrypted keystore and multisig `setWorker(worker,
+   true)` authorization. Revoke retired workers with `setWorker(worker, false)`.
 
 3. **Keep worker balances small.** Each worker needs `~0.02 ETH` for gas. More
    than that is unnecessary exposure.
@@ -421,6 +415,9 @@ to your treasury wallet using your own wallet software.
 
 8. **Test with mock data first.** Run `snapshot_generator.py --mock` before
    connecting to a live chain. Confirm the metrics look right before funding.
+
+9. **Use protected submission before real money.** The current live path sends
+   raw transactions to a standard RPC and is exposed to public-orderflow risks.
 
 ---
 
@@ -470,10 +467,9 @@ forge test --root contracts/
 | Understand the test strategy | `docs/testing-strategy-liquidations.md` |
 | Understand the security model | `docs/security-research.md` |
 | Understand the Aave V3 protocol | `docs/research/aave-v3-liquidation-compendium.md` |
+| Provision encrypted wallets safely | `docs/runbook-wallet-provisioning.md` |
+| Complete the active live gate | `docs/runbook-keystore-multisig-go-live.md` |
 
 ---
 
-*This document was generated from a recursive analysis of the current repository
-state. Claims marked "Library ready; not wired in main.rs yet" reflect the code
-as of the date above — check `core/src/main.rs` directly to confirm whether
-additional wiring has been added since.*
+*Updated 2026-07-09 for the implemented standalone Executor model.*

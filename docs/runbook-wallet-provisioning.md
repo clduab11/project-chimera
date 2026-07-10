@@ -1,7 +1,7 @@
 # Project Chimera — Wallet Provisioning & Testnet Practice Runbook
 
-**Version**: 1.0
-**Last Updated**: 2026-07-05
+**Version**: 1.1
+**Last Updated**: 2026-07-09
 **Audience**: Solo operator provisioning worker/treasury keystores and rehearsing the full funding loop on Base Sepolia.
 **Prerequisites**: Repository checked out; Python 3.11+ with `requirements.txt` installed (web3/eth_account needed only for generation and online steps — `--help`, `--dry-run`, `plan`, and `shadow-env` run stdlib-only).
 
@@ -38,6 +38,11 @@ go-live remains the manual path in `docs/runbook-keystore-multisig-go-live.md`
 §6, gated by `docs/runbook-7day-soak.md`. Nothing in this runbook sets any mode
 to `live`.
 
+The live model uses these worker EOAs only to sign ordinary EIP-1559 calls to
+the standalone Executor's `execute(bytes)` entrypoint. There is no EIP-7702 or
+delegation. Before live use, the Executor-owner multisig must authorize every
+active worker with `setWorker(worker, true)`.
+
 ---
 
 ## 2. Custody Rules (Mechanical, Not Aspirational)
@@ -58,6 +63,8 @@ These rules are enforced by the tools themselves, not by operator discipline:
    ```bash
    export CHIMERA_KEYSTORE_PASSWORD='<set by operator>'
    ```
+
+   Verify presence without printing it: `test -n "$CHIMERA_KEYSTORE_PASSWORD"`.
 
 2. **Keystore format.** Web3 Secret Storage Definition V3: scrypt KDF
    (n=2^18, r=8, p=1) + `aes-128-ctr` cipher, plaintext `address` field.
@@ -300,10 +307,7 @@ RUST_LOG=chimera=info target/release/chimera 2>&1 | grep -i "signer loaded"
 
 **Two expected, benign log lines:**
 
-1. A legacy warning from `main.rs:554` about `CHIMERA_KEYSTORE_PATH` — a
-   pre-existing legacy path check; it is benign in shadow mode and this
-   runbook does not modify `main.rs`.
-2. An ETH price fallback line: the configured Chainlink ETH/USD feed address
+1. An ETH price fallback line: the configured Chainlink ETH/USD feed address
    is the mainnet one, which has no code on Base Sepolia, so the engine uses
    `eth_price_usd_fallback: 1800` by design (see
    `docs/runbook-testnet-deploy.md` §3.3). This is expected, not an error.
@@ -321,9 +325,32 @@ RUST_LOG=chimera=info target/release/chimera 2>&1 | grep -i "signer loaded"
 | Faucet dry spell (no grant available) | Daily limits / identity gates on faucets 1-4 | Use the fallback bridge (row 5 of §5.2): obtain L1 Sepolia ETH, bridge via https://bridge.base.org, then resume at step 2 with `faucet --wait` |
 | `Skipping unreadable keystore file` at boot | Password mismatch or corrupt/foreign-format file | Confirm the shared password; regenerate the keystore (V3 scrypt + aes-128-ctr only) |
 
+## 8. Mainnet Hand-Off
+
+This runbook proves keystore and gas-funding mechanics only. Mainnet live
+startup additionally requires:
+
+- `CHIMERA_EXECUTOR_ADDRESS`, `CHIMERA_TREASURY_ADDRESS`,
+  `CHIMERA_TREASURY_KEYSTORE`, `CHIMERA_WORKER_KEYSTORE_DIR`, and
+  `CHIMERA_EOA_POOL_PATH` set to deployment-local values;
+- `BASE_RPC_URL` or `RPC_URL` set;
+- Executor bytecode present, `pool()` equal to the canonical Aave Pool, and
+  `isWorker(address)` true for every active worker;
+- treasury signer/address parity, active signer/pool parity, treasury refund
+  ETH, and every worker at or above `min_worker_balance_eth`;
+- the mandatory 7-day `toggle_shadow.py` soak gate;
+- explicit acceptance or remediation of standard-RPC submission exposure,
+  because private/protected submission is not wired.
+
+Worker and treasury funding is gas ETH only. Aave supplies liquidation capital.
+Debt-token profit remains in Executor and is withdrawn by the owner multisig.
+The Rust scheduler sweeps/refunds worker native ETH but does not sweep ERC20s;
+`sweep_tokens` is currently unused. `scripts/sweep_profits.py` is a legacy/manual
+raw-key helper, not the Executor-profit or primary scheduled path.
+
 ---
 
-## 8. Cross-Reference Index
+## 9. Cross-Reference Index
 
 | Document | Relationship |
 | --- | --- |

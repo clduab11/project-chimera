@@ -15,15 +15,17 @@ core/src/main.rs `ModeState`):
 IMPORTANT - what this script does NOT do:
   This script NEVER edits the committed `config/pacing.yaml` `execute_mode`
   field. Flipping the engine to live is a deliberate config change made
-  separately. This tool only manages mode.json, the gate state that the Rust
-  `validate_mode_transition()` consults.
+  separately. This tool only updates mode.json. At startup, Rust independently
+  validates `shadow_since` age whenever the effective execute mode is live,
+  regardless of mode.json `previous_mode`.
 
 SOAK ENFORCEMENT:
-  `--set-live` mirrors the Rust rule in core/src/config.rs
-  `validate_mode_transition()`: a shadow->live transition requires `shadow_since`
-  to be at least SEVEN DAYS old (7 * 24 * 60 * 60 = 604800 seconds). If the soak
-  is not satisfied (or shadow_since is unstamped), the script prints the remaining
-  time and exits 1 WITHOUT writing.
+  `--set-live` applies the same 7-day threshold before updating mode.json:
+  `shadow_since` must be at least SEVEN DAYS old
+  (7 * 24 * 60 * 60 = 604800 seconds). If the soak is not satisfied (or
+  shadow_since is unstamped), the script prints the remaining time and exits 1
+  WITHOUT writing. Rust then independently revalidates this timestamp on every
+  startup whose effective execute mode is live.
 
 INVARIANT (AGENTS.md #5): stdlib only. No web3.py. `--help` always works.
 All writes are atomic (tmp file + os.replace).
@@ -59,7 +61,7 @@ logger = logging.getLogger("toggle_shadow")
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_STATE_FILE: str = "core/state/mode.json"
-# Mirrors core/src/config.rs validate_mode_transition: 7 * 24 * 60 * 60.
+# Matches core/src/config.rs validate_mode_transition: 7 * 24 * 60 * 60.
 SHADOW_SOAK_SECONDS: int = 7 * 24 * 60 * 60  # 604800
 
 
@@ -137,8 +139,8 @@ def do_set_shadow(state_file: str) -> int:
 
 def do_set_live(state_file: str) -> int:
     """
-    Set previous_mode=live ONLY if the 7-day soak is satisfied. Refuses (exit 1,
-    no write) otherwise, mirroring the Rust validate_mode_transition gate.
+    Update mode.json previous_mode=live ONLY if the 7-day soak is satisfied.
+    Rust independently revalidates shadow_since when effective mode is live.
     """
     state = read_mode(state_file)
     if state is None:
@@ -163,13 +165,14 @@ def do_set_live(state_file: str) -> int:
         return 1
 
     logger.warning(
-        "Soak satisfied (%s >= %s). Setting previous_mode=live in %s.",
+        "Soak satisfied (%s >= %s). Updating mode.json previous_mode=live in %s.",
         fmt_duration(age),
         fmt_duration(SHADOW_SOAK_SECONDS),
         state_file,
     )
     logger.warning(
-        "NOTE: this does NOT change config/pacing.yaml execute_mode; flip that separately."
+        "This only updates mode.json; Rust independently revalidates shadow_since age "
+        "whenever effective execute_mode is live. It does not change config/pacing.yaml."
     )
     # Preserve shadow_since for the audit trail of when the soak clock started.
     write_mode(state_file, "live", shadow_since)

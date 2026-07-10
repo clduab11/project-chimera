@@ -1,15 +1,16 @@
 # Project Chimera — Operator Manual
 
-**Version**: 1.1
-**Last Updated**: 2026-07-05
+**Version**: 1.2
+**Last Updated**: 2026-07-10
+**Status**: Current implemented standalone-Executor workflow; shadow-first and operator-gated.
 **Audience**: Solo operator running the sovereign L2 MEV engine.
 **Time Commitment**: 10–20 minutes daily.
 
-> **Note:** This document reflects a pre-implementation operator workflow.
 > The current binary uses host-run deployment with metrics on port
 > `9100 + (chain_id % 1000)` (e.g. `:9553` for Base, chain_id=8453).
 > See `docs/runbook-7day-soak.md` and `docs/runbook-keystore-multisig-go-live.md`
-> for updated operator procedures.
+> for the detailed soak and custody procedures. Live transactions are broadcast
+> through the configured standard RPC; private/protected submission is not wired.
 
 ---
 
@@ -27,12 +28,15 @@ cd ~/chimera
 cargo test -p chimera-core test_load_valid_config
 # Expected: OK, with values: daily=$2000, weekly=$7500, single=$1000, mode=shadow
 
-# 2. Confirm execute_mode is what you expect
-cat config/pacing.yaml | grep execute_mode
-# Expected: shadow (unless you have explicitly completed the 7-day live transition)
+# 2. Confirm the checked-in default remains shadow
+grep execute_mode config/pacing.yaml
+# Expected: execute_mode: shadow
+
+# 3. Inspect the deployment-local override used by this shell/service
+printf 'CHIMERA_EXECUTE_MODE=%s\n' "${CHIMERA_EXECUTE_MODE:-<unset: checked-in shadow default applies>}"
 ```
 
-**Critical**: If `execute_mode` reads `live` and you did not intentionally change it, stop immediately. See [Emergency Procedures](emergency-procedures.md).
+**Critical**: Keep checked-in `config/pacing.yaml` in shadow mode. If the effective deployment-local `CHIMERA_EXECUTE_MODE` is `live` and you did not intentionally complete the 7-day transition, stop immediately. See [Emergency Procedures](emergency-procedures.md).
 
 ### 1.2 RPC Health Check
 
@@ -54,28 +58,39 @@ curl -X POST https://arb1.arbitrum.io/rpc \
 ### 1.3 Wallet Balance Check
 
 ```bash
-# Check EOA pool balances. Default --min-balance is 0.0; pass an explicit threshold:
-python scripts/check_balances.py --chain base --min-balance 0.01
-# Expected: All 10 addresses show ≥ 0.01 ETH
+# Check every active, non-excluded EOA-pool worker through a real RPC.
+# Omitting --rpc makes this script report offline/mock balances.
+python scripts/check_balances.py --rpc "$BASE_RPC_URL" \
+  --eoa-pool "$CHIMERA_EOA_POOL_PATH" --chain base --min-balance 0.01
+# Expected: Every active, non-excluded worker shows ≥ 0.01 ETH.
 ```
 
 **Minimums**:
-- **Base**: Each EOA ≥ 0.01 ETH (~$35 at current prices). Total pool: ≥ 0.1 ETH.
-- **Arbitrum**: Each EOA ≥ 0.005 ETH (~$18). Total pool: ≥ 0.05 ETH.
+- **Base**: Each active, non-excluded EOA ≥ 0.01 ETH and never below the deployment's configured `min_worker_balance_eth`.
+- **Arbitrum**: Each active, non-excluded EOA ≥ 0.005 ETH and never below the deployment's configured `min_worker_balance_eth`.
 
 **Action if low**: Fund from your cold wallet. Never fund from a CEX directly — use an intermediate wallet.
 
 ### 1.4 Keystore Integrity
 
 ```bash
-# Verify encrypted keystore is readable and contains 10 keys
-ls -la encrypted_keystore/
-# Expected: 10 .json files + keystore.meta
+# Confirm all deployment-local custody inputs exist without printing secrets.
+test -n "${CHIMERA_TREASURY_KEYSTORE:-}"
+test -n "${CHIMERA_WORKER_KEYSTORE_DIR:-}"
+test -n "${CHIMERA_EOA_POOL_PATH:-}"
+test -n "${CHIMERA_KEYSTORE_PASSWORD:-}"
+test -r "$CHIMERA_TREASURY_KEYSTORE"
+test -d "$CHIMERA_WORKER_KEYSTORE_DIR"
+test -r "$CHIMERA_EOA_POOL_PATH"
+python -m json.tool "$CHIMERA_EOA_POOL_PATH" >/dev/null
 
-# Check keystore decryption (test-only, does not expose keys)
-cargo test --test keystore_integrity
-# Expected: OK, 10 keys loaded
+# Decrypt in memory and verify every active, non-excluded pool worker has a
+# matching deployment-local worker keystore. No private key is printed.
+python scripts/provision_wallets.py --verify --eoa-pool "$CHIMERA_EOA_POOL_PATH"
+# Expected: Verify OK for every non-excluded, non-zero pool address.
 ```
+
+Never echo `CHIMERA_KEYSTORE_PASSWORD`, pass it as a command-line argument, or place it in the repository. Live startup separately decrypts the treasury keystore and fails closed on signer/address or role mismatches.
 
 ### 1.5 State File Check
 
@@ -212,7 +227,7 @@ In shadow mode, the engine runs the full pipeline **except** the final on-chain 
 - [ ] ≥50 simulation runs completed with plausible candidates
 - [ ] Zero unexpected breaker trips (trips should only occur on manual test)
 - [ ] Simulated profit within 10% of actual on-chain liquidations (tracked manually or via script)
-- [ ] All 10 EOA wallets funded and balance-checked
+- [ ] Every active, non-excluded EOA-pool worker is funded and balance-checked
 - [ ] Operator has manually tripped and cleared a test breaker at least once
 - [ ] Grafana dashboard shows clean, readable metrics for 7 consecutive days
 - [ ] `chimera_revert_total` remains at 0 (no on-chain reverts possible in shadow)
@@ -227,13 +242,34 @@ python scripts/toggle_shadow.py --set-live
 
 This enforces the 7-day shadow rule and writes the mode transition to `core/state/mode.json`.
 
-**Step 2**: Edit `config/pacing.yaml`
+**Step 2**: Set live mode only in the protected deployment-local environment (shell, service `EnvironmentFile`, or secret manager):
 
-```yaml
-execute_mode: live
+```bash
+export CHIMERA_EXECUTE_MODE=live
 ```
 
-**Step 3**: Reload config (requires restart in v1)
+Do not change or overwrite checked-in `config/pacing.yaml`; it must remain `execute_mode: shadow`.
+
+**Step 3**: Complete the standalone Executor and signer preflight before starting live execution:
+
+```bash
+# Require deployed standalone Executor bytecode and the canonical Aave Pool.
+cast code "$CHIMERA_EXECUTOR_ADDRESS" --rpc-url "$BASE_RPC_URL"
+cast call "$CHIMERA_EXECUTOR_ADDRESS" "pool()(address)" --rpc-url "$BASE_RPC_URL"
+
+# Repeat for every active, non-excluded address in the deployment-local EOA pool.
+cast call "$CHIMERA_EXECUTOR_ADDRESS" "isWorker(address)(bool)" \
+  <ACTIVE_WORKER_ADDRESS> --rpc-url "$BASE_RPC_URL"
+
+# Verify EOA-pool/signer parity, then native gas funding.
+python scripts/provision_wallets.py --verify --eoa-pool "$CHIMERA_EOA_POOL_PATH"
+python scripts/check_balances.py --rpc "$BASE_RPC_URL" \
+  --eoa-pool "$CHIMERA_EOA_POOL_PATH" --chain base --min-balance 0.01
+```
+
+Require non-empty Executor bytecode, exact `pool()` equality, `isWorker(address) == true` for every active non-excluded worker, treasury signer/address parity, one decrypted signer per active non-excluded EOA-pool worker, a treasury native balance of at least the configured `refund_topup_eth`, and every active non-excluded worker at or above `min_worker_balance_eth`. Live startup checks these conditions and must fail closed. Explicitly accept the standard-RPC/public-orderflow risk or add and validate protected submission before real-money operation.
+
+**Step 4**: Reload config (requires restart)
 
 ```bash
 # Stop current instance
@@ -243,30 +279,32 @@ pkill chimera
 cargo run --release --bin chimera
 ```
 
-**Step 4**: Verify live mode is active
+**Step 5**: Verify live mode is active
 
 ```bash
 tail -f logs/chimera.log.$(date +%Y-%m-%d) | grep execute_mode
 # Expected: "execute_mode: live"
 ```
 
-**Step 5**: First live execution watch
+**Step 6**: First live execution watch
 
 - Stay at the terminal for the first 1–2 hours.
 - Monitor Grafana and logs in real time.
 - Confirm the first execution produces the expected `LiquidationCall` event on BaseScan/Arbiscan.
-- Verify profit landed in the expected EOA.
+- Verify the first debt-token profit remains in Executor, then withdraw it through the owner multisig with `withdraw(token, amount)`; profit is not expected in the worker EOA.
 
-**Rollback to shadow** (immediate, no restart required in future versions; v1 requires restart):
+**Rollback to shadow** (restart required):
 
 ```bash
 # Set shadow via toggle script
 python scripts/toggle_shadow.py --set-shadow
-# Edit config back to shadow
-echo "execute_mode: shadow" > config/pacing.yaml
+# Set the deployment-local override back to shadow (also update the service env file/secret manager).
+export CHIMERA_EXECUTE_MODE=shadow
 # Restart engine
 pkill chimera && cargo run --release --bin chimera
 ```
+
+Never overwrite `config/pacing.yaml` during rollback; preserve its complete checked-in shadow configuration.
 
 ---
 
@@ -379,14 +417,14 @@ These are **normal operating ranges** for a healthy Chimera instance in shadow o
 | Candidates seen / day | 5–50 | Depends on market volatility; spikes during large price drops |
 | Simulations run / day | 5–50 | One per candidate; may be lower if pacing gates deny early |
 | Executions / day | 1–4 | Capped by daily limit and 6h minimum interval |
-| Executions / week | 7–20 | Weekly cap ($5,000) is the hard ceiling |
+| Executions / week | 7–20 | Weekly cap ($7,500) is the hard ceiling |
 
 ### 5.2 Financial
 
 | Metric | Normal Range | Notes |
 |--------|-------------|-------|
-| Daily net USD | $0–$1,666 | Hard cap; operator should never see >$1,666 |
-| Weekly net USD | $0–$5,000 | Hard cap |
+| Daily net USD | $0–$2,000 | Hard cap; operator should never see >$2,000 |
+| Weekly net USD | $0–$7,500 | Hard cap |
 | Single execution profit | $10–$800 | Most profitable liquidations are $20–$200 on L2 |
 | Daily loss (ETH) | $0–$0.005 | Hard cap; includes gas + negative outcomes |
 | Profit multiplier | 2.5x–10x | Minimum 2.5x; higher is normal in calm markets |
@@ -434,19 +472,19 @@ These are **normal operating ranges** for a healthy Chimera instance in shadow o
 In addition to the daily checklist, perform these tasks once per week:
 
 1. **Rotate snapshots**: Delete `core/snapshots/*.json` older than 7 days to save disk space.
-2. **Review Grafana**: Check the weekly financial panel. Confirm weekly net is within $5,000.
+2. **Review Grafana**: Check the weekly financial panel. Confirm weekly net is within $7,500.
 3. **Audit logs**: Search for any `SimulationFailed` or `FeeQueryError` events. File a bug if reproducible.
 4. **Update venues**: Run `python scripts/update_venues.py` or manually verify liquidity thresholds.
-5. **Keystore backup**: Copy `encrypted_keystore/` to an offline encrypted USB drive. Test decryption.
+5. **Keystore backup**: Back up the deployment-local `$CHIMERA_TREASURY_KEYSTORE` and `$CHIMERA_WORKER_KEYSTORE_DIR` to offline encrypted media, never inside the repository. Test restoration and rerun `python scripts/provision_wallets.py --verify --eoa-pool "$CHIMERA_EOA_POOL_PATH"` without exposing keys.
 6. **Dependency check**: Run `cargo outdated` (if installed) or review `Cargo.lock` for critical security updates.
-7. **Profit reconciliation**: Compare Grafana daily net against on-chain balance changes (manual in v1).
+7. **Profit reconciliation**: Compare Grafana daily net against Executor token balances and owner-multisig withdrawals. Rust `SweepScheduler` manages native worker gas only; Executor token profit uses owner-multisig `withdraw(token, amount)`. `scripts/sweep_profits.py` is a legacy/manual raw-key helper, not the primary profit path.
 
 ---
 
 ## 7. Monthly Tasks
 
 1. **Full system restart**: Stop the engine, archive `core/state/outcomes.jsonl`, and restart to verify cold-boot behavior.
-2. **EOA rotation**: Generate a new pool of 10 clean wallets and update `encrypted_keystore/`.
+2. **EOA rotation**: Rotate the configured active worker set using deployment-local `$CHIMERA_WORKER_KEYSTORE_DIR` and `$CHIMERA_EOA_POOL_PATH`; verify every active, non-excluded worker, then have the Executor-owner multisig revoke retired workers and authorize replacements.
 3. **Config review**: Re-evaluate caps against actual performance. Do not increase without 30 days of shadow data.
 4. **Disaster recovery drill**: Restore `outcomes.jsonl` from backup and confirm engine resumes correctly.
 

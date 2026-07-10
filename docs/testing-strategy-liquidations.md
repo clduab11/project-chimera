@@ -1,6 +1,13 @@
 # Testing Strategy: Near-100% Accurate REVM Simulation for Aave V3 Liquidations on L2 (Base/Arbitrum)
 
-**Goal**: Achieve simulation fidelity such that every profitable liquidation candidate identified in simulation has >99.5% probability of succeeding on-chain when submitted within the same block (accounting for L2 sequencer latency). This is critical for the $50-start, zero-capital-risk model (flash-loan or direct atomic bundles) and the strict pacing/circuit-breaker protections.
+**Goal**: Achieve simulation fidelity such that every profitable liquidation candidate identified in simulation has >99.5% probability of succeeding on-chain when submitted within the same block (accounting for L2 sequencer latency). This is critical for the standalone Executor flash-loan model and the strict pacing/circuit-breaker protections.
+
+**Active execution shape**: authorized worker → standalone
+`Executor.execute(bytes)` → Executor calls Aave
+`flashLoanSimple(receiver=Executor)` → Pool calls
+`executeOperation(caller=Pool, initiator=Executor)` → Executor liquidates, swaps,
+approves repayment, and retains debt-token profit. Tests and simulations must not
+substitute a worker-originated Pool flash loan or any legacy entry point.
 
 **Research Insights Incorporated (from Aave v3-origin source, docs, MEV analyses 2026)**:
 
@@ -78,7 +85,9 @@
 - eMode entry/exit + mixed collateral portfolios.
 - Isolation mode debt ceiling edge (exactly at ceiling).
 - MIN_* threshold boundaries (exactly 2000e8, exactly MIN_LEFTOVER_BASE).
-- Flash-loan + liquidation atomic bundle (if using Aave flash for capital efficiency).
+- Standalone Executor flash-loan flow, including the owner/worker entry gate,
+  `receiver=Executor`, Pool-only callback, `initiator=Executor`, repayment, and
+  retained-profit balance.
 - L2 fee model stress: high L1 blob congestion (spike eth_getL1Fee 3-5x).
 - Concurrent simulation: 50 parallel liquidations from same fork state (race conditions).
 - Oracle failure / sentinel (PriceOracleSentinel) paths on L2.
@@ -90,6 +99,39 @@
 - Subgraph reconciliation: detected at-risk users match Aave UI "liquidations" tab.
 - Gas accounting: Simulated total cost (L2 + L1) within 5% of real inclusion cost on 100 recent txs.
 - End-to-end bundle: Build full Executor calldata, simulate in REVM, then dry-run on live fork RPC (eth_call) → must match.
+
+### 4.1 Foundry Executor Coverage
+- Run `forge test --root contracts/ --match-path test/Executor.t.sol -vvv`.
+- The current standalone flow is covered by
+  `testAuthorizedWorkerExecutesFullFlashLoanFlow`, `testOwnerCanExecute`,
+  `testUnauthorizedWorkerCannotExecute`,
+  `testLegacyDirectExecSelectorIsRemoved`,
+  `testExecuteRejectsWrongPayloadLengths`,
+  `testExecuteRejectsZeroAssetAndAmount`,
+  `testExecuteRejectsUnconfiguredPool`,
+  `testFlashLoanFailureRevertsAtomically`,
+  `testProfitGateStillRevertsFullFlow`,
+  `testExecuteOperationRejectsWrongCaller`,
+  `testExecuteOperationRejectsWrongInitiator`,
+  `testExecuteOperationRejectsWrongPayloadLengths`,
+  `testSetWorkerOnlyOwnerAndViewReflectsChanges`, `testSetPoolOnlyOwner`,
+  `testConstructionOwnerIsConfigured`, `testWithdrawOnlyOwner`,
+  `testWithdrawNativeByOwner`, `testTransferOwnershipOnlyOwner`,
+  `testConstructorRejectsMissingOwnerArgument`,
+  `testRequestAndCallbackShapesAreExact`, and
+  `testSelectorsMatchCanonicalSignatures`.
+- `testLegacyDirectExecSelectorIsRemoved` is a negative regression test: the
+  old selector must remain rejected.
+- `ExecutorBaseFork.t.sol` is opt-in. The configuration test
+  `testBaseForkStandaloneExecutorConfiguration` skips unless `BASE_FORK_URL` is
+  set locally. Never store the URL in source or documentation.
+- The real-fork test `testBaseForkRealLiquidationWhenConfigured` also requires
+  explicit opportunity inputs in `BASE_LIQUIDATION_USER`,
+  `BASE_COLLATERAL_TOKEN`, `BASE_DEBT_TOKEN`, `BASE_DEBT_AMOUNT`,
+  `BASE_DEX_ROUTER`, and `BASE_AMOUNT_OUT_MIN`; `BASE_MIN_PROFIT` is optional.
+  Treat all values as local environment inputs, never secrets or committed
+  configuration. The test skips when required values are absent and never
+  broadcasts.
 
 ### 5. Continuous Calibration & Monitoring (Production)
 - Shadow mode (first 7-14 days): Every real on-chain liquidation is compared to what our detector+sim would have done. Log accuracy, false negatives (missed profitable), false positives (sim said yes, on-chain reverted or unprofitable).
@@ -115,7 +157,8 @@
 
 ## Implementation Notes for the Vertical Slice
 - Pre-filter (fast, pure math in Rust) for HF < 1.05 using cached prices + indexes (from snapshot_generator or periodic refresh).
-- Full REVM path: Build exact Pool.liquidationCall (or flash + liquidation) calldata against forked state at current head.
+- Full REVM path: Build the exact standalone `Executor.execute(bytes)` request
+  against forked state at current head and exercise its Aave callback flow.
 - Must use the same price oracle address and block.timestamp as the fork.
 - Cache warm: Pre-load all aToken/vDebt scaled balances + reserve indexes + oracle prices for at-risk users (reduces RPCs dramatically).
 - After sim: Re-apply exact L1 fee scalar + current L2 gas price + tip before final "profitable?" decision.

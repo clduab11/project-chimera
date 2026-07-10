@@ -6,10 +6,10 @@
 > gate below and then explicitly run `toggle_shadow.py --set-live`, which itself
 > enforces the 7-day soak rule.
 >
-> Honesty note: some referenced helpers are fully wired and some are still
-> partial (e.g. `sweep_profits.py` currently prints a ready message rather than
-> sweeping). Treat a partial helper as "verify/extend before relying on it,"
-> not "done." See `docs/first-run-onboarding.md` §8–10.
+> The live path uses a standalone multisig-owned Executor. Worker EOAs sign
+> ordinary EIP-1559 calls to `execute(bytes)`; there is no EIP-7702/delegation.
+> Private/protected submission is not wired, so the current path broadcasts raw
+> transactions to the configured standard RPC.
 >
 > Nothing in this repo has been validated end-to-end with the full toolchain in
 > this environment. Run the Pre-flight gate on a workstation with Rust, Foundry,
@@ -25,13 +25,15 @@ or explicitly documented before moving on.
 - [ ] `cargo test -p chimera-core` — green
 - [ ] `cargo test -p chimera-core test_load_valid_config` — config-load test passes (unit test in `core/src/config.rs`, not a separate integration test)
 - [ ] `forge test --root contracts/ -vvv` — green, including:
-  - [ ] owner/auth tests (`exec`, `setPool`, `withdraw` reject non-owner)
+  - [ ] owner/worker auth tests (`execute`, `setPool`, `setWorker`, `withdraw`)
   - [ ] withdraw path tests (ETH + ERC20, USDT-style no-return)
   - [ ] profit-gate overflow tests (`minProfit`/`tip` add-overflow guards)
-  - [ ] reentrancy tests (Executor atomic flow; FundDistributor known-gap noted)
+  - [ ] Executor atomic-flow and callback validation tests
   - [ ] constructor-owner test (owner set from appended arg)
   - [ ] `transferOwnership` tests (happy path + zero-address rejection)
   - [ ] pool-validation test (`executeOperation` rejects non-pool caller)
+  - [ ] initiator-validation test (`executeOperation` rejects initiator other than Executor)
+  - [ ] worker authorization tests (`setWorker` / `isWorker`)
 - [ ] `python -m compileall scripts ai-audit/scripts` — clean
 - [ ] `cargo audit` — clean or each advisory documented (incl. RUSTSEC-2024-0437 risk-accept rationale)
 - [ ] `slither contracts --config-file slither.config.json` — clean or findings triaged
@@ -49,29 +51,32 @@ Deploy and exercise on testnet before any mainnet deployment.
 - [ ] Deploy via `contracts/script/Deploy.s.sol` to **Base Sepolia** and/or **Arbitrum Sepolia**
 - [ ] Confirm Executor `owner()` == the intended **multisig** address
 - [ ] Confirm `multisig.code.length > 0` (owner is a deployed contract, not an EOA typo)
-- [ ] Call `setPool(<aaveV3Pool>)` **from the multisig**; verify the pool address reads back from slot 1:
+- [ ] Call `setPool(<canonicalAaveV3Pool>)` **from the multisig**; verify with the public getter:
       ```bash
-      cast storage <EXECUTOR_ADDRESS> 1 --rpc-url <RPC_URL>
+      cast call <EXECUTOR_ADDRESS> "pool()(address)" --rpc-url <RPC_URL>
       ```
-      Note: The Executor contract has no `pool()` public view getter. Use `cast storage` to read slot 1 directly.
-- [ ] `FundDistributor`: constructor `_owner` set; then `transferOwnership(multisig)`
-- [ ] `FundDistributor`: multisig calls `acceptOwnership`; confirm `owner` == multisig and `pendingOwner` == 0
-- [ ] Verify both contracts on the block explorer (source + constructor args)
+- [ ] From the multisig, call `setWorker(<worker>, true)` for **every active worker**; verify each with `isWorker(address)`
+- [ ] Verify Executor on the block explorer (source + construction owner argument)
 - [ ] Smoke test on testnet: one end-to-end liquidation via flash loan; confirm `Profit` event and profit gate behavior
-- [ ] Confirm an unauthorized caller is rejected (non-owner `exec`/`withdraw`, non-pool `executeOperation`)
-- [ ] Repeat the owner/pool verification on **mainnet** addresses before §5
+- [ ] Confirm the worker sends an ordinary EIP-1559 transaction to Executor `execute(bytes)`, not to Aave Pool and not via delegation
+- [ ] Confirm Executor calls `flashLoanSimple` with itself as receiver and rejects a non-pool callback or non-Executor initiator
+- [ ] Confirm an unauthorized caller is rejected (`execute`, `setPool`, `setWorker`, `withdraw`)
+- [ ] Repeat owner/pool/worker authorization verification on **mainnet** addresses before §5
 
 ---
 
 ## 3. Operational Setup
 
 - [ ] Encrypted keystore created **outside the repo**; never committed (confirm `.gitignore`)
-- [ ] `CHIMERA_KEYSTORE_PATH` and `CHIMERA_KEYSTORE_PASSWORD` set in the host env
+- [ ] `CHIMERA_TREASURY_KEYSTORE`, `CHIMERA_WORKER_KEYSTORE_DIR`, and `CHIMERA_KEYSTORE_PASSWORD` set in the protected host environment; there is no `CHIMERA_KEYSTORE_PATH` requirement
+- [ ] `CHIMERA_EXECUTOR_ADDRESS`, `CHIMERA_TREASURY_ADDRESS`, and `CHIMERA_EOA_POOL_PATH` set to deployment-local values
 - [ ] `CHIMERA_OPERATOR_TOKEN` set (gates `clear_breaker`); strong, not reused
-- [ ] RPC env(s) set (`BASE_RPC_URL` / `ARB_RPC_URL` are now wired in `main.rs`; `RPC_URL` used as fallback)
-- [ ] `config/eoa_pool.json` populated with **public addresses only**, using the `wallets` key (the `workers` vs `wallets` mismatch is resolved; `fund_eoa.py` now reads `wallets`)
-- [ ] Worker EOAs funded via `fund_eoa.py` (verify the script reads `wallets` key and your treasury key is available; default funding is ~0.02 ETH/worker)
-- [ ] `check_balances.py` confirms worker balances are gas-sized and treasury is cold
+- [ ] RPC env set (`BASE_RPC_URL` or fallback `RPC_URL`); credentials are not committed or logged
+- [ ] EOA pool populated with **public addresses only** using `wallets`; checked-in placeholders replaced or excluded and never funded
+- [ ] Treasury keystore address equals `CHIMERA_TREASURY_ADDRESS`; treasury is not an active worker
+- [ ] Every active EOA-pool address has a matching encrypted worker keystore
+- [ ] Treasury and workers funded with **gas ETH only**; Aave flash loans supply liquidation capital
+- [ ] `check_balances.py` confirms each active worker is at or above `min_worker_balance_eth` and the treasury has ETH for refunds
 - [ ] `config/pacing.yaml` reviewed — caps sane and conservative:
   - [ ] `max_daily_net_usd` (default $2,000)
   - [ ] `max_weekly_net_usd` (default $7,500)
@@ -86,6 +91,7 @@ Deploy and exercise on testnet before any mainnet deployment.
 - [ ] `chimera_breaker_state` reads `0` at startup
 - [ ] Run `health_check.py --rpc <RPC_URL> --metrics-port <ACTUAL_PORT>` — there is no `--full` flag; use the flags above
 - [ ] Run `check_balances.py --chain base --min-balance 0.01` to verify worker balances (default `--min-balance` is `0.0`; explicitly set the threshold you expect)
+- [ ] Confirm Rust `SweepScheduler` behavior in shadow/testnet: excess **native ETH** sweep and worker refund; `sweep_tokens` is unused and ERC20 sweeping is not implemented there
 
 ---
 
@@ -109,13 +115,17 @@ as designed before any capital is at risk.
 Only enter this section after §1–4 are fully satisfied.
 
 - [ ] Soak evidence archived (metrics export + log summary for the 7-day window)
-- [ ] Multisig ownership re-confirmed for both contracts on mainnet (§2)
+- [ ] Standalone Executor bytecode and multisig ownership re-confirmed on mainnet (§2)
+- [ ] Executor `pool()` equals the canonical Aave Pool and `isWorker` is true for every active worker
+- [ ] Treasury signer/address parity, EOA-pool/signer parity, and live funding checks pass
 - [ ] `docs/emergency-procedures.md` reviewed by the operator on duty
 - [ ] Rollback path documented and the operator can execute it from memory (§6)
 - [ ] Run `toggle_shadow.py --set-live` — **this enforces the 7-day rule**; if it refuses, the soak is not satisfied, stop
-- [ ] Start with **small capital** (minimum viable worker balances) for the first live window
+- [ ] Start with minimum viable **gas ETH** for treasury and workers; do not deposit trading/liquidation capital
 - [ ] Watch the first ~10 live ops at reduced sizing; confirm inclusion > 85% and no breaker trips
-- [ ] Sweep first profits with a manual/verified path (do not rely on the `sweep_profits.py` skeleton unsupervised)
+- [ ] Explicitly assess the unwired private/protected-submission risk before real money; current raw transactions use the standard RPC
+- [ ] Verify debt-token profit remains in Executor, then consolidate it with multisig `withdraw(token, amount)`
+- [ ] Verify the Rust scheduler manages worker native gas ETH; do not treat `scripts/sweep_profits.py` as the Executor-profit or primary scheduled path
 
 ---
 
@@ -128,7 +138,7 @@ this in the §4 drill.
 - [ ] **Return to safe mode:** `toggle_shadow.py --set-shadow` (logs only, no execution)
 - [ ] **Recover funds:**
   - [ ] Executor: `withdraw(token, amount)` from the multisig owner (amount `0` = full balance; `token=0` = native ETH)
-  - [ ] FundDistributor: `emergencyWithdraw()` from the multisig owner
+- [ ] **Disable/revoke:** multisig calls `setWorker(worker, false)` for affected workers and may call `setPool(address(0))` to disable Executor execution
 - [ ] **Rotate exposure:** `rotate_eoa.py` (pool hygiene) and, if keys may be compromised, rotate keys manually
 - [ ] Do not clear the breaker until root cause is resolved; `clear_breaker` requires `CHIMERA_OPERATOR_TOKEN` by design
 - [ ] File an incident using the template in `docs/emergency-procedures.md`; leave the system explicitly paused or in shadow — never ambiguous

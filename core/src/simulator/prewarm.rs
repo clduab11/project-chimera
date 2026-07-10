@@ -61,9 +61,8 @@ where
         }
 
         fn visit_str<E: de::Error>(self, s: &str) -> Result<u128, E> {
-            s.parse::<u128>().map_err(|_| {
-                de::Error::invalid_value(de::Unexpected::Str(s), &self)
-            })
+            s.parse::<u128>()
+                .map_err(|_| de::Error::invalid_value(de::Unexpected::Str(s), &self))
         }
     }
 
@@ -127,10 +126,16 @@ pub struct ReserveData {
     // --- Snapshot indices / rates / timestamps consumed at offsets 1 and 3.
     //     Previously hard-coded to RAY / zero; now sourced from the snapshot JSON.
     /// Current liquidity index as a RAY (1e27). Defaults to RAY for mock snapshots.
-    #[serde(default = "default_ray_u128", deserialize_with = "deser_u128_or_string")]
+    #[serde(
+        default = "default_ray_u128",
+        deserialize_with = "deser_u128_or_string"
+    )]
     pub liquidity_index: u128,
     /// Current variable borrow index as a RAY (1e27). Defaults to RAY for mock snapshots.
-    #[serde(default = "default_ray_u128", deserialize_with = "deser_u128_or_string")]
+    #[serde(
+        default = "default_ray_u128",
+        deserialize_with = "deser_u128_or_string"
+    )]
     pub variable_borrow_index: u128,
     /// Current stable borrow rate as a RAY (1e27). Defaults to 0.
     #[serde(default, deserialize_with = "deser_u128_or_string")]
@@ -329,8 +334,8 @@ pub fn pre_warm_db<ExtDB: revm::database_interface::DatabaseRef>(
 
             // Offset 1: liquidityIndex (128 bits high) + currentLiquidityRate (128 bits low).
             // Aave V3 ReserveData struct order: liquidityIndex, currentLiquidityRate pack together.
-            let offset1 = (U256::from(reserve.liquidity_index) << 128)
-                | U256::from(reserve.liquidity_rate);
+            let offset1 =
+                (U256::from(reserve.liquidity_index) << 128) | U256::from(reserve.liquidity_rate);
             let _ = db.insert_account_storage(snapshot.pool, base + U256::from(1), offset1);
 
             // Offset 2: variableBorrowIndex (128 bits high) + currentVariableBorrowRate (128 bits low).
@@ -545,17 +550,23 @@ mod tests {
             "offset 0 config word must match packed bitmap"
         );
         // Offset 1: liquidityIndex << 128 | liquidity_rate.
-        let stored_offset1 = pool_storage.get(&(base + U256::from(1))).expect("offset 1 must exist");
+        let stored_offset1 = pool_storage
+            .get(&(base + U256::from(1)))
+            .expect("offset 1 must exist");
         let expected_offset1 = (U256::from(snapshot.reserves[0].liquidity_index) << 128)
             | U256::from(snapshot.reserves[0].liquidity_rate);
         assert_eq!(*stored_offset1, expected_offset1, "offset 1 pack mismatch");
         // Offset 2: variableBorrowIndex << 128 | variable_borrow_rate.
-        let stored_offset2 = pool_storage.get(&(base + U256::from(2))).expect("offset 2 must exist");
+        let stored_offset2 = pool_storage
+            .get(&(base + U256::from(2)))
+            .expect("offset 2 must exist");
         let expected_offset2 = (U256::from(snapshot.reserves[0].variable_borrow_index) << 128)
             | U256::from(snapshot.reserves[0].variable_borrow_rate);
         assert_eq!(*stored_offset2, expected_offset2, "offset 2 pack mismatch");
         // Offset 3: stable_borrow_rate << 128 | (id << 40) | last_update_timestamp.
-        let stored_offset3 = pool_storage.get(&(base + U256::from(3))).expect("offset 3 must exist");
+        let stored_offset3 = pool_storage
+            .get(&(base + U256::from(3)))
+            .expect("offset 3 must exist");
         let expected_offset3 = (U256::from(snapshot.reserves[0].stable_borrow_rate) << 128)
             | (U256::from(snapshot.reserves[0].id) << 40)
             | U256::from(snapshot.reserves[0].last_update_timestamp);
@@ -696,19 +707,40 @@ mod tests {
             serde_json::from_str(json).expect("snapshot must deserialize");
 
         let reserve = &snapshot.reserves[0];
-        assert_eq!(reserve.liquidity_rate, 3_000_000_000_000_000_000_000_000u128);
-        assert_eq!(reserve.variable_borrow_rate, 5_000_000_000_000_000_000_000_000u128);
-        assert_eq!(reserve.total_variable_debt, 500_000_000_000_000_000_000_000u128);
-        assert_eq!(reserve.liquidity_index, 1_056_789_123_456_789_123_456_789_123u128);
-        assert_eq!(reserve.variable_borrow_index, 1_034_567_891_234_567_891_234_567_891u128);
-        assert_eq!(reserve.stable_borrow_rate, 2_000_000_000_000_000_000_000_000u128);
+        assert_eq!(
+            reserve.liquidity_rate,
+            3_000_000_000_000_000_000_000_000u128
+        );
+        assert_eq!(
+            reserve.variable_borrow_rate,
+            5_000_000_000_000_000_000_000_000u128
+        );
+        assert_eq!(
+            reserve.total_variable_debt,
+            500_000_000_000_000_000_000_000u128
+        );
+        assert_eq!(
+            reserve.liquidity_index,
+            1_056_789_123_456_789_123_456_789_123u128
+        );
+        assert_eq!(
+            reserve.variable_borrow_index,
+            1_034_567_891_234_567_891_234_567_891u128
+        );
+        assert_eq!(
+            reserve.stable_borrow_rate,
+            2_000_000_000_000_000_000_000_000u128
+        );
         assert_eq!(reserve.last_update_timestamp, 1_751_420_000u64);
         assert_eq!(reserve.id, 3);
         assert_eq!(reserve.emode_category, 1);
         assert_eq!(reserve.emode_liquidation_threshold, 9300);
         assert_eq!(reserve.emode_liquidation_bonus, 10200);
         assert!(!reserve.a_token.is_zero(), "a_token must be populated");
-        assert!(!reserve.variable_debt_token.is_zero(), "variable_debt_token must be populated");
+        assert!(
+            !reserve.variable_debt_token.is_zero(),
+            "variable_debt_token must be populated"
+        );
         assert!(reserve.active, "active must default true / be present");
         assert!(!reserve.frozen);
         assert!(!reserve.paused);

@@ -1,7 +1,7 @@
 //! Integration test: orchestrator pacing + detector + EOA validation
 //! Run: cargo test --test integration_test
 
-use chimera_core::{PacingConfig, PacingEngine, Opportunity};
+use chimera_core::{Opportunity, PacingConfig, PacingEngine};
 use rust_decimal::Decimal;
 
 #[test]
@@ -19,8 +19,10 @@ fn orchestrator_pacing_allows_valid_liquidation() {
     };
 
     let decision = engine.check(&opp).unwrap();
-    assert!(matches!(decision, chimera_core::PacingDecision::Allow { .. }),
-        "Valid liquidation should pass pacing gate");
+    assert!(
+        matches!(decision, chimera_core::PacingDecision::Allow { .. }),
+        "Valid liquidation should pass pacing gate"
+    );
 }
 
 #[test]
@@ -38,6 +40,8 @@ fn orchestrator_pacing_denies_over_single_cap() {
     };
 
     let decision = engine.check(&opp).unwrap();
-    assert!(matches!(decision, chimera_core::PacingDecision::Deny { .. }),
-        "Over-cap liquidation should be denied");
+    assert!(
+        matches!(decision, chimera_core::PacingDecision::Deny { .. }),
+        "Over-cap liquidation should be denied"
+    );
 }

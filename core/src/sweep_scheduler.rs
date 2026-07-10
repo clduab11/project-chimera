@@ -1,4 +1,3 @@
-use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy::consensus::{SignableTransaction, TxEip1559};
@@ -7,6 +6,7 @@ use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, TxKind, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{info, warn};
@@ -89,7 +89,16 @@ where
             }
         };
 
-        let min_keep_wei = decimal_eth_to_wei(self.config.sweep_min_keep_eth);
+        let min_keep_wei = match native_reserve_wei(
+            self.config.sweep_min_keep_eth,
+            self.config.min_worker_balance_eth,
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(error = %e, "Sweep: invalid native reserve configuration");
+                return;
+            }
+        };
         let gas_cost = U256::from(21000) * U256::from(gas_price);
 
         for worker in self.registry.worker_addresses() {
@@ -188,8 +197,20 @@ where
 
         let treasury_addr = treasury_signer.address;
 
-        let min_balance_wei = decimal_eth_to_wei(self.config.min_worker_balance_eth);
-        let fund_wei = decimal_eth_to_wei(self.config.refund_topup_eth);
+        let min_balance_wei = match decimal_eth_to_wei(self.config.min_worker_balance_eth) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(error = %e, "Refund: invalid worker balance threshold");
+                return;
+            }
+        };
+        let fund_wei = match decimal_eth_to_wei(self.config.refund_topup_eth) {
+            Ok(value) => value,
+            Err(e) => {
+                warn!(error = %e, "Refund: invalid top-up amount");
+                return;
+            }
+        };
 
         let gas_price = match self.provider.get_gas_price().await {
             Ok(gp) => gp,
@@ -250,7 +271,10 @@ where
             return;
         }
 
-        if let Err(e) = treasury_signer.sync_from_chain(self.provider.as_ref()).await {
+        if let Err(e) = treasury_signer
+            .sync_from_chain(self.provider.as_ref())
+            .await
+        {
             warn!(error = %e, "Refund: treasury nonce sync failed");
             return;
         }
@@ -299,9 +323,76 @@ where
     }
 }
 
-fn decimal_eth_to_wei(eth: Decimal) -> U256 {
-    let wei_str = (eth * Decimal::from(1_000_000_000_000_000_000u64))
-        .round()
-        .to_string();
-    U256::from_str(&wei_str).unwrap_or(U256::ZERO)
+fn native_reserve_wei(
+    sweep_min_keep_eth: Decimal,
+    min_worker_balance_eth: Decimal,
+) -> Result<U256, String> {
+    let min_gas_budget_eth = Decimal::from(crate::executor::balance::MIN_GAS_BUDGET_WEI as u64)
+        / Decimal::from(1_000_000_000_000_000_000u64);
+    decimal_eth_to_wei(
+        sweep_min_keep_eth
+            .max(min_worker_balance_eth)
+            .max(min_gas_budget_eth),
+    )
+}
+
+fn decimal_eth_to_wei(eth: Decimal) -> Result<U256, String> {
+    if eth < Decimal::ZERO {
+        return Err(format!("ETH amount must not be negative: {eth}"));
+    }
+    let scaled = eth * Decimal::from(1_000_000_000_000_000_000u64);
+    if scaled.fract() != Decimal::ZERO {
+        return Err(format!("ETH amount has precision below one wei: {eth} ETH"));
+    }
+    scaled
+        .to_u128()
+        .map(U256::from)
+        .ok_or_else(|| format!("ETH amount is outside the supported wei range: {eth} ETH"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn native_reserve_uses_worker_minimum_when_it_is_higher() {
+        assert_eq!(
+            native_reserve_wei(dec!(0.005), dec!(0.01)).unwrap(),
+            U256::from(12_500_000_000_000_000u64)
+        );
+    }
+
+    #[test]
+    fn native_reserve_uses_sweep_minimum_when_it_is_higher() {
+        assert_eq!(
+            native_reserve_wei(dec!(0.02), dec!(0.01)).unwrap(),
+            U256::from(20_000_000_000_000_000u64)
+        );
+    }
+
+    #[test]
+    fn decimal_eth_conversion_is_exact_and_rejects_subwei_precision() {
+        assert_eq!(
+            decimal_eth_to_wei(dec!(0.123456789012345678)).unwrap(),
+            U256::from(123_456_789_012_345_678u64)
+        );
+        assert!(decimal_eth_to_wei(dec!(0.0000000000000000001)).is_err());
+    }
+
+    #[test]
+    fn sweep_reserve_guarantees_min_gas_budget_floor() {
+        let min_gas_budget_wei = crate::executor::balance::MIN_GAS_BUDGET_WEI as u64;
+        let reserve = native_reserve_wei(dec!(0.005), dec!(0.01))
+            .expect("default config values must produce a valid reserve");
+        assert!(
+            reserve >= U256::from(min_gas_budget_wei),
+            "sweep reserve {reserve} wei must be >= MIN_GAS_BUDGET_WEI ({min_gas_budget_wei} wei / 0.0125 ETH)"
+        );
+        assert_eq!(
+            reserve,
+            U256::from(min_gas_budget_wei),
+            "with default config (0.005 sweep / 0.01 worker), reserve should equal the MIN_GAS_BUDGET floor of 0.0125 ETH"
+        );
+    }
 }

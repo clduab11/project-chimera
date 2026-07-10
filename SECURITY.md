@@ -67,14 +67,18 @@ failure should result in loss of funds.
 
 ### Private Key Management
 
-- **Encrypted keystore files** — private keys for worker EOAs are stored in
-  encrypted keystore files outside the repository. These files are listed in
-  `.gitignore` and must **never** be committed.
+- **Encrypted keystore files** — private keys for the gas treasury and worker
+  EOAs are stored in encrypted keystore files outside the repository and must
+  **never** be committed. Passwords are loaded through
+  `CHIMERA_KEYSTORE_PASSWORD`, never echoed or passed as CLI arguments.
 - **`config/eoa_pool.json`** — contains only **public addresses** and rotation
   metadata. No private keys, no mnemonics, no encrypted key material.
 - **No hot wallet private keys in configuration files** — `pacing.yaml`,
   `risk.yaml`, `routing.yaml`, `pools.toml`, and all other config files contain
   only operational parameters.
+- **Distinct roles** — the Executor-owner multisig controls pool/worker
+  authorization and profit withdrawals; the treasury signer funds worker gas;
+  workers sign only ordinary EIP-1559 Executor calls and native gas maintenance.
 
 ### Shadow-Mode-First Execution
 
@@ -109,19 +113,43 @@ running in a no-op loop but skips all detect/simulate/submit work.
 
 ### Multi-Signature Deployment Requirement
 
-- Before any live capital is committed, both `Executor.yul` (owner = slot 0)
-  and `FundDistributor.sol` (owner) **must** be owned by a multisig wallet with
-  deployed code.
-- `contracts/script/Deploy.s.sol` enforces multisig-owned deployment at the
-  Forge script level.
-- Single-EOA ownership is permitted only in shadow/testing mode.
+- The standalone `Executor.yul` owner is set at construction and **must** be a
+  deployed multisig contract before live operation. There is no lazy owner
+  initialization.
+- Worker EOAs send ordinary EIP-1559 transactions to `execute(bytes)`; there is
+  no EIP-7702 or delegation path. The multisig must call
+  `setWorker(worker, true)` for every active worker and revoke retired workers.
+- The multisig must call `setPool(canonicalPool)`. Live startup verifies
+  Executor bytecode, `pool()` equality, and `isWorker` for every active worker.
+- Successful debt-token profit remains in Executor until multisig
+  `withdraw(token, amount)`.
 
 ### EOA Pool Rotation
 
 - Worker EOAs carry small gas-only balances and are treated as disposable.
+- Aave flash loans supply liquidation capital; treasury/worker deposits are not
+  strategy capital.
 - `scripts/rotate_eoa.py` performs round-robin rotation with a cooldown period.
 - If funds are at risk, `scripts/rotate_wallet.py` can rotate the active hot
   wallet immediately.
+- Rotation is incomplete until the EOA-pool entry, encrypted keystore set, and
+  Executor `setWorker` authorization agree.
+
+### Live Startup and Gas Automation
+
+- The required runtime inputs are `BASE_RPC_URL` or `RPC_URL`,
+  `CHIMERA_EXECUTOR_ADDRESS`, `CHIMERA_TREASURY_ADDRESS`,
+  `CHIMERA_TREASURY_KEYSTORE`, `CHIMERA_WORKER_KEYSTORE_DIR`,
+  `CHIMERA_EOA_POOL_PATH`, and `CHIMERA_KEYSTORE_PASSWORD`. There is no
+  `CHIMERA_KEYSTORE_PATH` requirement.
+- Live startup fails closed on treasury signer/address mismatch, missing active
+  worker signers, duplicate/invalid roles, zero treasury gas balance, or a
+  worker below `min_worker_balance_eth`.
+- The Rust `SweepScheduler` sweeps excess **native ETH** from workers to the gas
+  treasury and refunds underfunded workers. It does not sweep ERC20 tokens;
+  `sweep_tokens` is currently unused.
+- `scripts/sweep_profits.py` is an implemented legacy/manual raw-key helper. It
+  is not the Executor-profit path and is not primary scheduled automation.
 
 ---
 
@@ -166,10 +194,10 @@ The following risks are documented in the threat model
 ### Flash Loan Atomicity Assumptions
 
 The Executor contract relies on Aave V3's single-transaction flash-loan
-callback. If the callback is invoked outside the expected atomic context,
-or if the Aave pool address changes without an on-chain update, the
-execution could fail or be exploited. Mitigations: pool validation against
-slot 1, initiator check, exact 288-byte params. Status: **Mitigated**
+callback. Executor calls configured Pool `flashLoanSimple` with itself as the
+receiver. The callback requires `caller() == pool()` and
+`initiator == Executor`, plus exact parameter framing. Live startup checks the
+public `pool()` getter against the canonical runtime Pool. Status: **Mitigated**
 (see threat model §4).
 
 ### Oracle Staleness Window
@@ -182,11 +210,11 @@ profit gate is enforced on-chain regardless of oracle data. Status:
 
 ### MEV Competition / Frontrunning
 
-Submissions go through a standard RPC provider. Searchers can observe the
-mempool and front-run liquidations. Mitigation: profit gate with `tip`
-parameter makes theft self-defeating for the attacker, but does not
-prevent it. **Private submission (Flashbots/MEV-Share) is planned but not
-yet wired.** Status: **Open** (see threat model §6, risk #4).
+Signed raw EIP-1559 transactions go through the configured standard RPC.
+Searchers or provider infrastructure may observe and front-run liquidations.
+The on-chain profit gate limits adverse execution but does not provide orderflow
+privacy. **Private/protected submission is not wired and is recommended before
+real-money operation.** Status: **Open** (see threat model §6, risk #4).
 
 ### L2 Sequencer Risks
 
@@ -224,10 +252,14 @@ Before any live execution with real capital, the following must be completed:
 3. Dependency CVE triage (`cargo audit`, `pip-audit`, `osv-scanner`) — resolve
    or document-accept all findings.
 4. Mandatory 7-day shadow soak with clean metrics.
-5. Multisig ownership deployed for both `Executor` and `FundDistributor`.
-6. Encrypted keystore provisioned outside the repository.
-7. Private transaction submission (Flashbots/MEV-Share) evaluated and enabled.
-8. FundDistributor reentrancy guard added (deferred — see threat model §5).
+5. Standalone Executor deployed with construction-time multisig ownership;
+   canonical Pool set and every active worker authorized.
+6. Encrypted treasury/worker keystores provisioned outside the repository, with
+   treasury-address and active EOA-pool parity verified.
+7. Gas treasury funded for refunds and every active worker at or above
+   `min_worker_balance_eth`; no trading capital deposited.
+8. Private/protected transaction submission implemented and validated, or the
+   residual standard-RPC exposure explicitly accepted before any real money.
 
 Consult `docs/threat-model.md` for the full risk matrix and
 `docs/emergency-procedures.md` for incident response workflows.

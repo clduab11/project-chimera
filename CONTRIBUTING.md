@@ -4,7 +4,7 @@ This is a private repository. These guidelines are for maintainers and invited c
 
 ## Shadow-Mode-First Principle
 
-The engine runs in shadow mode by default. **Never auto-flip to live.** The `execute_mode` field in config and fixtures must always commit as `shadow`. The shadow-to-live transition is gated in code (`toggle_shadow.py`) and requires a mandatory 7-day shadow soak, an encrypted keystore, and a multisig-owned deployment.
+The engine runs in shadow mode by default. **Never auto-flip to live.** The `execute_mode` field in config and fixtures must always commit as `shadow`. The shadow-to-live transition is gated in code (`toggle_shadow.py`) and requires a mandatory 7-day shadow soak, encrypted treasury/worker keystores, a multisig-owned standalone Executor, canonical Aave Pool configuration, and authorization of every active worker.
 
 The `shadow-guard` CI job blocks any PR that flips `execute_mode: live` in committed files.
 
@@ -81,7 +81,7 @@ These constraints must be preserved in every change:
 | 1 | `config/pacing.yaml` values must match `core/src/config.rs` defaults and the `valid_yaml()` test fixture | Configuration drift breaks pacing enforcement |
 | 2 | `docs/snapshot-schema.md` must stay synchronized with `core/src/simulator/prewarm.rs` `ReserveData` struct | Schema mismatch produces corrupted simulation state |
 | 3 | Monetary values use Rust `Decimal`, not `f64` | Floating-point rounding is unacceptable in financial calculations |
-| 4 | EVM contracts target Cancun only (`foundry.toml` `evm_version = "cancun"`) | Inconsistent EVM versions across contracts cause divergent behavior |
+| 4 | EVM contracts target Cancun only (`foundry.toml` `evm_version = "cancun"`) | The standalone Executor and its tests must execute under the same EVM semantics |
 | 5 | Python scripts must remain importable without `web3.py` installed (graceful fallback) | Operator tooling must work on minimal environments |
 | 6 | All executor contract changes require a corresponding Foundry test in `contracts/test/` | Untested contract changes risk MEV loss |
 
@@ -110,7 +110,7 @@ These constraints must be preserved in every change:
 ## Module Boundaries
 
 - **`core/`** — Rust engine library. `lib.rs` re-exports the public API. Binary entry at `main.rs` (orchestrator). Trait boundaries: `PriceOracle`, `TransactionExecutor`, `StatePersistence`.
-- **`contracts/`** — EVM execution layer. `Executor.yul` is the flash-loan atomic liquidation contract. `interfaces/` contains Solidity interfaces for cross-contract calls.
+- **`contracts/`** — EVM execution layer. `Executor.yul` is the standalone, construction-owned flash-loan liquidation contract. Authorized worker EOAs call `execute(bytes)` with ordinary EIP-1559 transactions; there is no EIP-7702/delegation model. `interfaces/` contains Solidity interfaces for cross-contract calls.
 - **`config/`** — YAML/TOML/JSON configuration consumed by core (Rust) and scripts (Python). Schema documented in `docs/snapshot-schema.md` or inline.
 - **`scripts/`** — Python operational tooling: snapshot generator, wallet rotation, DEX venue discovery, emergency pause.
 - **`ai-audit/`** — Auxiliary, optional contract scanner. Independent of the liquidation engine.

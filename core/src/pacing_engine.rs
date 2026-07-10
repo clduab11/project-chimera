@@ -1,4 +1,4 @@
-﻿//! Pacing Engine - The financial governor and risk-control layer for Chimera.
+//! Pacing Engine - The financial governor and risk-control layer for Chimera.
 //! Pure logic (no I/O in hot path). Enforces every cap, jitter window, and breaker from the Executive Brief.
 //! Called on EVERY candidate opportunity before any simulation or submission.
 //! Post-outcome updates are also mandatory.
@@ -108,7 +108,12 @@ impl PacingEngineInner {
             };
         }
         // EOA pool validation: if a pool is loaded, the opportunity must use a known EOA.
-        if !self.eoa_rotation.is_empty() && !self.eoa_rotation.contains(&opp.eoa) {
+        if !self.eoa_rotation.is_empty()
+            && !self
+                .eoa_rotation
+                .iter()
+                .any(|eoa| eoa.eq_ignore_ascii_case(&opp.eoa))
+        {
             return PacingDecision::Deny {
                 reason: format!("EOA {} not in clean pool", opp.eoa),
             };
@@ -374,7 +379,7 @@ impl PacingEngine {
                 cached_eth_price: None,
             }
         };
-                Self {
+        Self {
             inner: Arc::new(RwLock::new(inner)),
             state_path,
             state_persistence: None,
@@ -437,7 +442,7 @@ impl PacingEngine {
         if let Some(addresses) = value.as_array() {
             return Ok(addresses
                 .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
                 .collect());
         }
         let wallets = value
@@ -449,10 +454,17 @@ impl PacingEngine {
         Ok(wallets
             .iter()
             .filter_map(|wallet| {
+                let excluded = wallet
+                    .get("excluded")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if excluded {
+                    return None;
+                }
                 wallet
                     .get("address")
                     .and_then(|v| v.as_str())
-                    .map(str::to_string)
+                    .map(|s| s.to_lowercase())
             })
             .collect())
     }
@@ -679,9 +691,7 @@ impl CrossProcessPacing {
         Ok(())
     }
 
-    fn load_reservations(
-        path: &std::path::Path,
-    ) -> Result<Vec<ReservationRecord>, ChimeraError> {
+    fn load_reservations(path: &std::path::Path) -> Result<Vec<ReservationRecord>, ChimeraError> {
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -756,10 +766,9 @@ impl CrossProcessPacing {
     ) -> Result<(), ChimeraError> {
         let mut content = String::new();
         for record in records {
-            let line =
-                serde_json::to_string(record).map_err(|e| {
-                    ChimeraError::PersistenceError(format!("Reservation serialization: {e}"))
-                })?;
+            let line = serde_json::to_string(record).map_err(|e| {
+                ChimeraError::PersistenceError(format!("Reservation serialization: {e}"))
+            })?;
             content.push_str(&line);
             content.push('\n');
         }
@@ -772,10 +781,9 @@ impl CrossProcessPacing {
         path: &std::path::Path,
         record: &ReservationRecord,
     ) -> Result<(), ChimeraError> {
-        let line =
-            serde_json::to_string(record).map_err(|e| {
-                ChimeraError::PersistenceError(format!("Reservation serialization: {e}"))
-            })?;
+        let line = serde_json::to_string(record).map_err(|e| {
+            ChimeraError::PersistenceError(format!("Reservation serialization: {e}"))
+        })?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -847,7 +855,8 @@ impl CrossProcessPacing {
         // Recover realized usage from the shared outcomes audit trail so that
         // caps include prior settled outcomes (not just open reservations).
         let (realized_daily, realized_weekly) = if self.outcomes_path.exists() {
-            Self::recover_realized_usage(&self.outcomes_path).unwrap_or((Decimal::ZERO, Decimal::ZERO))
+            Self::recover_realized_usage(&self.outcomes_path)
+                .unwrap_or((Decimal::ZERO, Decimal::ZERO))
         } else {
             (Decimal::ZERO, Decimal::ZERO)
         };
@@ -889,11 +898,7 @@ impl CrossProcessPacing {
 
     /// Settle a reservation after outcome recording. Moves the reservation
     /// from `Reserved` → `Settled`.
-    pub fn settle(
-        &self,
-        reservation_id: &str,
-        chain_id: u64,
-    ) -> Result<(), ChimeraError> {
+    pub fn settle(&self, reservation_id: &str, chain_id: u64) -> Result<(), ChimeraError> {
         let path = self.reservations_path(chain_id);
         let _lock = self.acquire_lock()?;
         let mut records = Self::load_reservations(&path)?;
@@ -961,42 +966,42 @@ mod tests {
 
     fn make_test_config() -> PacingConfig {
         PacingConfig {
-            max_daily_net_usd:       Decimal::from(2000),
-            max_weekly_net_usd:      Decimal::from(7500),
+            max_daily_net_usd: Decimal::from(2000),
+            max_weekly_net_usd: Decimal::from(7500),
             max_single_transfer_usd: Decimal::from(1000),
-            min_interval_hours:      6,
-            max_jitter_hours:        12,
-            venue_rotation_count:    5,
-            clean_eoa_pool_size:     10,
-            auto_halt_on_reverts:    3,
-            max_gas_gwei:            300,
-            max_daily_loss_eth:      Decimal::from_str("0.005").unwrap(),
-            min_profit_multiplier:   Decimal::from_str("2.5").unwrap(),
-            execute_mode:            "shadow".into(),
-            log_level:               "info".into(),
-            metrics_port:            9100,
-            chain_id:                8453,
+            min_interval_hours: 6,
+            max_jitter_hours: 12,
+            venue_rotation_count: 5,
+            clean_eoa_pool_size: 10,
+            auto_halt_on_reverts: 3,
+            max_gas_gwei: 300,
+            max_daily_loss_eth: Decimal::from_str("0.005").unwrap(),
+            min_profit_multiplier: Decimal::from_str("2.5").unwrap(),
+            execute_mode: "shadow".into(),
+            log_level: "info".into(),
+            metrics_port: 9100,
+            chain_id: 8453,
             oracle_staleness_seconds: 300,
-            eth_price_usd_fallback:  Decimal::from(1800),
-            eth_usd_feed_address:   "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into(),
+            eth_price_usd_fallback: Decimal::from(1800),
+            eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into(),
             recent_outcomes_capacity: 128,
-            eoa_pool_path:           "nonexistent_eoa_pool.json".into(),
-            pools_toml_path:         "config/pools.toml".into(),
-            executor_address:        "".into(),
-            treasury_address:        "".into(),
-            treasury_keystore:       "".into(),
-            worker_keystore_dir:     "".into(),
-            sweep_interval_secs:     300,
-            refund_interval_secs:    3600,
-            min_worker_balance_eth:  Decimal::from_str("0.01").unwrap(),
-        refund_topup_eth:        Decimal::from_str("0.05").unwrap(),
-        sweep_tokens: vec![],
-        sweep_min_keep_eth: Decimal::from_str("0.005").unwrap(),
-        ws_endpoint: String::new(),
+            eoa_pool_path: "nonexistent_eoa_pool.json".into(),
+            pools_toml_path: "config/pools.toml".into(),
+            executor_address: "".into(),
+            treasury_address: "".into(),
+            treasury_keystore: "".into(),
+            worker_keystore_dir: "".into(),
+            sweep_interval_secs: 300,
+            refund_interval_secs: 3600,
+            min_worker_balance_eth: Decimal::from_str("0.01").unwrap(),
+            refund_topup_eth: Decimal::from_str("0.05").unwrap(),
+            sweep_tokens: vec![],
+            sweep_min_keep_eth: Decimal::from_str("0.005").unwrap(),
+            ws_endpoint: String::new(),
+        }
     }
-}
 
-#[test]
+    #[test]
     fn test_allows_under_all_caps() {
         let engine = PacingEngine::new(make_test_config());
         let opp = Opportunity {
@@ -1053,7 +1058,8 @@ mod tests {
         let decision = engine.check(&opp2).unwrap();
         assert!(
             matches!(decision, PacingDecision::Deny { ref reason } if reason.contains("rotation")),
-            "Expected venue rotation denial, got {:?}", decision
+            "Expected venue rotation denial, got {:?}",
+            decision
         );
     }
 
@@ -1076,7 +1082,8 @@ mod tests {
             let decision = engine.check(&opp).unwrap();
             assert!(
                 matches!(decision, PacingDecision::Allow { .. }),
-                "Venue {} should be allowed on first use", venue
+                "Venue {} should be allowed on first use",
+                venue
             );
             engine.record_outcome(&opp, Decimal::from(10), Decimal::ZERO, false);
         }
@@ -1105,10 +1112,10 @@ mod tests {
         config.eoa_pool_path = pool_path.to_str().unwrap().to_string();
         config.clean_eoa_pool_size = 3;
         let engine = PacingEngine::new(config);
-        assert_eq!(engine.select_next_eoa(), Some("0xA".to_string()));
-        assert_eq!(engine.select_next_eoa(), Some("0xB".to_string()));
-        assert_eq!(engine.select_next_eoa(), Some("0xC".to_string()));
-        assert_eq!(engine.select_next_eoa(), Some("0xA".to_string()));
+        assert_eq!(engine.select_next_eoa(), Some("0xa".to_string()));
+        assert_eq!(engine.select_next_eoa(), Some("0xb".to_string()));
+        assert_eq!(engine.select_next_eoa(), Some("0xc".to_string()));
+        assert_eq!(engine.select_next_eoa(), Some("0xa".to_string()));
     }
 
     #[test]
@@ -1132,7 +1139,42 @@ mod tests {
         let decision = engine.check(&opp).unwrap();
         assert!(
             matches!(decision, PacingDecision::Deny { ref reason } if reason.contains("not in clean pool")),
-            "Expected EOA validation denial, got {:?}", decision
+            "Expected EOA validation denial, got {:?}",
+            decision
+        );
+    }
+
+    #[test]
+    fn test_eip55_checksummed_eoa_canonicalized_to_lowercase() {
+        // EIP-55 checksummed addresses loaded from the pool are lowercased,
+        // so they match the orchestrator's `format!("0x{:x}", addr)` output.
+        let dir = tempfile::tempdir().unwrap();
+        let pool_path = dir.path().join("eoa_pool.json");
+        let checksummed = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F";
+        let pool = vec![checksummed.to_string()];
+        std::fs::write(&pool_path, serde_json::to_string(&pool).unwrap()).unwrap();
+        let mut config = make_test_config();
+        config.eoa_pool_path = pool_path.to_str().unwrap().to_string();
+        config.clean_eoa_pool_size = 1;
+        let engine = PacingEngine::new(config);
+        let selected = engine.select_next_eoa().unwrap();
+        assert_eq!(
+            selected,
+            checksummed.to_lowercase(),
+            "Pool address should be canonicalized to lowercase"
+        );
+        let opp = Opportunity {
+            id: "test-eip55".into(),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 1,
+            venue: "test-dex".into(),
+            eoa: selected,
+            timestamp: Utc::now(),
+        };
+        let decision = engine.check(&opp).unwrap();
+        assert!(
+            matches!(decision, PacingDecision::Allow { .. }),
+            "Checksummed-then-lowercased EOA should pass pacing check"
         );
     }
 
@@ -1172,7 +1214,8 @@ mod tests {
         let decision = engine.check(&opp).unwrap();
         assert!(
             matches!(decision, PacingDecision::Deny { ref reason } if reason == "InsufficientProfit"),
-            "Expected InsufficientProfit denial, got {:?}", decision
+            "Expected InsufficientProfit denial, got {:?}",
+            decision
         );
     }
 
@@ -1190,7 +1233,8 @@ mod tests {
         let decision = engine.check(&opp).unwrap();
         assert!(
             matches!(decision, PacingDecision::Allow { .. }),
-            "Expected Allow, got {:?}", decision
+            "Expected Allow, got {:?}",
+            decision
         );
     }
 
@@ -1219,14 +1263,35 @@ mod tests {
     /// valid in a `static`. Poisoning is recovered via `into_inner`.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    struct OperatorTokenGuard(Option<String>);
+
+    impl OperatorTokenGuard {
+        fn set(value: Option<&str>) -> Self {
+            let previous = std::env::var("CHIMERA_OPERATOR_TOKEN").ok();
+            match value {
+                Some(value) => std::env::set_var("CHIMERA_OPERATOR_TOKEN", value),
+                None => std::env::remove_var("CHIMERA_OPERATOR_TOKEN"),
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for OperatorTokenGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("CHIMERA_OPERATOR_TOKEN", value),
+                None => std::env::remove_var("CHIMERA_OPERATOR_TOKEN"),
+            }
+        }
+    }
+
     #[test]
     fn clear_breaker_succeeds_with_valid_token() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CHIMERA_OPERATOR_TOKEN", "s3cret");
+        let _env = OperatorTokenGuard::set(Some("s3cret"));
         let engine = PacingEngine::new(make_test_config());
         engine.inner.write().breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
         let res = engine.clear_breaker("s3cret");
-        std::env::remove_var("CHIMERA_OPERATOR_TOKEN");
         assert!(res.is_ok(), "expected Ok, got {:?}", res);
         assert!(!engine.is_breaker_active(), "breaker should be cleared");
     }
@@ -1234,14 +1299,14 @@ mod tests {
     #[test]
     fn clear_breaker_rejects_wrong_token() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("CHIMERA_OPERATOR_TOKEN", "s3cret");
+        let _env = OperatorTokenGuard::set(Some("s3cret"));
         let engine = PacingEngine::new(make_test_config());
         engine.inner.write().breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
         let res = engine.clear_breaker("wrong-token");
-        std::env::remove_var("CHIMERA_OPERATOR_TOKEN");
         assert!(
             matches!(res, Err(ChimeraError::ConfigError(_))),
-            "expected ConfigError, got {:?}", res
+            "expected ConfigError, got {:?}",
+            res
         );
         // Breaker must remain tripped after a rejected clear.
         assert!(engine.is_breaker_active(), "breaker must stay tripped");
@@ -1250,13 +1315,14 @@ mod tests {
     #[test]
     fn clear_breaker_rejects_without_env() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("CHIMERA_OPERATOR_TOKEN");
+        let _env = OperatorTokenGuard::set(None);
         let engine = PacingEngine::new(make_test_config());
         engine.inner.write().breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
         let res = engine.clear_breaker("anything");
         assert!(
             matches!(res, Err(ChimeraError::ConfigError(_))),
-            "expected ConfigError, got {:?}", res
+            "expected ConfigError, got {:?}",
+            res
         );
         assert!(engine.is_breaker_active(), "breaker must stay tripped");
     }
@@ -1345,10 +1411,16 @@ mod tests {
         let cached_price = Decimal::from(3000);
         engine.inner.write().cached_eth_price = Some(cached_price);
         let cost_cached = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
-        assert!(cost_cached > cost_fallback, "cached price 3000 should produce higher cost than fallback 1800");
+        assert!(
+            cost_cached > cost_fallback,
+            "cached price 3000 should produce higher cost than fallback 1800"
+        );
         engine.inner.write().cached_eth_price = None;
         let cost_after_clear = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
-        assert_eq!(cost_after_clear, cost_fallback, "after clearing cache, should fall back to config");
+        assert_eq!(
+            cost_after_clear, cost_fallback,
+            "after clearing cache, should fall back to config"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1360,7 +1432,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         let opp = Opportunity {
             id: "opp-1".into(),
@@ -1390,7 +1463,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         // Reserve most of the daily cap
         let opp1 = Opportunity {
@@ -1424,7 +1498,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl")).with_ttl(0); // TTL=0 minutes
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"))
+                .with_ttl(0); // TTL=0 minutes
 
         let opp = Opportunity {
             id: "opp-expire".into(),
@@ -1446,7 +1522,11 @@ mod tests {
         assert_eq!(records[0].status, ReservationStatus::Expired);
 
         let (daily, _weekly) = pacing.global_totals(8453).unwrap();
-        assert_eq!(daily, Decimal::ZERO, "expired reservations should not count toward totals");
+        assert_eq!(
+            daily,
+            Decimal::ZERO,
+            "expired reservations should not count toward totals"
+        );
     }
 
     #[test]
@@ -1456,10 +1536,12 @@ mod tests {
         let res_dir = dir.path().join("reservations");
 
         let engine1 = PacingEngine::new(make_test_config());
-        let pacing1 = CrossProcessPacing::new(engine1, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing1 =
+            CrossProcessPacing::new(engine1, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         let engine2 = PacingEngine::new(make_test_config());
-        let pacing2 = CrossProcessPacing::new(engine2, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing2 =
+            CrossProcessPacing::new(engine2, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         let opp1 = Opportunity {
             id: "p1-opp".into(),
@@ -1504,7 +1586,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         let opp1 = Opportunity {
             id: "opp-1".into(),
@@ -1591,7 +1674,8 @@ NOT_VALID_JSON
         std::fs::write(&bad_path, "GARBAGE\n").unwrap();
 
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         let opp = Opportunity {
             id: "opp-1".into(),
@@ -1617,7 +1701,8 @@ NOT_VALID_JSON
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         // Reserve on chain 8453
         let opp1 = Opportunity {
@@ -1681,7 +1766,10 @@ NOT_VALID_JSON
         engine.inner.write().cached_eth_price = Some(Decimal::from(2000));
         // refresh_eth_price is async but with no oracle it's a no-op.
         // Verify that the cached price is unchanged.
-        assert_eq!(engine.inner.read().cached_eth_price, Some(Decimal::from(2000)));
+        assert_eq!(
+            engine.inner.read().cached_eth_price,
+            Some(Decimal::from(2000))
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1694,7 +1782,8 @@ NOT_VALID_JSON
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         let opp = Opportunity {
             id: "tokio-test".into(),
@@ -1708,7 +1797,10 @@ NOT_VALID_JSON
         // This must NOT panic — recover_realized_usage now uses sync I/O
         // instead of creating a nested Tokio runtime.
         let result = pacing.try_reserve(&opp, 8453);
-        assert!(result.is_ok(), "try_reserve should succeed from tokio context");
+        assert!(
+            result.is_ok(),
+            "try_reserve should succeed from tokio context"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1721,7 +1813,8 @@ NOT_VALID_JSON
         let dir = tempfile::tempdir().unwrap();
         let res_dir = dir.path().join("reservations");
         let engine = PacingEngine::new(make_test_config());
-        let pacing = CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
+        let pacing =
+            CrossProcessPacing::new(engine, res_dir.clone(), dir.path().join("outcomes.jsonl"));
 
         // Step 1: Record a realized outcome to drive up local counters.
         // The engine's inner daily_net_usd will rise but the global cap
@@ -1735,12 +1828,9 @@ NOT_VALID_JSON
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
         };
-        pacing.engine().record_outcome(
-            &opp1,
-            Decimal::from(500),
-            Decimal::ZERO,
-            false,
-        );
+        pacing
+            .engine()
+            .record_outcome(&opp1, Decimal::from(500), Decimal::ZERO, false);
 
         // Inner counter is now 500.
         assert_eq!(
@@ -1814,8 +1904,10 @@ NOT_VALID_JSON
         };
 
         // IDs must differ (same borrower, same chain, different times)
-        assert_ne!(opp1.id, opp2.id,
-            "Repeated opportunities for the same borrower must have unique IDs");
+        assert_ne!(
+            opp1.id, opp2.id,
+            "Repeated opportunities for the same borrower must have unique IDs"
+        );
 
         // Both should be independently allowed (no collision)
         let d1 = engine.check(&opp1).unwrap();
@@ -1828,8 +1920,10 @@ NOT_VALID_JSON
 
         // Verify both outcomes are tracked in daily usage
         let state = engine.current_risk_state();
-        assert_eq!(state.daily_net_usd, Decimal::from(200),
-            "Both opportunities should be independently counted");
+        assert_eq!(
+            state.daily_net_usd,
+            Decimal::from(200),
+            "Both opportunities should be independently counted"
+        );
     }
 }
-

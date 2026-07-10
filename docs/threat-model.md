@@ -20,18 +20,18 @@
 Chimera combines a local Rust engine, two on-chain contracts, and a set of local
 Python operator scripts. The core insight for threat modeling is that **the
 funds path is gated at two layers**: the Rust pacing engine (off-chain, decides
-*whether* to act) and the on-chain contracts (owner/pool-gated, decide *who* may
-act). Neither layer trusts the network or the counterparties.
+*whether* to act) and the on-chain contracts (owner/worker/pool-gated, decide
+*who* may act). Neither layer trusts the network or the counterparties.
 
 ### 1.1 Components
 
 | Component | Location | Trust level | Notes |
 |---|---|---|---|
 | Rust engine (`chimera-core`) | Local host | Trusted (operator-owned) | Detector, simulator, oracle, pacing engine, executor/submitter |
-| Yul `Executor` | On-chain (Base/Arbitrum) | Semi-trusted, owner + pool gated | Flash-loan atomic liquidation; storage slot 0 = owner, slot 1 = pool |
+| Standalone Yul `Executor` | On-chain (Base/Arbitrum) | Semi-trusted, owner + worker + pool gated | Worker calls `execute(bytes)`; Executor initiates and receives the Aave flash loan; storage slot 0 = owner, slot 1 = pool, slot 2 = worker mapping root |
 | `FundDistributor.sol` | On-chain | Semi-trusted, `Ownable` two-step | Batch ETH top-ups to worker EOAs |
 | Operator scripts (`scripts/`) | Local host | Trusted (operator-owned) | Funding, sweep, rotation, snapshot, emergency, health |
-| Worker EOAs | Hot keys | Low trust (disposable) | Small gas-only balances; rotated for hygiene |
+| Worker EOAs | Hot keys | Low trust (disposable) | Explicitly authorized callers of `Executor.execute(bytes)`; small native gas-only balances; rotated for hygiene |
 | Treasury | Cold wallet / multisig | Highest trust | Never touches the engine directly |
 | Encrypted keystore | Local host (outside repo) | Highest trust | Operator's responsibility; never committed |
 | RPC provider | External | **Untrusted** | Can lie, stall, censor, or front-run |
@@ -53,8 +53,9 @@ act). Neither layer trusts the network or the counterparties.
    (local <->    \   +------------------------------------+      |
     on-chain)     \  |  ON-CHAIN (semi-trusted, gated)    |      |
                    \ |  Executor.yul   FundDistributor.sol|      |
-                    \|  owner=slot0    Ownable two-step   |      |
-                     |  pool =slot1    onlyOwner          |      |
+                     \|  owner=slot0    Ownable two-step   |      |
+                      |  pool =slot1    onlyOwner          |      |
+                      |  workers=slot2 mapping             |      |
                      +-----------------+------------------+      |
                                        ^                         |
    ====================================|=========================|====
@@ -85,10 +86,12 @@ act). Neither layer trusts the network or the counterparties.
 ```
 
 **Boundary A — local ↔ on-chain.** Everything crossing this boundary is a signed
-transaction or a read. On-chain contracts re-validate authority (owner/pool)
-and economics (profit gate) because the local side cannot be assumed correct by
-the chain, and the chain/counterparties cannot be assumed correct by the local
-side.
+transaction or a read. The standalone Executor re-validates that `execute(bytes)`
+comes from its owner or an explicitly authorized worker; the configured Pool is
+the callback caller; and the callback initiator is the Executor itself. It also
+re-validates economics with the on-chain profit gate because the local side
+cannot be assumed correct by the chain, and the chain/counterparties cannot be
+assumed correct by the local side.
 
 **Boundary B — host perimeter.** If the host is compromised, the keystore
 password and operator token are reachable; this is treated as a catastrophic,
@@ -108,7 +111,7 @@ the repo. `config/eoa_pool.json` holds **public addresses only**.
 | Worker EOA funds | Directly spendable hot ETH (gas) | Worker keys (hot) |
 | Treasury funds | The bulk of capital | Cold wallet / multisig |
 | Encrypted keystore / private keys | Compromise = total loss of controllable funds | Local host, outside repo |
-| Executor transient token balances | Mid-transaction debt/collateral tokens held by `Executor` | On-chain, during the atomic op |
+| Executor token balances | Mid-transaction debt/collateral plus retained debt-token profit | Standalone on-chain `Executor`; profit remains until owner-only withdrawal |
 | Operator token (`CHIMERA_OPERATOR_TOKEN`) | Gates `clear_breaker`; protects the breaker from unauthorized clears | Env var on host |
 | Config integrity | `pacing.yaml` caps/breakers are the financial guardrails; drift removes protection | `config/`, mirrored in `config.rs` |
 
@@ -136,16 +139,17 @@ that addresses it. "Slot 0/1" refer to `Executor.yul` storage.
 | STRIDE | Scenario | Control / mitigation | Status |
 |---|---|---|---|
 | **Spoofing** | Attacker contract calls `executeOperation` pretending to be the Aave pool | Pool validation: `caller()` must equal `sload(1)`; else `InvalidPool` revert (`Executor.yul` CASE A) | Mitigated |
-| **Spoofing** | Attacker calls `exec`, `setPool`, `withdraw`, or `transferOwnership` as if owner | Owner gate: `caller()` must equal `sload(0)`; else `Unauthorized` revert | Mitigated |
-| **Spoofing** | Lazy-init owner hijack: first caller becomes owner if slot 0 == 0 | No caller()-based lazy-init; ownership set only at construction or by explicit worker self-init; arbitrary external callers cannot seize worker-as-Executor | Mitigated |
+| **Spoofing** | Attacker calls `execute(bytes)` without authorization | Entry gate accepts only `sload(0)` owner or a worker explicitly enabled in the slot-2 mapping; else `Unauthorized` (`0x82b42900`) | Mitigated |
+| **Spoofing** | Attacker calls `setPool`, `setWorker`, `withdraw`, or `transferOwnership` as if owner | Owner gate: `caller()` must equal `sload(0)`; else `Unauthorized` revert | Mitigated |
+| **Spoofing** | Lazy/self-init owner hijack: first caller attempts to become owner | No lazy or caller-based initialization exists. Deployment requires exactly one nonzero construction-owner word; only `transferOwnership` can replace it | Mitigated |
 | **Tampering** | `pacing.yaml` edited to weaken caps; drifts from `config.rs` defaults | 3-way sync invariant (AGENTS.md #1): `pacing.yaml` ↔ `config.rs` defaults ↔ `valid_yaml()` fixture; CI/test must catch drift | Partial (enforced by test that must be run) |
 | **Tampering** | Snapshot poisoning: malicious Aave state fed to simulator | Snapshot schema contract (`docs/snapshot-schema.md` ↔ `prewarm.rs`); simulation re-derives economics; profit gate is on-chain regardless | Partial |
-| **Repudiation** | No record of why a decision/execution happened | JSONL audit trail (`StatePersistence`) logs every outcome with id, timestamp, venue, eoa, chain_id | Mitigated (library; wiring into `main.rs` still partial — see README §9) |
+| **Repudiation** | No record of why a decision/execution happened | JSONL audit trail (`StatePersistence`) logs every outcome with id, timestamp, venue, eoa, chain_id; `main.rs` wires `JsonlPersistence` into the pacing engine and cross-process reservation path | Mitigated |
 | **Information disclosure** | Keystore password or key leaked via logs | Password/keys never logged; logs go to stdout; keystore lives outside repo; `.gitignore` keeps secrets untracked | Partial (operator-dependent; no automated secret-scan gate yet) |
 | **DoS** | RPC timeout / transient failure stalls the loop | Retry/backoff on the submitter path; conservative behavior on read failure | Partial |
 | **DoS** | L2 sequencer stall / censorship strands a strategy | Atomic all-or-nothing op (no partial state); deadline param on swaps; engine halts rather than retries blindly | Partial (cannot prevent sequencer behavior; limits damage) |
 | **DoS** | Dependency advisory (e.g. RUSTSEC-2024-0437) in the tree | Risk-accepted with rationale (see §6); tracked via `cargo audit` in the validation gate | Accepted (documented) |
-| **Elevation** | Unauthorized `exec(bytes)` to run an arbitrary strategy | Owner gate on `exec` (slot 0) | Mitigated |
+| **Elevation** | Unauthorized `execute(bytes)` to run an arbitrary strategy | Owner-or-explicit-worker gate; worker grants and revocations are owner-only and readable through `isWorker(address)` | Mitigated |
 | **Elevation** | Unauthorized `withdraw` of Executor balances | Owner gate on `withdraw`; funds go only to `sload(0)` owner | Mitigated |
 | **Elevation** | Unauthorized `clear_breaker` to resume after a halt | `CHIMERA_OPERATOR_TOKEN` env gate; refuses if unset or mismatched | Mitigated |
 | **Elevation** | `transferOwnership(0)` re-enables lazy-init hijack | Zero-address rejection in `transferOwnership` (Executor) and `ZeroAddress` revert in FundDistributor | Mitigated |
@@ -158,13 +162,14 @@ that addresses it. "Slot 0/1" refer to `Executor.yul` storage.
 |---|---|---|---|
 | Reentrancy (Executor) | Re-enter during the atomic op | Single atomic flash-loan flow; profit gate and accounting computed from `balanceOf` after steps; no external calls after state is finalized | Mitigated |
 | Reentrancy (FundDistributor) | Recipient `.call{value}` re-enters `distribute`/`emergencyWithdraw` | **Known gap:** no `nonReentrant` guard. `onlyOwner` limits the caller to a trusted multisig and there is no post-transfer state to corrupt, but a guard is **deferred** and should be added before live | Open (deferred, documented) |
-| Profit-gate overflow | `balanceBefore + minProfit + tip` overflows to bypass the gate | Explicit add-overflow guards: each sum checked `lt(sum, prev)` → `ProfitGateFailed` (both CASE A and CASE B) | Mitigated |
-| Donation / price manipulation | Inflate balances or manipulate swap price to fake profit | Profit gate requires `balanceAfter > balanceBefore + minProfit + tip`; `amountOutMin` bounds the swap; oracle staleness window (`oracle_staleness_seconds`) | Partial |
+| Profit-gate overflow | `balanceBefore + premium + minProfit + tip` overflows to bypass the gate | Explicit add-overflow guards: each sum checked `lt(sum, prev)` → `ProfitGateFailed` | Mitigated |
+| Donation / price manipulation | Inflate balances or manipulate swap price to fake profit | Profit gate requires `balanceAfter > balanceBefore + premium + minProfit + tip`; `amountOutMin` bounds the swap; oracle staleness window (`oracle_staleness_seconds`) | Partial |
 | USDT no-return-value | Tokens that return nothing on `approve`/`transfer` | `callApprove` / `withdraw` treat empty returndata as success and only fail on explicit `false` | Mitigated |
 | Nonce collision in funding | Concurrent funding txns reuse a nonce | Addressed in funding path; sequential nonce handling | Mitigated (verify under load) |
 | Bad-debt liquidation | Liquidating a position that leaves uncovered bad debt | **Must-not-attempt:** simulator screens bad-debt coverage before submission; engine declines | Partial (relies on simulator fidelity) |
-| MEV front-running | Searcher steals the liquidation or sandwiches the swap | `tip` parameter and profit gate make unprofitable theft self-defeating for us; **private submission is not yet wired** — current state submits via standard RPC | Open (private submission planned) |
+| MEV front-running | Searcher steals the liquidation or sandwiches the swap | `tip`, `amountOutMin`, deadline, and profit gate bound damage, but current submission uses standard JSON-RPC and exposes the transaction to provider/mempool risks; private submission is not wired | Open |
 | Flash-loan callback abuse | Attacker triggers `executeOperation` with crafted params | Pool validation (slot 1) + initiator must equal contract address + exact 288-byte params + atomic revert on any failed step | Mitigated |
+| Profit theft by worker | Authorized worker redirects liquidation proceeds | The Executor is the flash-loan receiver, liquidation recipient, swap recipient, and repayment account. Profit remains in the Executor; workers cannot call owner-only `withdraw` | Mitigated |
 
 ---
 
@@ -190,6 +195,10 @@ These are **not** mitigated by code and must be tracked operationally:
    advisory with rationale documented in the dependency CVE triage; re-evaluate
    on each `cargo audit` run before a live milestone.
 7. **FundDistributor reentrancy guard deferred.** See §5; add before live.
+8. **Standard RPC/private-submission exposure remains open.** The live submitter
+   broadcasts through standard JSON-RPC. Provider leakage, public-mempool
+   visibility, censorship, and ordering risk remain until a private submission
+   path is implemented and validated.
 
 ---
 
@@ -201,7 +210,7 @@ High. Status: Mitigated / Partial / Accepted / Open.
 | # | Risk | Likelihood | Impact | Current mitigation | Status |
 |---|---|---|---|---|---|
 | 1 | Host compromise → key/keystore exfiltration | Low | High | Out-of-repo keystore, small hot balances, multisig contracts; no in-code defense | Open |
-| 2 | Lazy-init owner hijack on Executor (mis-deploy) | Low | High | Constructor owner arg + zero-addr reject + mandatory owner/pool verification step | Partial |
+| 2 | Executor deployment/configuration error | Low | High | Exact nonzero constructor owner arg; startup verifies deployed code, `pool()`, and every active `isWorker()` authorization | Partial |
 | 3 | Config drift weakens caps/breakers | Med | High | 3-way sync invariant + test fixture; CI must enforce | Partial |
 | 4 | MEV front-running steals liquidation | High | Med | Profit gate + tip; private submission not yet wired | Open |
 | 5 | Malicious DEX router/token drains mid-tx balance | Low | High | `amountOutMin`, profit gate, atomic revert, USDT-safe calls | Partial |

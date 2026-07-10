@@ -5,8 +5,8 @@
 //! and optionally a feed source closure. When the feed produces events, those
 //! are returned; on error or if no feed is configured, `BlockWatch` is used.
 
-use crate::ChimeraError;
 use crate::mempool::{BlockWatch, MempoolWatcher, WatchEvent};
+use crate::ChimeraError;
 use async_trait::async_trait;
 use std::{pin::Pin, sync::Arc};
 use tracing::{info, warn};
@@ -16,8 +16,11 @@ use tracing::{info, warn};
 /// Implementors might stream pending transactions from a sequencer's mempool
 /// endpoint, poll a custom API, or bridge proprietary feeds. The closure
 /// pattern keeps this trivially pluggable without requiring an additional trait.
-pub type FeedSource =
-    Arc<dyn Fn() -> Pin<Box<dyn std::future::Future<Output = Result<WatchEvent, ChimeraError>> + Send>> + Send + Sync>;
+pub type FeedSource = Arc<
+    dyn Fn() -> Pin<Box<dyn std::future::Future<Output = Result<WatchEvent, ChimeraError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// A [`MempoolWatcher`] that attempts to use a fast feed first, falling back
 /// to [`BlockWatch`] when the feed is unavailable, errors, or is not configured.

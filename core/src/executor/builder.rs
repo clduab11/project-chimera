@@ -1,7 +1,7 @@
 //! Calldata builder for common DeFi interactions.
 //!
-//! Uses [`alloy::sol!`] to generate type-safe ABI encoders for Aave V3
-//! liquidation / flash-loan and Uniswap V2 swap calls.
+//! Uses [`alloy::sol!`] to generate type-safe ABI encoders for the standalone
+//! Executor, Aave V3 interactions, and Uniswap V2 swaps.
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol_types::SolCall;
@@ -42,6 +42,26 @@ alloy::sol! {
     }
 }
 
+alloy::sol! {
+    struct ExecutorPayload {
+        address asset;
+        uint256 amount;
+        address collateral;
+        address user;
+        uint256 debtToCover;
+        bool receiveAToken;
+        address dexRouter;
+        uint256 amountOutMin;
+        uint256 minProfit;
+        uint256 tip;
+        uint256 deadline;
+    }
+
+    interface IExecutor {
+        function execute(bytes calldata params) external;
+    }
+}
+
 /// Builder for common DeFi calldata payloads.
 ///
 /// All methods return raw ABI-encoded `Bytes` ready to be placed in a
@@ -49,6 +69,43 @@ alloy::sol! {
 pub struct CalldataBuilder;
 
 impl CalldataBuilder {
+    /// Encode the standalone Executor `execute(bytes)` entry point. The inner
+    /// payload is exactly eleven static ABI words in contract order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_executor_execute(
+        asset: Address,
+        amount: U256,
+        collateral: Address,
+        user: Address,
+        debt_to_cover: U256,
+        receive_a_token: bool,
+        dex_router: Address,
+        amount_out_min: U256,
+        min_profit: U256,
+        tip: U256,
+        deadline: u64,
+    ) -> Bytes {
+        use alloy::sol_types::SolValue;
+
+        let payload = ExecutorPayload {
+            asset,
+            amount,
+            collateral,
+            user,
+            debtToCover: debt_to_cover,
+            receiveAToken: receive_a_token,
+            dexRouter: dex_router,
+            amountOutMin: amount_out_min,
+            minProfit: min_profit,
+            tip,
+            deadline: U256::from(deadline),
+        };
+        let call = IExecutor::executeCall {
+            params: Bytes::from(payload.abi_encode()),
+        };
+        Bytes::from(call.abi_encode())
+    }
+
     /// Encode an Aave V3 `liquidationCall`.
     ///
     /// # Arguments
@@ -85,7 +142,7 @@ impl CalldataBuilder {
     /// * `amount`          – Amount to borrow.
     /// * `params`          – ABI-encoded parameters forwarded to the receiver.
     pub fn build_flash_loan_simple(
-        pool: Address,
+        _pool: Address,
         receiver_address: Address,
         asset: Address,
         amount: U256,
@@ -187,6 +244,28 @@ mod tests {
     }
 
     #[test]
+    fn test_executor_execute_selector_and_inner_shape() {
+        let data = CalldataBuilder::build_executor_execute(
+            address!("0x1111111111111111111111111111111111111111"),
+            U256::from(2),
+            address!("0x3333333333333333333333333333333333333333"),
+            address!("0x4444444444444444444444444444444444444444"),
+            U256::from(5),
+            true,
+            address!("0x7777777777777777777777777777777777777777"),
+            U256::from(8),
+            U256::from(9),
+            U256::from(10),
+            11,
+        );
+        assert_eq!(&data[..4], IExecutor::executeCall::SELECTOR);
+        assert_eq!(data.len(), 4 + 32 + 32 + 11 * 32);
+        let mut length_word = [0u8; 32];
+        length_word.copy_from_slice(&data[36..68]);
+        assert_eq!(U256::from_be_bytes(length_word), U256::from(352u64));
+    }
+
+    #[test]
     fn test_dex_swap_non_empty() {
         let data = CalldataBuilder::build_dex_swap(
             Address::ZERO,
@@ -271,9 +350,15 @@ mod tests {
 
     #[test]
     fn test_flash_loan_simple_encodes_receiver_not_pool() {
-        let pool: Address = "0x1111111111111111111111111111111111111111".parse().unwrap();
-        let worker: Address = "0x2222222222222222222222222222222222222222".parse().unwrap();
-        let asset: Address = "0x3333333333333333333333333333333333333333".parse().unwrap();
+        let pool: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let worker: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let asset: Address = "0x3333333333333333333333333333333333333333"
+            .parse()
+            .unwrap();
         let amount = U256::from(1_000_000u64);
         let params = Bytes::from_static(&[0u8; 4]);
 
@@ -282,6 +367,9 @@ mod tests {
         let data = &encoded[4..];
         // receiverAddress is the first argument (offset 0..32).
         let decoded_receiver = Address::from_slice(&data[12..32]);
-        assert_eq!(decoded_receiver, worker, "receiver must equal supplied worker, not pool");
+        assert_eq!(
+            decoded_receiver, worker,
+            "receiver must equal supplied worker, not pool"
+        );
     }
 }

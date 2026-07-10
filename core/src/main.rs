@@ -500,9 +500,9 @@ fn resolve_aave_addresses(chain_id: u64) -> AaveAddresses {
     if chain_id == 42161 {
         AaveAddresses {
             pool: addr("0x794a61358D6845594F94dc1DB02A252b5b4814aD", "CHIMERA_AAVE_POOL"),
-            oracle: addr("0xb56c2F0B8Be1bd3C6f81A24fe035B91ea9E14711", "CHIMERA_AAVE_ORACLE"),
+            oracle: addr("0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7", "CHIMERA_AAVE_ORACLE"),
             pool_data_provider: addr(
-                "0x69FA688f1Dc47d4B5d8029D5a35FB7a5480d4d96",
+                "0x243Aa95cAC2a25651eda86e80bEe66114413c43b",
                 "CHIMERA_POOL_DATA_PROVIDER",
             ),
             weth: addr(
@@ -512,9 +512,9 @@ fn resolve_aave_addresses(chain_id: u64) -> AaveAddresses {
         }
     } else {
         AaveAddresses {
-            pool: addr("0xA238Dd80C259a72e81d7e4666a2CEDEcD3cA5cB", "CHIMERA_AAVE_POOL"),
+            pool: addr("0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", "CHIMERA_AAVE_POOL"),
             oracle: addr(
-                "0x2DaD3A13EF0C636622150F51bA8b404Fd4c56B98c",
+                "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156",
                 "CHIMERA_AAVE_ORACLE",
             ),
             pool_data_provider: addr(

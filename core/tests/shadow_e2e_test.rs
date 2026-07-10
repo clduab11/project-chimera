@@ -32,7 +32,7 @@ use chimera_core::{
         LiquidationDetector, MarketSnapshot, ReserveData, UserPosition,
     },
     routing::RoutingResolver,
-    state::{ReservationRecord, ReservationStatus},
+    state::{CrashRecovery, ReservationRecord, ReservationStatus},
     BreakerReason, CrossProcessPacing, JsonlPersistence, Metrics, Opportunity,
     Orchestrator, OrchestratorConfig, PacingDecision, PacingEngine, RpcSubmitter,
     SimulationResult, SignerRegistry, StrategyAssembler,
@@ -401,6 +401,15 @@ async fn test_e2e_orchestrator_shadow_with_mock_doubles_and_jsonl_recovery() {
     // (error code 5: Access denied). On non-Windows platforms, verify full roundtrip.
     #[cfg(not(target_os = "windows"))]
     {
+        // record_outcome spawns the JSONL append as a detached task; on the
+        // current-thread test runtime it only runs at an await point, so poll
+        // with a bounded await-based wait instead of asserting immediately.
+        for _ in 0..100 {
+            if tokio::fs::metadata(&outcomes_path).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
             outcomes_path.exists(),
             "outcomes.jsonl must exist after orchestration"

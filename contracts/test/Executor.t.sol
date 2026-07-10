@@ -69,8 +69,13 @@ contract ExecutorTest is Test {
     bytes4 constant ERR_ATOMIC_FAIL      = 0x5fe2e75c;
     bytes4 constant ERR_UNAUTHORIZED     = 0x82b42900;
     bytes4 constant ERR_INVALID_ROUTER   = 0x8d4f59a9;
+    bytes4 constant ERR_INVALID_POOL     = 0xd0363b78;
     bytes4 constant SEL_EXECUTE_OPERATION = 0x1b11d0ff;
     bytes4 constant SEL_EXEC             = 0x55f86501;
+    bytes4 constant SEL_OWNER            = 0x8da5cb5b;
+    bytes4 constant SEL_SET_POOL         = 0xa51b62c1;
+    bytes4 constant SEL_WITHDRAW         = 0xf3fef3a3;
+    bytes4 constant SEL_TRANSFER_OWNERSHIP = 0xf2fde38b;
     bytes32 constant EVT_PROFIT_TOPIC0   = 0x357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8;
 
     uint256 constant FLASH_AMOUNT   = 1000 ether;
@@ -200,7 +205,7 @@ contract ExecutorTest is Test {
     // ─── Payload Length Validation (exact sizes) ───────────────────────────────
     function testExecuteOperationRejectsWrongPayloadLength() public {
         // Too short (287 bytes instead of 288)
-        bytes memory shortParams = abi.encodePacked(_getParams()[0:287]);
+        bytes memory shortParams = _slice(_getParams(), 0, 287);
         mockTokenA.mint(executor, 2000 ether);
         bytes memory callDataShort = abi.encodeWithSelector(
             SEL_EXECUTE_OPERATION, address(mockTokenA), FLASH_AMOUNT, FLASH_PREMIUM, executor, shortParams
@@ -221,10 +226,10 @@ contract ExecutorTest is Test {
 
     function testDirectExecRejectsWrongPayloadLength() public {
         // Too short (383 bytes instead of 384)
-        bytes memory shortData = abi.encodePacked(abi.encode(
+        bytes memory shortData = _slice(abi.encode(
             address(mockTokenA), FLASH_AMOUNT, address(mockPool), address(mockTokenB),
             victim, DEBT_TO_COVER, false, address(mockRouter), AMOUNT_OUT_MIN, MIN_PROFIT, TIP, DEADLINE
-        )[0:383]);
+        ), 0, 383);
         mockTokenA.mint(executor, 2000 ether);
         bytes memory callDataShort = abi.encodeWithSelector(SEL_EXEC, shortData);
         vm.expectRevert(ERR_ATOMIC_FAIL);
@@ -326,8 +331,6 @@ contract ExecutorTest is Test {
         }
 
         assertGt(executor.code.length, 0, "deployed contract must have code");
-    }
-
     }
 
     // ─── Admin surface + gates (per T2 ABI gate + Invariant #6) ─────────────────

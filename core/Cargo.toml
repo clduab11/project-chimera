@@ -1,11 +1,11 @@
 [package]
 name = "chimera-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Project Chimera"]
 description = "Sovereign L2 MEV execution engine - REVM simulation, pacing, routing"
-license = "MIT"
-repository = "https://github.com/your-org/project-chimera"
+license = "Proprietary"
+repository = "https://github.com/clduab11/project-chimera"
 
 [dependencies]
 # alloy 1.x — the modern all-in-one meta-crate (revm 36 requires alloy ^1.4)

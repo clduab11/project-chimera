@@ -4,6 +4,9 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Also invoked as a reusable workflow by release.yml so the tag-time gate
+  # set is definitionally identical to the PR-time gate set.
+  workflow_call:
 
 permissions:
   contents: read
@@ -84,10 +87,19 @@ jobs:
         if: always()
         run: |
           find /tmp/yul-backup -name '*.yul' -exec mv {} contracts/src/ \; 2>/dev/null || true
-      - name: Restore Yul sources
-        if: always()
-        run: |
-          find /tmp/yul-backup -name '*.yul' -exec mv {} contracts/src/ \; 2>/dev/null || true
+
+  lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy -p chimera-core --all-targets -- -D warnings
 
   pip-audit:
     name: Python dependency audit (pip-audit)

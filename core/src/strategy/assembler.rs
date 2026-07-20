@@ -151,6 +151,7 @@ impl StrategyAssembler {
     /// In addition to the fields set by [`build_strategy_params`], this populates
     /// words 6–8 (min_profit, tip, deadline) from caller-provided values.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // mirrors the on-chain ABI word order; a params struct would obscure offsets
     fn build_strategy_params_full(
         collateral: Address,
         user: Address,
@@ -509,7 +510,7 @@ mod tests {
         let tip = U256::from(50u64);
         let deadline = 1700000000u64;
 
-        let tx = StrategyAssembler::build_transaction(
+        let _tx = StrategyAssembler::build_transaction(
             executor,
             &route,
             collateral,
@@ -597,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_rust_params_match_executor_yul_offsets() {
-        let route = sample_route();
+        let _route = sample_route();
 
         let collateral = address!("0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B");
         let user = address!("0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE");

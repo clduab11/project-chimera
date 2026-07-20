@@ -23,16 +23,21 @@ All documentation files in the repository, with brief descriptions:
 | [docs/runbook-7day-soak.md](docs/runbook-7day-soak.md) | 7-day shadow-soak runbook |
 | [docs/runbook-keystore-multisig-go-live.md](docs/runbook-keystore-multisig-go-live.md) | Keystore and multisig go-live runbook |
 | [docs/runbook-testnet-deploy.md](docs/runbook-testnet-deploy.md) | Testnet deployment runbook |
+| [docs/runbook-wallet-provisioning.md](docs/runbook-wallet-provisioning.md) | Testnet wallet provisioning runbook |
 | [docs/testing-strategy-liquidations.md](docs/testing-strategy-liquidations.md) | Test pyramid: unit, integration, proptest, golden replay, Foundry fork tests |
 | [docs/security-research.md](docs/security-research.md) | CVE/advisory workflow and curated Aave/Solidity/Slither references |
 | [docs/research/aave-v3-liquidation-compendium.md](docs/research/aave-v3-liquidation-compendium.md) | Aave V3 liquidation logic source map and regression scenarios |
 | [docs/research/dependency-cve-triage.md](docs/research/dependency-cve-triage.md) | CVE triage for pinned dependencies |
 | [docs/gate-report-2026-06-16.md](docs/gate-report-2026-06-16.md) | Validation gate run record |
 | [docs/gate-report-2026-06-16-t2.md](docs/gate-report-2026-06-16-t2.md) | Validation gate run record (t2) |
+| [docs/monetization.md](docs/monetization.md) | Lawful revenue paths, rejected approaches, compliance checklist (new in 0.2.0) |
+| [docs/release-readiness.md](docs/release-readiness.md) | v0.2.0 first-release readiness plan and gap register (new in 0.2.0) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and validation gate instructions (new in 0.1.4) |
 | [SECURITY.md](SECURITY.md) | Vulnerability reporting and security model (new in 0.1.4) |
 | [CHANGELOG.md](CHANGELOG.md) | Release history in Keep a Changelog format |
-| [PHASE6_VALIDATION_GATE.md](PHASE6_VALIDATION_GATE.md) | Phase 6 validation criteria and sign-off checklist |
+
+Note: `PHASE6_VALIDATION_GATE.md` was revoked during the Wave 0 re-audit and
+removed; current gate status lives in [docs/release-readiness.md](docs/release-readiness.md).
 
 The `ai-audit/` directory is optional/auxiliary — it contains Slither + local Ollama contract scanning tooling that is independent of the engine and not part of the liquidation funds path.
 
@@ -306,4 +311,6 @@ cargo audit && pip-audit && osv-scanner -r .
 
 ## License
 
-Private — not for public distribution.
+Proprietary — all rights reserved. See [LICENSE](LICENSE). Not for public
+distribution. (Versions up to 0.1.4 were distributed under the MIT license;
+the license changed at 0.2.0 — see CHANGELOG.)

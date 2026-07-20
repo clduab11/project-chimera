@@ -87,6 +87,12 @@ research/raw/
 # Scratch / temp artifacts
 temp_executor.yul
 
+# Scratch commit-message notes (kept locally, never committed)
+commit.txt
+
+# Conversation exports / research transcripts (local only, not for release)
+chimera-expansion-*.md
+
 # Misplaced duplicate (canonical copy lives at core/tests/fixtures/)
 tests/fixtures/golden_replays.json
 keystores/

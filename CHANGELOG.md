@@ -5,6 +5,72 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.2.0] - 2026-07-20 - First-release readiness
+
+### Summary
+Release-hygiene pass preparing the repository for its first tagged release.
+Resolves the MIT-vs-private license contradiction (proprietary won), aligns
+crate metadata with the changelog, enforces a zero-warning lint gate in CI,
+adds release automation, and documents the lawful monetization posture and the
+release readiness plan. No runtime behavior changes.
+
+### Changed
+- **License**: LICENSE replaced with a proprietary all-rights-reserved notice
+  (supersedes MIT for versions >= 0.2.0); README license section aligned;
+  `core/Cargo.toml` set to `license = "Proprietary"`
+- **Version/metadata**: chimera-core bumped 0.1.0 -> 0.2.0; placeholder
+  `repository` URL corrected to github.com/clduab11/project-chimera
+- **CI**: removed duplicated "Restore Yul sources" step in the slither job;
+  added `lint` job enforcing `cargo fmt --check` and
+  `cargo clippy --all-targets -- -D warnings`; ci.yml is now a reusable
+  workflow (`workflow_call`) so release gating cannot drift from PR gating
+- **README**: removed link to revoked/missing PHASE6_VALIDATION_GATE.md;
+  doc index brought current (wallet provisioning, monetization, release
+  readiness); license contradiction resolved
+
+### Added
+- `.github/workflows/release.yml` — tag-triggered (`v*`): verifies tag ==
+  crate version, reuses the complete ci.yml gate set via `workflow_call`
+  (tests, lint, slither, audits, shadow-guard), builds the Linux release
+  binary and Executor artifact, publishes a GitHub release bundle.
+  Token defaults to `contents: read` with write scoped to the publish job
+  only; all actions pinned to commit SHAs (dependabot-tracked)
+- `.github/dependabot.yml` — weekly cargo/pip/github-actions updates
+- `.github/pull_request_template.md`, `.github/ISSUE_TEMPLATE/` — validation-
+  gate checklist, bug and feature templates
+- `docs/monetization.md` — lawful revenue paths (Aave liquidations, whitehat
+  bounties, optional paid data API), rejected approaches, compliance checklist,
+  staged human-approval plan
+- `docs/release-readiness.md` — validation results, gap register, cut-release
+  checklist
+
+### Fixed
+- 13 rustc warnings (unused imports/variables across orchestrator, resolver,
+  persistence, config, mempool feed, assembler, shadow e2e test)
+- 8 clippy findings (complex type alias, too-many-arguments annotations,
+  `&mut Vec` -> slice, `contains_key`, field-reassign-with-default,
+  constant assertion, dead field annotation)
+- Post-review: restored `CrashRecovery` import in `shadow_e2e_test.rs` with
+  `#[cfg(not(target_os = "windows"))]` gating — its only use is cfg-gated off
+  Windows, so the removal compiled locally but broke Linux CI/release builds
+- Post-review: removed the vacuous `send_failure_propagates_error_without_settling`
+  test (compile-time invariant, zero runtime assertions)
+- Post-review: release.yml GITHUB_TOKEN scope and action pinning (see Added)
+
+### Repository hygiene
+- `commit.txt` untracked and gitignored (scratch commit notes stay local)
+- `chimera-expansion-*.md` gitignored (local research transcripts; not for
+  publication — part II documents a refused fraud request)
+
+### Validation (2026-07-20, this machine)
+- cargo test: 199 passed, 0 failed, 3 ignored
+- cargo clippy --all-targets -- -D warnings: clean
+- cargo fmt --all -- --check: clean
+- python -m compileall scripts ai-audit/scripts: exit 0
+- forge test / slither: pending on a full-toolchain workstation (CI runs both)
+
+---
+
 ## [0.1.4] - 2026-07-05 - Documentation cleanup, dead code removal, and repo hygiene
 
 ### Added

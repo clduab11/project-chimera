@@ -30,11 +30,15 @@ use chimera_core::{
     config::{PacingConfig, RiskConfig, RoutingConfig, TradingPair, VenueEntry},
     detector::liquidation::{LiquidationDetector, MarketSnapshot, ReserveData, UserPosition},
     routing::RoutingResolver,
-    state::{CrashRecovery, ReservationRecord, ReservationStatus},
+    state::{ReservationRecord, ReservationStatus},
     BreakerReason, CrossProcessPacing, JsonlPersistence, Metrics, Opportunity, Orchestrator,
     OrchestratorConfig, PacingDecision, PacingEngine, RpcSubmitter, SignerRegistry,
     SimulationResult, StrategyAssembler,
 };
+// Used only by the cross-process reservation lifecycle test, which is
+// cfg-gated off Windows; import must match that gating or Linux builds fail.
+#[cfg(not(target_os = "windows"))]
+use chimera_core::state::CrashRecovery;
 use chrono::{TimeDelta, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;

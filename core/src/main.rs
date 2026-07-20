@@ -64,6 +64,9 @@ fn default_previous_mode() -> String {
 struct AaveAddresses {
     pool: Address,
     oracle: Address,
+    /// Populated at startup; read by address-parity tests and reserved for
+    /// prewarm/diagnostics — not yet consumed on the hot path.
+    #[allow(dead_code)]
     pool_data_provider: Address,
     /// Canonical WETH — used as the simulator's ETH oracle asset.
     weth: Address,
@@ -267,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Monomorphized once per concrete `P`, so the wallet-backed and read-only providers
 /// (which have different concrete types) both flow through here without trait objects.
+#[allow(clippy::too_many_arguments)] // bootstrap wiring; each arg is an independent runtime component
 async fn run_with_provider<P>(
     provider: Arc<P>,
     pacing_cfg: PacingConfig,

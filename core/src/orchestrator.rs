@@ -2,15 +2,15 @@
 
 use crate::config::{RiskConfig, RoutingConfig};
 use crate::{
-    check_eoa_gas_sufficient, BuiltTransaction, ChimeraError, CrossProcessPacing,
-    LiquidationCandidate, LiquidationDetector, LiquidationSimulator, MarketSnapshot,
-    MempoolWatcher, Metrics, Opportunity, PacingConfig, PacingDecision, ResolvedV2Route,
-    RoutingResolver, RpcSubmitter, SignerRegistry, StrategyAssembler, TransactionExecutor,
+    check_eoa_gas_sufficient, ChimeraError, CrossProcessPacing, LiquidationCandidate,
+    LiquidationDetector, LiquidationSimulator, MarketSnapshot, MempoolWatcher, Metrics,
+    Opportunity, PacingConfig, PacingDecision, ResolvedV2Route, RoutingResolver, RpcSubmitter,
+    SignerRegistry, StrategyAssembler,
 };
 use alloy::consensus::{SignableTransaction, TxEip1559};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use hex;
@@ -78,6 +78,9 @@ impl Default for OrchestratorConfig {
 /// [`RpcSubmitter`] (already configured with `dry_run = execute_mode != "live"`),
 /// and a [`CrossProcessPacing`] that wraps a pre-built [`PacingEngine`].
 /// Execution is gated on `execute_mode == "live"` AND pacing-allowed AND profitable.
+/// Test-only simulation override used by shadow/e2e harnesses.
+type MockSimFn = Arc<dyn Fn(&crate::LiquidationCandidate) -> crate::SimulationResult + Send + Sync>;
+
 pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
     config: OrchestratorConfig,
     pacing: CrossProcessPacing,
@@ -95,8 +98,7 @@ pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
     signer_registry: Arc<SignerRegistry>,
     mempool_watcher: Option<Arc<dyn MempoolWatcher>>,
     mock_gas_price_wei: Option<u128>,
-    mock_sim_fn:
-        Option<Arc<dyn Fn(&crate::LiquidationCandidate) -> crate::SimulationResult + Send + Sync>>,
+    mock_sim_fn: Option<MockSimFn>,
 }
 
 impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
@@ -615,6 +617,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
     /// Live broadcast path. Only reached when `execute_mode == "live"`, pacing allowed
     /// and the simulation was profitable. Builds an Executor `execute(bytes)`
     /// transaction and signs it with the selected worker EOA.
+    #[allow(clippy::too_many_arguments)] // execution plumbing; params travel together from process_candidate
     async fn execute_live(
         &self,
         opp: &Opportunity,
@@ -747,7 +750,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
         worker_signer.sync_from_chain(&*self.provider).await?;
         tx.nonce = worker_signer.next_nonce();
 
-        let mut alloy_tx = TxEip1559 {
+        let alloy_tx = TxEip1559 {
             chain_id: self.chain_id,
             nonce: tx.nonce,
             max_fee_per_gas: tx.max_fee_per_gas,
@@ -870,29 +873,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn send_failure_propagates_error_without_settling() {
-        // Structural invariant: when execute_live returns Err, process_candidate
-        // must return Err WITHOUT calling pacing.settle(). The Err arm at
-        // orchestrator.rs:558-561 ensures this: it logs and returns Err(e).
-        // This test verifies that the code path exists and is reachable by
-        // confirming that execute_live compiles with return Err(e) on send failure.
-        //
-        // The fix changes the send_raw_transaction Err branch from:
-        //   record_outcome(..., reverted=true) + Ok(())
-        // to:
-        //   return Err(e)
-        //
-        // We verify the invariant by constructing a scenario where execute_live
-        // returns Err due to a missing signer (which happens before send but
-        // exercises the same error-propagation path). The key property is that
-        // process_candidate's Err handler does NOT settle the reservation.
-
-        // Verify the execute_live method signature returns Result<(), ChimeraError>
-        // and that the Err return on send failure compiles (checked at compile time).
-        // The git diff confirms the change from `Ok(())` to `return Err(e)`.
-        assert!(true, "invariant verified by code structure: execute_live returns Err on send failure, process_candidate Err arm does not settle");
     }
 }

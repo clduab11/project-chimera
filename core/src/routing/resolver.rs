@@ -6,8 +6,7 @@
 //!
 //! Scope: V2-only routing. V3/Aerodrome routing is out of scope for this Epic.
 
-use crate::config::{RiskConfig, RoutingConfig, TradingPair, VenueEntry};
-use crate::ChimeraError;
+use crate::config::{RiskConfig, RoutingConfig, TradingPair};
 use alloy::primitives::{Address, U256};
 use std::str::FromStr;
 use tracing::warn;
@@ -161,10 +160,10 @@ impl<'a> RoutingResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::VenueEntry;
     use alloy::primitives::address;
 
     fn test_routing_config() -> RoutingConfig {
-        use crate::config::VenueEntry;
         RoutingConfig {
             primary: "test".into(),
             fallbacks: vec![],

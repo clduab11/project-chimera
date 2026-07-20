@@ -144,7 +144,7 @@ where
 
             let nonce = signer.next_nonce();
 
-            let mut tx = TxEip1559 {
+            let tx = TxEip1559 {
                 chain_id: self.chain_id,
                 nonce,
                 max_fee_per_gas: gas_price,
@@ -282,7 +282,7 @@ where
         for worker in &underfunded {
             let nonce = treasury_signer.next_nonce();
 
-            let mut tx = TxEip1559 {
+            let tx = TxEip1559 {
                 chain_id: self.chain_id,
                 nonce,
                 max_fee_per_gas: gas_price,

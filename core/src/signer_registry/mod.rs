@@ -232,7 +232,7 @@ impl SignerRegistry {
         }
         self.signers
             .keys()
-            .filter(|a| self.treasury.map_or(true, |t| *a != &t))
+            .filter(|a| self.treasury.is_none_or(|t| *a != &t))
             .copied()
             .collect()
     }
@@ -301,7 +301,7 @@ impl SignerRegistry {
                     "active EOA pool address {addr} is the treasury; treasury must not be a worker"
                 )));
             }
-            if self.signers.get(&addr).is_none() {
+            if !self.signers.contains_key(&addr) {
                 return Err(ChimeraError::ConfigError(format!(
                     "Live mode: EOA pool entry {} has no registered worker signer in {}",
                     addr_str, eoa_pool_path

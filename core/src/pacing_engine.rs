@@ -983,7 +983,7 @@ mod tests {
             chain_id: 8453,
             oracle_staleness_seconds: 300,
             eth_price_usd_fallback: Decimal::from(1800),
-            eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into(),
+            eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70".into(),
             recent_outcomes_capacity: 128,
             eoa_pool_path: "nonexistent_eoa_pool.json".into(),
             pools_toml_path: "config/pools.toml".into(),
@@ -993,10 +993,11 @@ mod tests {
             worker_keystore_dir: "".into(),
             sweep_interval_secs: 300,
             refund_interval_secs: 3600,
-            min_worker_balance_eth: Decimal::from_str("0.01").unwrap(),
-            refund_topup_eth: Decimal::from_str("0.05").unwrap(),
-            sweep_tokens: vec![],
-            sweep_min_keep_eth: Decimal::from_str("0.005").unwrap(),
+            min_worker_balance_eth: Decimal::from_str("0.002").unwrap(),
+            refund_topup_eth: Decimal::from_str("0.01").unwrap(),
+            sweep_tokens: Vec::new(),
+            sweep_min_keep_eth: Decimal::from_str("0.001").unwrap(),
+
             ws_endpoint: String::new(),
         }
     }

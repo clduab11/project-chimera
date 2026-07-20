@@ -91,14 +91,13 @@ them trips the circuit breaker and halts the engine without operator action.
 runs the full detection and pacing logic but does not submit transactions on-chain.
 It is safe to run in this mode without any funds at risk.
 
-`execute_mode: live` is the mode where transactions are submitted. A 7-day shadow
-period is required before the engine will allow a shadow-to-live transition.
-`toggle_shadow.py` enforces the soak against `core/state/mode.json`; live mode
-never enables itself.
+`execute_mode: live` is the mode where transactions are submitted.
+`toggle_shadow.py` manages the transition state in `core/state/mode.json`; live
+mode never enables itself. (The 7-day shadow-soak requirement was de-listed by
+operator decision on 2026-07-20.)
 
 **Do not change `execute_mode` to `live` until you have:**
-- Run shadow mode for at least 7 days
-- Verified the metrics look healthy (Section 7)
+- Verified the metrics look healthy in shadow mode (Section 7)
 - Confirmed Executor bytecode, canonical `pool()`, multisig ownership, and every active worker's `isWorker` authorization
 - Confirmed encrypted signer/EOA-pool parity and gas funding
 - Read `docs/emergency-procedures.md`

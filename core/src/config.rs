@@ -83,7 +83,7 @@ fn default_eth_price_usd_fallback() -> Decimal {
     Decimal::from(1800)
 }
 fn default_eth_usd_feed_address() -> String {
-    "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into()
+    "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70".into()
 }
 fn default_recent_outcomes_capacity() -> usize {
     128
@@ -101,13 +101,13 @@ fn default_refund_interval_secs() -> u64 {
     3600
 }
 fn default_min_worker_balance_eth() -> Decimal {
-    Decimal::from_str("0.01").expect("valid literal")
+    Decimal::from_str("0.002").expect("valid literal")
 }
 fn default_refund_topup_eth() -> Decimal {
-    Decimal::from_str("0.05").expect("valid literal")
+    Decimal::from_str("0.01").expect("valid literal")
 }
 fn default_sweep_min_keep_eth() -> Decimal {
-    Decimal::from_str("0.005").expect("valid literal")
+    Decimal::from_str("0.001").expect("valid literal")
 }
 fn default_router_compatibility() -> String {
     String::new()
@@ -146,10 +146,10 @@ impl Default for PacingConfig {
             worker_keystore_dir: String::new(),
             sweep_interval_secs: 300,
             refund_interval_secs: 3600,
-            min_worker_balance_eth: Decimal::from_str("0.01").expect("valid literal"),
-            refund_topup_eth: Decimal::from_str("0.05").expect("valid literal"),
+            min_worker_balance_eth: Decimal::from_str("0.002").expect("valid literal"),
+            refund_topup_eth: Decimal::from_str("0.01").expect("valid literal"),
             sweep_tokens: Vec::new(),
-            sweep_min_keep_eth: Decimal::from_str("0.005").expect("valid literal"),
+            sweep_min_keep_eth: Decimal::from_str("0.001").expect("valid literal"),
             ws_endpoint: String::new(),
         }
     }
@@ -308,37 +308,24 @@ impl PacingConfig {
         Ok(())
     }
 
-    /// Validate the shadow soak whenever the effective `execute_mode` is live.
-    /// Requires a 7-day shadow period tracked in external state (`shadow_since`),
-    /// regardless of the informational `previous_mode` value.
+    /// Validate mode state whenever the effective `execute_mode` is live.
+    /// The 7-day (604800s) shadow-soak requirement was de-listed by operator
+    /// decision on 2026-07-20: a missing or recent `shadow_since` no longer
+    /// blocks live mode. A future `shadow_since` still fails as a corruption
+    /// guard against an invalid mode-state file.
     pub fn validate_mode_transition(
         &self,
         _previous_mode: &str,
         shadow_since: Option<SystemTime>,
     ) -> Result<(), ChimeraError> {
         if self.execute_mode == "live" {
-            match shadow_since {
-                Some(since) => {
-                    let elapsed = SystemTime::now().duration_since(since).map_err(|_| {
-                        ChimeraError::ConfigError(
-                            "execute_mode=live requires shadow_since to be a valid past timestamp; correct the future timestamp in mode state"
-                                .into(),
-                        )
-                    })?;
-                    if elapsed.as_secs() < 7 * 24 * 60 * 60 {
-                        return Err(ChimeraError::ConfigError(format!(
-                            "execute_mode=live requires shadow_since to be at least 604800 seconds old; current age is {} seconds, so wait at least {} more seconds",
-                            elapsed.as_secs(),
-                            7 * 24 * 60 * 60 - elapsed.as_secs()
-                        )));
-                    }
-                }
-                None => {
-                    return Err(ChimeraError::ConfigError(
-                        "execute_mode=live requires a stamped shadow_since timestamp in mode state; run scripts/toggle_shadow.py --set-shadow and complete the 7-day soak"
+            if let Some(since) = shadow_since {
+                SystemTime::now().duration_since(since).map_err(|_| {
+                    ChimeraError::ConfigError(
+                        "execute_mode=live requires shadow_since to be a valid past timestamp; correct the future timestamp in mode state"
                             .into(),
-                    ));
-                }
+                    )
+                })?;
             }
         }
         Ok(())
@@ -561,7 +548,7 @@ metrics_port: 9100
 chain_id: 8453
 oracle_staleness_seconds: 300
 eth_price_usd_fallback: 1800
-eth_usd_feed_address: \"0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b\"
+eth_usd_feed_address: \"0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70\"
 recent_outcomes_capacity: 128
 eoa_pool_path: config/eoa_pool.json
 pools_toml_path: config/pools.toml
@@ -571,10 +558,10 @@ treasury_keystore: \"\"
 worker_keystore_dir: \"\"
 sweep_interval_secs: 300
 refund_interval_secs: 3600
-min_worker_balance_eth: 0.01
-refund_topup_eth: 0.05
+min_worker_balance_eth: 0.002
+refund_topup_eth: 0.01
 sweep_tokens: []
-sweep_min_keep_eth: 0.005
+sweep_min_keep_eth: 0.001
 ws_endpoint: \"\"
 "
         .to_string()
@@ -594,7 +581,7 @@ ws_endpoint: \"\"
         assert_eq!(cfg.eth_price_usd_fallback, Decimal::from(1800));
         assert_eq!(
             cfg.eth_usd_feed_address,
-            "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b"
+            "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
         );
         assert_eq!(cfg.eoa_pool_path, "config/eoa_pool.json");
         assert_eq!(cfg.pools_toml_path, "config/pools.toml");
@@ -781,30 +768,20 @@ ws_endpoint: \"\"
     }
 
     #[test]
-    fn test_validate_mode_transition_requires_shadow_period() {
+    fn test_validate_mode_transition_soak_gate_delisted() {
         let cfg = PacingConfig {
             execute_mode: "live".into(),
             ..PacingConfig::default()
         };
-        // Missing shadow_since => fails
-        let result = cfg.validate_mode_transition("shadow", None);
-        assert!(result.is_err());
-        // Recent shadow (< 7 days) => fails
-        let recent = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
-        let result = cfg.validate_mode_transition("shadow", Some(recent));
-        assert!(result.is_err());
-        // Old shadow (>= 7 days) => succeeds
+        // Soak gate de-listed by operator decision on 2026-07-20: a missing or
+        // recent shadow_since no longer blocks live mode.
+        assert!(cfg.validate_mode_transition("shadow", None).is_ok());
+        let recent = SystemTime::now() - Duration::from_secs(60);
+        assert!(cfg.validate_mode_transition("shadow", Some(recent)).is_ok());
+        assert!(cfg.validate_mode_transition("live", None).is_ok());
+        assert!(cfg.validate_mode_transition("live", Some(recent)).is_ok());
         let old = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
-        let result = cfg.validate_mode_transition("shadow", Some(old));
-        assert!(result.is_ok());
-
-        // A stored previous_mode=live cannot bypass the same checks.
-        let result = cfg.validate_mode_transition("live", None);
-        assert!(result.is_err());
-        let result = cfg.validate_mode_transition("live", Some(recent));
-        assert!(result.is_err());
-        let result = cfg.validate_mode_transition("live", Some(old));
-        assert!(result.is_ok());
+        assert!(cfg.validate_mode_transition("live", Some(old)).is_ok());
     }
 
     #[test]

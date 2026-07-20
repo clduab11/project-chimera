@@ -2,7 +2,7 @@
 
 **Status**: Standalone-Executor liquidation engine implemented; shadow-first and never auto-flips to live.
 
-> Validation gate: the core remediation has NOT been validated end-to-end in this environment — `cargo` and `forge` have not been run here and MUST be verified on a developer workstation with the full toolchain before any output is trusted. The toolchains (`cargo`, `forge`, `slither`) are not installed in every environment. Run the commands in [Build & Test](#build--test) on a machine with the Rust toolchain, Foundry, and Slither before trusting any simulation output. A 7-day shadow soak is required before any shadow-to-live transition, and live mode additionally requires an encrypted keystore and a multisig-owned deployment. Live execution remains gated until the full validation gate in `.kilo/plans/comprehensive-refactor-validation-security-research.md` passes.
+> Validation gate: the core remediation has NOT been validated end-to-end in this environment — `cargo` and `forge` have not been run here and MUST be verified on a developer workstation with the full toolchain before any output is trusted. The toolchains (`cargo`, `forge`, `slither`) are not installed in every environment. Run the commands in [Build & Test](#build--test) on a machine with the Rust toolchain, Foundry, and Slither before trusting any simulation output. The 7-day shadow-soak gate was de-listed by operator decision on 2026-07-20; live mode additionally requires an encrypted keystore and a multisig-owned deployment. Live execution remains gated until the full validation gate in `.kilo/plans/comprehensive-refactor-validation-security-research.md` passes.
 
 ---
 
@@ -22,6 +22,7 @@ All documentation files in the repository, with brief descriptions:
 | [docs/incident-log.md](docs/incident-log.md) | Incident tracking template (new in 0.1.4) |
 | [docs/runbook-7day-soak.md](docs/runbook-7day-soak.md) | 7-day shadow-soak runbook |
 | [docs/runbook-keystore-multisig-go-live.md](docs/runbook-keystore-multisig-go-live.md) | Keystore and multisig go-live runbook |
+| [docs/operator-go-live-pack.md](docs/operator-go-live-pack.md) | Single sequential operator go-live pack: readiness audit + runbook (new in 0.2.0) |
 | [docs/runbook-testnet-deploy.md](docs/runbook-testnet-deploy.md) | Testnet deployment runbook |
 | [docs/runbook-wallet-provisioning.md](docs/runbook-wallet-provisioning.md) | Testnet wallet provisioning runbook |
 | [docs/testing-strategy-liquidations.md](docs/testing-strategy-liquidations.md) | Test pyramid: unit, integration, proptest, golden replay, Foundry fork tests |
@@ -59,7 +60,7 @@ The revenue loop is atomic and capital-light:
 
 5. **Guardrails that cannot be bypassed** — the pacing engine enforces $2,000 net daily, $7,500 net weekly, $1,000 per liquidation, 6–18h jitter between ops, auto-halt on 3 consecutive reverts, auto-halt on >300 gwei gas, auto-halt on 0.005 ETH daily loss. `emergency_pause.py` trips the breaker; `clear_breaker` requires `CHIMERA_OPERATOR_TOKEN`. Executor ownership is fixed at construction to the multisig. Only the owner or workers explicitly authorized with `setWorker(worker, true)` may call `execute(bytes)`; `setPool`, `setWorker`, `withdraw`, and `transferOwnership` remain owner-only. Live startup verifies deployed Executor bytecode, `pool()` equality, every active worker's `isWorker` status, treasury signer/address parity, EOA-pool/signer parity, and gas funding. `execute_mode` defaults to `shadow`, and `shadow-guard` refuses committed live config.
 
-The engine runs in shadow mode for a mandatory 7-day soak before a live transition is permitted (enforced by `toggle_shadow.py` against `core/state/mode.json`). After all go-live checks pass, it can execute profitable opportunities and maintain worker gas automatically. Debt-token profit remains in Executor until the multisig withdraws it. Private/protected submission is not wired: current execution broadcasts raw transactions to the configured standard RPC, so protected submission is strongly recommended before real-money operation.
+The engine runs in shadow mode by default; `toggle_shadow.py` manages the live-transition state in `core/state/mode.json` (the mandatory 7-day soak was de-listed by operator decision on 2026-07-20). After all go-live checks pass, it can execute profitable opportunities and maintain worker gas automatically. Debt-token profit remains in Executor until the multisig withdraws it. Private/protected submission is not wired: current execution broadcasts raw transactions to the configured standard RPC, so protected submission is strongly recommended before real-money operation.
 
 ```mermaid
 flowchart LR
@@ -256,7 +257,7 @@ The project has undergone a security + wiring remediation pass across five waves
 **Honest remaining gaps (must be closed before any live transition):**
 
 - Full toolchain validation (`cargo test`, `forge test`) has **NOT** been run in the remediation environment and must be verified on a developer workstation.
-- A **7-day shadow soak** is required before any shadow-to-live transition.
+- The mandatory **7-day shadow soak** was de-listed by operator decision on 2026-07-20; shadow remains the committed default.
 - Live mode requires an **encrypted keystore** and a **multisig-owned deployment**.
 - Private/protected transaction submission is **not wired**; live calls currently use the configured standard RPC.
 
@@ -275,7 +276,7 @@ The `scripts/` directory holds the Python operational helpers. All scripts impor
 - **`check_balances.py`** — health-checks wallet balances (native + ERC20), exits non-zero if any worker is below min threshold.
 - **`health_check.py`** — end-to-end preflight: RPC reachable, metrics alive, mode.json parse, snapshot freshness.
 - **`dry_run.py`** — validates config + RPC in shadow mode, optionally boots the binary for N seconds.
-- **`toggle_shadow.py`** — manages `core/state/mode.json` (the Rust binary reads this at startup); enforces the 7-day shadow soak before permitting `--set-live`.
+- **`toggle_shadow.py`** — manages `core/state/mode.json` (the Rust binary reads this at startup); manages the shadow→live mode state (7-day soak enforcement de-listed 2026-07-20).
 - **`recover_state.py`** — rebuilds aggregated pacing state from `core/state/outcomes.jsonl`, mirroring the Rust `CrashRecovery`.
 - **`rotate_eoa.py`** / **`rotate_wallet.py`** — round-robin wallet rotation with cooldown; `rotate_wallet.py` is a docs-compatible alias.
 - **`snapshot_generator.py`** — emits Aave V3 pool snapshots (live RPC or `--mock`).

@@ -18,9 +18,10 @@ approval before activation.
 1. Chimera's own capital and Chimera-executed protocol incentives only. Chimera
    never takes custody of third-party funds, never solicits investment, and
    never sells financial advice.
-2. Human approval gates are non-removable. The existing controls (shadow-first
-   mode, 7-day soak, multisig-owned Executor, pacing caps, breaker, operator
+2. Human approval gates remain under operator control. The existing controls
+   (shadow-first mode, multisig-owned Executor, pacing caps, breaker, operator
    token for `clear_breaker`) stay in force regardless of revenue pressure.
+   The 7-day soak was de-listed by explicit operator decision on 2026-07-20.
 3. Revenue never justifies weakening a guardrail. Any change to caps or gates
    requires a design doc and the validation gate in AGENTS.md.
 
@@ -46,7 +47,7 @@ protocol's own bonus.
 | Gate | State |
 |------|-------|
 | Full toolchain validation (`cargo test`, `forge test`, slither) | cargo test green (199 passed, 2026-07-20); forge/slither pending on a workstation |
-| 7-day shadow soak (`toggle_shadow.py` enforced) | required before live |
+| 7-day shadow soak (`toggle_shadow.py`) | **de-listed by operator decision 2026-07-20** |
 | Encrypted keystore + multisig-owned deployment | required before live |
 | Protected/private tx submission | **not wired** — recommended before real-money operation |
 | Pacing caps / breakers / emergency pause | code-enforced, must remain |
@@ -143,7 +144,7 @@ qualified counsel before live operation.
 | 0 | Policy: this document + owner sign-off on compliance checklist | Operator sign-off |
 | 1 | Validation gate on workstation: `forge test`, slither, full CI green | Operator reviews gate report |
 | 2 | Testnet practice (Base Sepolia) per `docs/runbook-testnet-deploy.md` | Operator reviews testnet results |
-| 3 | 7-day mainnet shadow soak per `docs/runbook-7day-soak.md` | Operator reviews soak vs `fetch_historical_liquidations.py` baseline |
+| 3 | Mainnet shadow rehearsal per `docs/runbook-7day-soak.md` (mandatory soak de-listed 2026-07-20) | Operator decision |
 | 4 | Live with tiny gas treasury, encrypted keystore, multisig-owned Executor, protected submission wired | Explicit go-live decision per `docs/runbook-keystore-multisig-go-live.md` |
 | 5 | Operate within caps; weekly review of PnL, breaker events, inclusion rate | Continuing operator review |
 | 6 | (Optional) Path B bounty submissions as findings arise | Per-report human review |

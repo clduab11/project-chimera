@@ -10,8 +10,8 @@
 >
 > This is a working threat model, not a certification. It should be revisited
 > after the validation gate (`cargo test`, `forge test`, `slither`, dependency
-> CVE triage) passes on a full-toolchain workstation and after the mandatory
-> 7-day shadow soak.
+> CVE triage) passes on a full-toolchain workstation. (The mandatory 7-day
+> shadow soak was de-listed by operator decision on 2026-07-20.)
 
 ---
 
@@ -181,8 +181,9 @@ These are **not** mitigated by code and must be tracked operationally:
    `slither`, and dependency CVE triage have not been executed in the
    remediation environment. Nothing below "Mitigated" should be trusted until
    the validation gate passes on a full-toolchain workstation.
-2. **7-day shadow soak required.** No shadow-to-live transition before a clean
-   7-day soak (enforced in `validate_mode_transition()`).
+2. **7-day shadow soak — de-listed.** Removed by operator decision on
+   2026-07-20; `validate_mode_transition()` no longer enforces a minimum shadow
+   age (a future `shadow_since` still fails as a corruption guard).
 3. **Multisig ownership required for live.** Both `Executor` (slot 0) and
    `FundDistributor` (`owner`) must be owned by a multisig with deployed code
    before any live capital.

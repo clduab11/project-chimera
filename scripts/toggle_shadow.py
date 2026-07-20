@@ -19,13 +19,12 @@ IMPORTANT - what this script does NOT do:
   validates `shadow_since` age whenever the effective execute mode is live,
   regardless of mode.json `previous_mode`.
 
-SOAK ENFORCEMENT:
-  `--set-live` applies the same 7-day threshold before updating mode.json:
-  `shadow_since` must be at least SEVEN DAYS old
-  (7 * 24 * 60 * 60 = 604800 seconds). If the soak is not satisfied (or
-  shadow_since is unstamped), the script prints the remaining time and exits 1
-  WITHOUT writing. Rust then independently revalidates this timestamp on every
-  startup whose effective execute mode is live.
+SOAK GATE STATUS (2026-07-20):
+  The 7-day (604800s) soak requirement was DE-LISTED by operator decision on
+  2026-07-20. SHADOW_SOAK_SECONDS is now 0: `--set-live` updates mode.json as
+  soon as a shadow_since stamp exists (run --set-shadow once to stamp). Rust
+  no longer enforces a minimum shadow age on live startup. The shadow_since
+  timestamp is still preserved in mode.json for the audit trail.
 
 INVARIANT (AGENTS.md #5): stdlib only. No web3.py. `--help` always works.
 All writes are atomic (tmp file + os.replace).
@@ -61,8 +60,9 @@ logger = logging.getLogger("toggle_shadow")
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_STATE_FILE: str = "core/state/mode.json"
-# Matches core/src/config.rs validate_mode_transition: 7 * 24 * 60 * 60.
-SHADOW_SOAK_SECONDS: int = 7 * 24 * 60 * 60  # 604800
+# 2026-07-20: 7-day soak gate de-listed by operator decision (final authority).
+# Was 7 * 24 * 60 * 60 (604800). Zero disables the age refusal in --set-live.
+SHADOW_SOAK_SECONDS: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -139,42 +139,32 @@ def do_set_shadow(state_file: str) -> int:
 
 def do_set_live(state_file: str) -> int:
     """
-    Update mode.json previous_mode=live ONLY if the 7-day soak is satisfied.
-    Rust independently revalidates shadow_since when effective mode is live.
+    Update mode.json previous_mode=live. The 7-day soak gate was de-listed by
+    operator decision on 2026-07-20; a stamped mode.json is still required so
+    the binary loads an explicit mode state (run --set-shadow once first).
     """
     state = read_mode(state_file)
     if state is None:
         logger.error("Refusing --set-live: no mode.json (shadow_since unstamped).")
-        logger.error("Run --set-shadow first and complete the %s soak.", fmt_duration(SHADOW_SOAK_SECONDS))
+        logger.error("Run --set-shadow first to stamp the mode state.")
         return 1
 
     shadow_since = int(state.get("shadow_since", 0) or 0)
     if shadow_since <= 0:
-        logger.error("Refusing --set-live: shadow_since is unstamped (0).")
+        logger.error("Refusing --set-live: shadow_since is unstamped (0). Run --set-shadow first.")
         return 1
 
     age = int(time.time()) - shadow_since
-    if age < SHADOW_SOAK_SECONDS:
-        remaining = SHADOW_SOAK_SECONDS - age
-        logger.error(
-            "Refusing --set-live: soak not satisfied. Elapsed %s of required %s; remaining %s.",
-            fmt_duration(age),
-            fmt_duration(SHADOW_SOAK_SECONDS),
-            fmt_duration(remaining),
-        )
-        return 1
-
     logger.warning(
-        "Soak satisfied (%s >= %s). Updating mode.json previous_mode=live in %s.",
-        fmt_duration(age),
-        fmt_duration(SHADOW_SOAK_SECONDS),
+        "Updating mode.json previous_mode=live in %s (shadow age %s; soak gate de-listed 2026-07-20).",
         state_file,
+        fmt_duration(age),
     )
     logger.warning(
-        "This only updates mode.json; Rust independently revalidates shadow_since age "
-        "whenever effective execute_mode is live. It does not change config/pacing.yaml."
+        "This only updates mode.json; it does not change config/pacing.yaml. "
+        "Set CHIMERA_EXECUTE_MODE=live in the deployment-local environment separately."
     )
-    # Preserve shadow_since for the audit trail of when the soak clock started.
+    # Preserve shadow_since for the audit trail of when the shadow clock started.
     write_mode(state_file, "live", shadow_since)
     return 0
 
@@ -196,7 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument(
         "--set-live",
         action="store_true",
-        help="Set previous_mode=live (only if the 7-day soak is satisfied).",
+        help="Set previous_mode=live (soak gate de-listed 2026-07-20; requires a stamped mode.json).",
     )
     parser.add_argument(
         "--state-file",

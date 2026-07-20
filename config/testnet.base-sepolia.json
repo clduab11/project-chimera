@@ -22,7 +22,7 @@
   "funding": {
     "treasury_target_eth": 0.1,
     "worker_topup_eth": 0.02,
-    "min_worker_balance_eth": 0.01
+    "min_worker_balance_eth": 0.002
   },
   "workers": 3
 }

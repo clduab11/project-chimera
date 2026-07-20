@@ -11,10 +11,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Release-hygiene pass preparing the repository for its first tagged release.
 Resolves the MIT-vs-private license contradiction (proprietary won), aligns
 crate metadata with the changelog, enforces a zero-warning lint gate in CI,
-adds release automation, and documents the lawful monetization posture and the
-release readiness plan. No runtime behavior changes.
+adds release automation, documents the lawful monetization posture and the
+release readiness plan, and de-lists the 7-day shadow-soak gate by operator
+decision (the only runtime behavior change: live startup no longer enforces a
+minimum shadow age).
 
 ### Changed
+- **Soak gate de-listed (operator decision, 2026-07-20)**: the mandatory 7-day
+  (604800s) shadow-soak requirement was removed from
+  `PacingConfig::validate_mode_transition()` and `scripts/toggle_shadow.py`
+  (`SHADOW_SOAK_SECONDS = 0`); `--set-live` now requires only a stamped
+  `core/state/mode.json`. A future `shadow_since` still fails as a corruption
+  guard. Shadow remains the committed default; all other live gates
+  (multisig-owned Executor, worker authorization, keystore parity, funding,
+  pacing caps, breaker) are unchanged. Docs updated to record the decision.
 - **License**: LICENSE replaced with a proprietary all-rights-reserved notice
   (supersedes MIT for versions >= 0.2.0); README license section aligned;
   `core/Cargo.toml` set to `license = "Proprietary"`

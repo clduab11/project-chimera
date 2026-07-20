@@ -32,11 +32,11 @@ This runbook covers two tools and one rehearsal:
 with `SignerRegistry`, faucet funding on Base Sepolia, worker fan-out funding,
 and a shadow-mode boot drill that decrypts every keystore with zero risk.
 
-**Out of scope:** the 7-day shadow soak and the `toggle_shadow.py --set-live`
-mode gate are **unchanged** by this tooling and are not exercised here. Live
-go-live remains the manual path in `docs/runbook-keystore-multisig-go-live.md`
-§6, gated by `docs/runbook-7day-soak.md`. Nothing in this runbook sets any mode
-to `live`.
+**Out of scope:** the `toggle_shadow.py --set-live` mode step is **unchanged**
+by this tooling and is not exercised here. (The 7-day soak gate was de-listed
+by operator decision on 2026-07-20.) Live go-live remains the manual path in
+`docs/runbook-keystore-multisig-go-live.md` §6. Nothing in this runbook sets
+any mode to `live`.
 
 The live model uses these worker EOAs only to sign ordinary EIP-1559 calls to
 the standalone Executor's `execute(bytes)` entrypoint. There is no EIP-7702 or
@@ -338,7 +338,7 @@ startup additionally requires:
   `isWorker(address)` true for every active worker;
 - treasury signer/address parity, active signer/pool parity, treasury refund
   ETH, and every worker at or above `min_worker_balance_eth`;
-- the mandatory 7-day `toggle_shadow.py` soak gate;
+- the `toggle_shadow.py --set-live` mode-state step (7-day soak gate de-listed 2026-07-20);
 - explicit acceptance or remediation of standard-RPC submission exposure,
   because private/protected submission is not wired.
 
@@ -356,6 +356,6 @@ raw-key helper, not the Executor-profit or primary scheduled path.
 | --- | --- |
 | `docs/runbook-keystore-multisig-go-live.md` | Mainnet keystore creation, live-mode config, go-live gate. This runbook's keystores use the same V3 format and the same `CHIMERA_KEYSTORE_PASSWORD` convention (§2) |
 | `docs/runbook-testnet-deploy.md` | Base Sepolia contract deployment, addresses (§3.1, Appendix A), and the `eth_price_usd_fallback` behavior referenced in §6.3 |
-| `docs/runbook-7day-soak.md` | The 7-day shadow soak and `toggle_shadow.py` gate — **unchanged and out of scope** for this runbook; complete it before any live transition |
+| `docs/runbook-7day-soak.md` | Optional shadow rehearsal — the mandatory soak was de-listed by operator decision on 2026-07-20 |
 | `AGENTS.md` | Invariant #1 (`config/pacing.yaml` frozen — env overrides only) and Invariant #5 (scripts importable without web3); validation gate |
 | `core/src/signer_registry/mod.rs` | Keystore decryption, shadow semantics, and `validate_against_eoa_pool` mirrored by `--verify` |

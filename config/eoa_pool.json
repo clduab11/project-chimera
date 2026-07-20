@@ -3,7 +3,7 @@
   "_comment": "Template only: these placeholder addresses are not operator wallets and must never be funded. Replace or exclude them before live use. Store private keys only in encrypted keystores outside the repo; this file contains public addresses and rotation metadata. Runtime balances are fetched via RPC; on-disk balances are intentionally zeroed.",
   "wallets": [
     {
-      "address": "0x1111111111111111111111111111111111111111",
+      "address": "0x843cB06F6d1dF23762fE77F348d5F2fb250FE68a",
       "label": "chimera-eoa-01",
       "chain_balances": {
         "base": "0",
@@ -14,7 +14,7 @@
       "excluded": false
     },
     {
-      "address": "0x2222222222222222222222222222222222222222",
+      "address": "0x3f7C899271Ac4656aCDc9088b514EB332061D0bE",
       "label": "chimera-eoa-02",
       "chain_balances": {
         "base": "0",
@@ -25,7 +25,7 @@
       "excluded": false
     },
     {
-      "address": "0x3333333333333333333333333333333333333333",
+      "address": "0x2f87fb652e08038f3E2256116fe35cA6e39A7D6E",
       "label": "chimera-eoa-03",
       "chain_balances": {
         "base": "0",
@@ -36,7 +36,7 @@
       "excluded": false
     },
     {
-      "address": "0x4444444444444444444444444444444444444444",
+      "address": "0x26496bE4b485B71a484bA52076feD4A37df11FD1",
       "label": "chimera-eoa-04",
       "chain_balances": {
         "base": "0",
@@ -47,7 +47,7 @@
       "excluded": false
     },
     {
-      "address": "0x5555555555555555555555555555555555555555",
+      "address": "0xB8FD38fF314843fF4bd910c74978646C3D170eA1",
       "label": "chimera-eoa-05",
       "chain_balances": {
         "base": "0",
@@ -55,10 +55,10 @@
       },
       "last_used": 0,
       "use_count": 0,
-      "excluded": false
+      "excluded": true
     },
     {
-      "address": "0x6666666666666666666666666666666666666666",
+      "address": "0x4D55AAbCec791A603407cE7244A29986372457e2",
       "label": "chimera-eoa-06",
       "chain_balances": {
         "base": "0",
@@ -66,10 +66,10 @@
       },
       "last_used": 0,
       "use_count": 0,
-      "excluded": false
+      "excluded": true
     },
     {
-      "address": "0x7777777777777777777777777777777777777777",
+      "address": "0xE733d0c63b7D9Afae16D3f3c552825AA4f85391a",
       "label": "chimera-eoa-07",
       "chain_balances": {
         "base": "0",
@@ -77,10 +77,10 @@
       },
       "last_used": 0,
       "use_count": 0,
-      "excluded": false
+      "excluded": true
     },
     {
-      "address": "0x8888888888888888888888888888888888888888",
+      "address": "0x195E192101a2db8406B20e375987d624B99DA794",
       "label": "chimera-eoa-08",
       "chain_balances": {
         "base": "0",
@@ -88,10 +88,10 @@
       },
       "last_used": 0,
       "use_count": 0,
-      "excluded": false
+      "excluded": true
     },
     {
-      "address": "0x9999999999999999999999999999999999999999",
+      "address": "0x1f4afDbc8c8eFC91b8e3e065511FfdFec58605F7",
       "label": "chimera-eoa-09",
       "chain_balances": {
         "base": "0",
@@ -99,10 +99,10 @@
       },
       "last_used": 0,
       "use_count": 0,
-      "excluded": false
+      "excluded": true
     },
     {
-      "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "address": "0xF4cd559fdFDE260d481A8a286CE1e9E071475696",
       "label": "chimera-eoa-10",
       "chain_balances": {
         "base": "0",
@@ -110,7 +110,7 @@
       },
       "last_used": 0,
       "use_count": 0,
-      "excluded": false
+      "excluded": true
     }
   ]
 }

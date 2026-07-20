@@ -130,24 +130,26 @@ Live startup fails if the treasury balance is zero or any active worker is below
 `min_worker_balance_eth`. Keep worker balances gas-sized; the Rust scheduler
 returns excess native ETH to the treasury and tops up underfunded workers.
 
-## 5. Mandatory Seven-Day Gate
+## 5. Mode-State Gate (7-day soak de-listed 2026-07-20)
 
-Do not proceed without at least seven continuous days of shadow operation and
-archived evidence. The engine never auto-flips to live.
+The mandatory seven-day soak requirement was de-listed by operator decision on
+2026-07-20. `toggle_shadow.py --set-live` now requires only a stamped
+`core/state/mode.json` (`--set-shadow` stamps it). The engine never auto-flips
+to live. A shadow rehearsal per `docs/runbook-7day-soak.md` remains recommended
+evidence before real funds, at operator discretion.
 
 ```bash
 python scripts/toggle_shadow.py --show
 ```
 
-Required evidence:
+Recommended (no longer gating) evidence:
 
-- [ ] `_soak_satisfied` is `true`
-- [ ] Metrics and logs cover at least seven continuous days
+- [ ] Shadow-mode smoke completed with clean logs
 - [ ] No unexplained breaker trips remain open
 - [ ] Crash recovery and emergency-pause drills passed
 - [ ] Standard-RPC/public-orderflow risk was explicitly accepted, or protected submission was added and validated
 
-Then run the explicit mode-state gate:
+Then run the explicit mode-state step:
 
 ```bash
 python scripts/toggle_shadow.py --set-live
@@ -274,6 +276,6 @@ gas ETH only** and does not sweep ERC20 tokens.
 |---|---|
 | `docs/deployment-checklist.md` | Full preflight, contract, soak, and live gates |
 | `docs/runbook-wallet-provisioning.md` | Safe encrypted-keystore provisioning and parity verification |
-| `docs/runbook-7day-soak.md` | Mandatory soak evidence |
+| `docs/runbook-7day-soak.md` | Optional shadow rehearsal (mandatory soak de-listed 2026-07-20) |
 | `docs/emergency-procedures.md` | Incident response and breaker recovery |
 | `SECURITY.md` | Custody, submission, and residual-risk model |

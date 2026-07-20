@@ -7,9 +7,9 @@ use tracing::warn;
 
 use crate::ChimeraError;
 
-/// Minimum gas budget for a liquidation transaction on L2.
-/// Conservative: 250k gas × 50 gwei = 0.0125 ETH buffer.
-pub const MIN_GAS_BUDGET_WEI: u128 = 12_500_000_000_000_000; // 0.0125 ETH
+/// Minimum gas budget for a liquidation transaction on Base L2.
+/// Buffer for ~few liquidations at low L2 gas (was 250k×50 gwei conservative).
+pub const MIN_GAS_BUDGET_WEI: u128 = 2_000_000_000_000_000; // 0.002 ETH
 
 /// Check whether an EOA has enough native balance to cover gas.
 ///

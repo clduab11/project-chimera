@@ -4,7 +4,7 @@ This is a private repository. These guidelines are for maintainers and invited c
 
 ## Shadow-Mode-First Principle
 
-The engine runs in shadow mode by default. **Never auto-flip to live.** The `execute_mode` field in config and fixtures must always commit as `shadow`. The shadow-to-live transition is gated in code (`toggle_shadow.py`) and requires a mandatory 7-day shadow soak, encrypted treasury/worker keystores, a multisig-owned standalone Executor, canonical Aave Pool configuration, and authorization of every active worker.
+The engine runs in shadow mode by default. **Never auto-flip to live.** The `execute_mode` field in config and fixtures must always commit as `shadow`. The shadow-to-live transition is managed in code (`toggle_shadow.py`); the 7-day soak was de-listed by operator decision on 2026-07-20. Live still requires encrypted treasury/worker keystores, a multisig-owned standalone Executor, canonical Aave Pool configuration, and authorization of every active worker.
 
 The `shadow-guard` CI job blocks any PR that flips `execute_mode: live` in committed files.
 

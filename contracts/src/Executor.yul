@@ -263,20 +263,20 @@ object "Executor" {
                 if shr(160, token) { revertWithError(0xc4cae92f) }
 
                 if iszero(token) {
-                    let balance := selfbalance()
+                    let available := selfbalance()
                     let withdrawal := amount
-                    if iszero(withdrawal) { withdrawal := balance }
-                    if gt(withdrawal, balance) { revertWithError(0x750b219c) }
+                    if iszero(withdrawal) { withdrawal := available }
+                    if gt(withdrawal, available) { revertWithError(0x750b219c) }
                     if iszero(call(gas(), caller(), withdrawal, 0, 0, 0, 0)) {
                         revertWithError(0x750b219c) // WithdrawFailed()
                     }
                     stop()
                 }
 
-                let balance := callBalanceOf(token, address())
+                let available := callBalanceOf(token, address())
                 let withdrawal := amount
-                if iszero(withdrawal) { withdrawal := balance }
-                if gt(withdrawal, balance) { revertWithError(0x750b219c) }
+                if iszero(withdrawal) { withdrawal := available }
+                if gt(withdrawal, available) { revertWithError(0x750b219c) }
                 if iszero(callTransfer(token, caller(), withdrawal)) {
                     revertWithError(0x750b219c)
                 }
@@ -311,12 +311,12 @@ object "Executor" {
                 }
             }
 
-            function callBalanceOf(token, account) -> balance {
+            function callBalanceOf(token, account) -> tokenBal {
                 mstore(0, shl(224, 0x70a08231))
                 mstore(4, account)
                 if iszero(staticcall(gas(), token, 0, 36, 0, 32)) { revert(0, 0) }
                 if lt(returndatasize(), 32) { revert(0, 0) }
-                balance := mload(0)
+                tokenBal := mload(0)
             }
 
             function callApprove(token, spender, amount) -> success {

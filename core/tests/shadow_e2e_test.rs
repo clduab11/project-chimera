@@ -137,7 +137,7 @@ fn test_pacing_config(eoa_pool_path: &str) -> PacingConfig {
         chain_id: 8453,
         oracle_staleness_seconds: 300,
         eth_price_usd_fallback: Decimal::from(1800),
-        eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b".into(),
+        eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70".into(),
         recent_outcomes_capacity: 128,
         eoa_pool_path: eoa_pool_path.to_string(),
         pools_toml_path: "config/pools.toml".into(),
@@ -147,10 +147,10 @@ fn test_pacing_config(eoa_pool_path: &str) -> PacingConfig {
         worker_keystore_dir: String::new(),
         sweep_interval_secs: 300,
         refund_interval_secs: 3600,
-        min_worker_balance_eth: dec!(0.01),
-        refund_topup_eth: dec!(0.05),
+        min_worker_balance_eth: dec!(0.002),
+        refund_topup_eth: dec!(0.01),
         sweep_tokens: vec![],
-        sweep_min_keep_eth: dec!(0.005),
+        sweep_min_keep_eth: dec!(0.001),
         ws_endpoint: String::new(),
     }
 }

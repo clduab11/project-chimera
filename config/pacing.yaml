@@ -32,7 +32,7 @@ oracle_staleness_seconds: 300
 eth_price_usd_fallback: 1800
 # Chainlink ETH/USD feed address for live gas-cost pricing. Configured per deployed chain.
 # Base mainnet default: https://docs.chain.link/data-feeds/price-feeds/addresses?network=base
-eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCbe3D9337177BcC57b"
+eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 recent_outcomes_capacity: 128
 eoa_pool_path: config/eoa_pool.json
 pools_toml_path: config/pools.toml
@@ -44,8 +44,8 @@ treasury_keystore: ""
 worker_keystore_dir: ""
 sweep_interval_secs: 300
 refund_interval_secs: 3600
-min_worker_balance_eth: 0.01
-refund_topup_eth: 0.05
+min_worker_balance_eth: 0.002
+refund_topup_eth: 0.01
 sweep_tokens: []
-sweep_min_keep_eth: 0.005
+sweep_min_keep_eth: 0.001
 ws_endpoint: ""

@@ -59,6 +59,8 @@ contract Deploy is Script {
         address aavePool = vm.envOr("CHIMERA_AAVE_POOL", address(0)); // optional
         address worker = vm.envOr("CHIMERA_WORKER", address(0)); // optional
         uint256 pk = vm.envUint("DEPLOYER_PRIVATE_KEY");
+        // Broadcaster EOA (msg.sender inside Script is the script contract, not the key).
+        address deployer = vm.addr(pk);
 
         // ── 2. Safety: ownership target must be a deployed contract ─────────
         require(multisig != address(0), "multisig unset");
@@ -87,7 +89,7 @@ contract Deploy is Script {
         require(executor != address(0), "executor deploy failed");
 
         // ── 4. Deploy FundDistributor; initiate two-step transfer to multisig
-        FundDistributor dist = new FundDistributor(msg.sender);
+        FundDistributor dist = new FundDistributor(deployer);
         dist.transferOwnership(multisig); // multisig must accept post-deploy
 
         vm.stopBroadcast();
@@ -104,7 +106,7 @@ contract Deploy is Script {
         require(multisig.code.length > 0, "multisig not a contract");
 
         // FundDistributor: transfer initiated, pending acceptance by multisig.
-        require(dist.owner() == msg.sender, "dist owner should still be deployer");
+        require(dist.owner() == deployer, "dist owner should still be deployer");
         require(
             dist.pendingOwner() == multisig,
             "dist pendingOwner != multisig"

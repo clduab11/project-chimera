@@ -358,15 +358,15 @@ mod tests {
     #[test]
     fn native_reserve_uses_worker_minimum_when_it_is_higher() {
         assert_eq!(
-            native_reserve_wei(dec!(0.005), dec!(0.01)).unwrap(),
-            U256::from(12_500_000_000_000_000u64)
+            native_reserve_wei(dec!(0.001), dec!(0.002)).unwrap(),
+            U256::from(2_000_000_000_000_000u64)
         );
     }
 
     #[test]
     fn native_reserve_uses_sweep_minimum_when_it_is_higher() {
         assert_eq!(
-            native_reserve_wei(dec!(0.02), dec!(0.01)).unwrap(),
+            native_reserve_wei(dec!(0.02), dec!(0.002)).unwrap(),
             U256::from(20_000_000_000_000_000u64)
         );
     }
@@ -383,16 +383,16 @@ mod tests {
     #[test]
     fn sweep_reserve_guarantees_min_gas_budget_floor() {
         let min_gas_budget_wei = crate::executor::balance::MIN_GAS_BUDGET_WEI as u64;
-        let reserve = native_reserve_wei(dec!(0.005), dec!(0.01))
+        let reserve = native_reserve_wei(dec!(0.001), dec!(0.002))
             .expect("default config values must produce a valid reserve");
         assert!(
             reserve >= U256::from(min_gas_budget_wei),
-            "sweep reserve {reserve} wei must be >= MIN_GAS_BUDGET_WEI ({min_gas_budget_wei} wei / 0.0125 ETH)"
+            "sweep reserve {reserve} wei must be >= MIN_GAS_BUDGET_WEI ({min_gas_budget_wei} wei / 0.002 ETH)"
         );
         assert_eq!(
             reserve,
             U256::from(min_gas_budget_wei),
-            "with default config (0.005 sweep / 0.01 worker), reserve should equal the MIN_GAS_BUDGET floor of 0.0125 ETH"
+            "with default config (0.001 sweep / 0.002 worker), reserve should equal the MIN_GAS_BUDGET floor of 0.002 ETH"
         );
     }
 }

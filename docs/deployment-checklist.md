@@ -3,8 +3,8 @@
 > **Read first.** This checklist gates the path from a clean checkout to live
 > execution. It is ordered: do not skip ahead. The engine is **shadow-mode-first
 > and never auto-flips to live** — the only way to go live is to satisfy every
-> gate below and then explicitly run `toggle_shadow.py --set-live`, which itself
-> enforces the 7-day soak rule.
+> gate below and then explicitly run `toggle_shadow.py --set-live`. (The 7-day
+> soak rule was de-listed by operator decision on 2026-07-20.)
 >
 > The live path uses a standalone multisig-owned Executor. Worker EOAs sign
 > ordinary EIP-1559 calls to `execute(bytes)`; there is no EIP-7702/delegation.
@@ -95,10 +95,11 @@ Deploy and exercise on testnet before any mainnet deployment.
 
 ---
 
-## 4. Shadow Soak (mandatory)
+## 4. Shadow Soak (optional — gate de-listed 2026-07-20)
 
-The soak is non-negotiable. It is the primary evidence that the system behaves
-as designed before any capital is at risk.
+The soak is no longer a hard gate: the operator de-listed the mandatory 7-day
+requirement on 2026-07-20. It remains the recommended evidence that the system
+behaves as designed before any capital is at risk.
 
 - [ ] Run shadow mode for **≥ 7 continuous days**
 - [ ] **Zero unexpected breaker trips** over the window (any trip → investigate, do not paper over)
@@ -120,7 +121,7 @@ Only enter this section after §1–4 are fully satisfied.
 - [ ] Treasury signer/address parity, EOA-pool/signer parity, and live funding checks pass
 - [ ] `docs/emergency-procedures.md` reviewed by the operator on duty
 - [ ] Rollback path documented and the operator can execute it from memory (§6)
-- [ ] Run `toggle_shadow.py --set-live` — **this enforces the 7-day rule**; if it refuses, the soak is not satisfied, stop
+- [ ] Run `toggle_shadow.py --set-live` — requires a stamped `core/state/mode.json` (7-day rule de-listed 2026-07-20)
 - [ ] Start with minimum viable **gas ETH** for treasury and workers; do not deposit trading/liquidation capital
 - [ ] Watch the first ~10 live ops at reduced sizing; confirm inclusion > 85% and no breaker trips
 - [ ] Explicitly assess the unwired private/protected-submission risk before real money; current raw transactions use the standard RPC

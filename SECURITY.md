@@ -86,8 +86,10 @@ failure should result in loss of funds.
   detects, and simulates — but does **not** submit real transactions.
 - A CI job (`shadow-guard`) blocks any PR that sets `execute_mode: live` in
   committed configuration or test fixtures.
-- Transition to live mode is gated by `toggle_shadow.py`, which enforces a
-  **mandatory 7-day shadow soak** before permitting `mode.json` to be flipped.
+- Transition to live mode is managed by `toggle_shadow.py` against
+  `core/state/mode.json`. The mandatory 7-day shadow soak was **de-listed by
+  operator decision on 2026-07-20**; `--set-live` now requires only a stamped
+  mode state.
 
 ### Pacing Engine Auto-Halt Triggers
 
@@ -251,7 +253,8 @@ Before any live execution with real capital, the following must be completed:
 2. `slither contracts --config-file slither.config.json` — static analysis pass.
 3. Dependency CVE triage (`cargo audit`, `pip-audit`, `osv-scanner`) — resolve
    or document-accept all findings.
-4. Mandatory 7-day shadow soak with clean metrics.
+4. Shadow-soak requirement: de-listed by operator decision on 2026-07-20;
+   `execute_mode` remains `shadow` in committed config.
 5. Standalone Executor deployed with construction-time multisig ownership;
    canonical Pool set and every active worker authorized.
 6. Encrypted treasury/worker keystores provisioned outside the repository, with

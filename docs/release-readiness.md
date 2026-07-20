@@ -5,7 +5,8 @@
 This document is the comprehensive readiness assessment for the project's first
 release. It records what was verified, what changed, and what remains an
 operator action. Scope: repository release hygiene only — **not** live-mode
-authorization (live remains gated by the 7-day soak and go-live runbooks).
+authorization (live is governed by the go-live runbooks; the 7-day soak gate
+was de-listed by operator decision on 2026-07-20).
 
 ---
 
@@ -58,7 +59,7 @@ authorization (live remains gated by the 7-day soak and go-live runbooks).
 
 ## 5. Explicitly out of scope for this release
 
-- Live-mode execution (gated by 7-day soak + keystore/multisig runbooks).
+- Live-mode execution (governed by keystore/multisig runbooks; 7-day soak gate de-listed 2026-07-20).
 - Protected/private transaction submission (tracked as pre-live requirement).
 - Any paid service, financial transaction, or account creation — see
   `docs/monetization.md` for the staged, approval-gated plan.
@@ -66,6 +67,6 @@ authorization (live remains gated by the 7-day soak and go-live runbooks).
 
 ## 6. Post-release operational path (unchanged project gates)
 
-testnet practice → 7-day shadow soak → compliance review
+testnet practice → compliance review
 (`docs/monetization.md` §6) → explicit go-live decision → capped live
 operation → weekly PnL/breaker review.

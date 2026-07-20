@@ -3,15 +3,15 @@
 **Document version:** 1.1
 **Last updated:** 2026-07-05
 **Target audience:** Solo operator
-**Status:** Operator-executed runbook — do NOT execute during authoring.
+**Status:** OPTIONAL REHEARSAL — the mandatory 7-day soak gate was de-listed by operator decision on 2026-07-20. This runbook is retained as a recommended shadow-stability rehearsal, not a go-live gate.
 **Deployment model:** Host-run binary + monitoring stack via Docker Compose (Grafana, Prometheus, Qdrant only; the chimera-core binary runs directly on the host).
 
-This runbook walks the operator through the mandatory 7-day (604,800-second) shadow soak period before capital is ever put at risk. Every step is checklisted. Every command is copy-paste safe (assuming the working directory is the repo root).
+This runbook walks the operator through a recommended 7-day (604,800-second) shadow stability rehearsal. Every step is checklisted. Every command is copy-paste safe (assuming the working directory is the repo root).
 
-The 7-day minimum is non-negotiable and is enforced by two independent gates:
+The 7-day minimum was de-listed by operator decision on 2026-07-20. Both former enforcement points now pass immediately:
 
-- `scripts/toggle_shadow.py --set-live` refuses exit 1 if `shadow_since` age < 7 days.
-- `PacingConfig::validate_mode_transition()` in `core/src/config.rs:219` refuses boot if previous_mode=shadow and shadow_since is missing or < 604,800 s.
+- `scripts/toggle_shadow.py --set-live` requires only a stamped `shadow_since` (`SHADOW_SOAK_SECONDS = 0`).
+- `PacingConfig::validate_mode_transition()` in `core/src/config.rs` no longer enforces a minimum shadow age (a future `shadow_since` still fails as a corruption guard).
 
 ---
 
@@ -122,9 +122,11 @@ Expected output includes:
   "shadow_since": <unix_timestamp>,
   "_exists": true,
   "_shadow_age": "0d 0h 0m",
-  "_soak_satisfied": false
+  "_soak_satisfied": true
 }
 ```
+
+(`_soak_satisfied` always reads `true` since the 2026-07-20 gate de-list; `SHADOW_SOAK_SECONDS = 0`.)
 
 Note the `shadow_since` timestamp. Write it down. The 7-day clock started when this was stamped.
 
@@ -235,7 +237,7 @@ Perform these once per day, ideally at the same time (± 2 hours) to establish a
 
 #### Day ___ (fill in date: ________)
 
-- [ ] **Shadow clock check** — Run `python scripts/toggle_shadow.py --show` and confirm `_soak_satisfied` remains `false` (expected until Day 7+). Note the `_shadow_age` field.
+- [ ] **Shadow clock check** — Run `python scripts/toggle_shadow.py --show` and note the `_shadow_age` field. (`_soak_satisfied` always reads `true` since the 2026-07-20 gate de-list.)
 
 - [ ] **Health probe** — Run `python scripts/health_check.py --rpc <URL> --metrics-port 9553`. All critical checks must PASS. Investigate any FAIL immediately.
 
@@ -805,15 +807,14 @@ actual_port = config.metrics_port + (chain_id % 1000)
 
 All `curl`, `grep`, and `health_check.py` commands in this runbook use port **9553** (Base). If operating on a different chain, adjust the port accordingly.
 
-## Appendix D: Transition Gate Enforcement
+## Appendix D: Transition Gate History
 
-The 7-day shadow soak is enforced at two independent points in the codebase:
+The 7-day shadow soak was previously enforced at two independent points in the codebase:
 
-1. **`scripts/toggle_shadow.py --set-live`** (line 137–176): Refuses exit 1 if `shadow_since` age < 604,800 seconds. Prints remaining time and exits without writing.
+1. **`scripts/toggle_shadow.py --set-live`**: refused if `shadow_since` age < 604,800 seconds.
+2. **`core/src/config.rs:validate_mode_transition()`**: refused live boot if `shadow_since` was missing or < 604,800 seconds.
 
-2. **`core/src/config.rs:validate_mode_transition()`** (line 219–246): Called at startup (main.rs:176). Refuses boot with `ConfigError` if `previous_mode == "shadow"` and `execute_mode == "live"` but `shadow_since` is missing or < 604,800 seconds.
-
-Both gates must be satisfied. `toggle_shadow.py` manages `mode.json` but does NOT change `execute_mode` in `config/pacing.yaml` — that is a separate deliberate operator action.
+Both were de-listed by operator decision on 2026-07-20 (`SHADOW_SOAK_SECONDS = 0`; the Rust check keeps only a future-timestamp corruption guard). `toggle_shadow.py` still manages `mode.json` but does NOT change `execute_mode` in `config/pacing.yaml` — that is a separate deliberate operator action.
 
 ## Appendix E: Known Partial Implementations
 

@@ -32,12 +32,15 @@ vendor/
 
 # Secrets & keys (CRITICAL - forensic safety)
 .env
+.env.*
+!.env.live.example
 secrets.env
 *.pem
 *.key
 wallets/
 clean_eoa_seeds.txt
 private_keys/
+.env.live
 
 # Large data / traces (local only)
 *.parquet
@@ -65,6 +68,8 @@ cache/
 out/
 broadcast/
 
+# Runtime logs (may embed RPC URLs with API keys)
+logs/
 # Ollama / models (large)
 ollama/models/
 
@@ -75,6 +80,7 @@ ollama/models/
 # Project Chimera - state & audit artifacts
 core/state/
 core/snapshots/
+config/snapshot.json
 ai-audit/queue/
 ai-audit/.daily_counter.json
 research/raw/

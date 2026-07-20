@@ -9,8 +9,8 @@ via web3.py and serializes it for the Rust REVM simulator's pre-warm cache.
 Supports both live RPC calls and a --mock fallback for testing.
 
 Usage:
-  python scripts/snapshot_generator.py --chain base --output core/snapshots/base_latest.json
-  python scripts/snapshot_generator.py --chain base --mock --output core/snapshots/base_mock.json
+  python scripts/snapshot_generator.py --chain base --output config/snapshot.json
+  python scripts/snapshot_generator.py --chain base --mock --output config/snapshot.json
 """
 
 from __future__ import annotations
@@ -28,7 +28,10 @@ from typing import Any
 
 try:
     from web3 import Web3
-    from web3.middleware import geth_poa_middleware
+    try:
+        from web3.middleware import geth_poa_middleware
+    except ImportError:  # web3.py v7 renamed the PoA middleware.
+        from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
 except ImportError:  # Allows --mock mode on machines without web3.py installed.
     Web3 = None  # type: ignore[assignment]
     geth_poa_middleware = None  # type: ignore[assignment]
@@ -164,10 +167,18 @@ POOL_ABI: list[dict[str, Any]] = [
         "inputs": [{"internalType": "uint8", "name": "id", "type": "uint8"}],
         "name": "getEModeCategoryData",
         "outputs": [
-            {"internalType": "uint16", "name": "liquidationThreshold", "type": "uint16"},
-            {"internalType": "uint16", "name": "liquidationBonus", "type": "uint16"},
-            {"internalType": "address", "name": "priceSource", "type": "address"},
-            {"internalType": "string", "name": "label", "type": "string"},
+            {
+                "internalType": "tuple",
+                "name": "",
+                "type": "tuple",
+                "components": [
+                    {"internalType": "uint16", "name": "ltv", "type": "uint16"},
+                    {"internalType": "uint16", "name": "liquidationThreshold", "type": "uint16"},
+                    {"internalType": "uint16", "name": "liquidationBonus", "type": "uint16"},
+                    {"internalType": "address", "name": "collateralBitmap", "type": "address"},
+                    {"internalType": "string", "name": "label", "type": "string"},
+                ],
+            }
         ],
         "stateMutability": "view",
         "type": "function",
@@ -340,6 +351,8 @@ def _fetch_emode_category_data(
     """Fetch eMode liquidation threshold and bonus for a category from the Pool."""
     if category_id == 0:
         return 0, 0
+    # Aave V3.3 returns a dynamic struct (leading 0x20 offset), so declare a
+    # single tuple output; flat field lists fail to decode (verified on Base).
     pool_contract = w3.eth.contract(
         address=Web3.to_checksum_address(pool_address),
         abi=[
@@ -347,10 +360,18 @@ def _fetch_emode_category_data(
                 "inputs": [{"internalType": "uint8", "name": "id", "type": "uint8"}],
                 "name": "getEModeCategoryData",
                 "outputs": [
-                    {"internalType": "uint16", "name": "liquidationThreshold", "type": "uint16"},
-                    {"internalType": "uint16", "name": "liquidationBonus", "type": "uint16"},
-                    {"internalType": "address", "name": "priceSource", "type": "address"},
-                    {"internalType": "string", "name": "label", "type": "string"},
+                    {
+                        "internalType": "tuple",
+                        "name": "",
+                        "type": "tuple",
+                        "components": [
+                            {"internalType": "uint16", "name": "ltv", "type": "uint16"},
+                            {"internalType": "uint16", "name": "liquidationThreshold", "type": "uint16"},
+                            {"internalType": "uint16", "name": "liquidationBonus", "type": "uint16"},
+                            {"internalType": "address", "name": "collateralBitmap", "type": "address"},
+                            {"internalType": "string", "name": "label", "type": "string"},
+                        ],
+                    }
                 ],
                 "stateMutability": "view",
                 "type": "function",
@@ -360,7 +381,12 @@ def _fetch_emode_category_data(
     result = _retry_with_backoff(
         lambda: pool_contract.functions.getEModeCategoryData(category_id).call()
     )
-    return int(result[0]), int(result[1])
+    # web3 may return the single tuple output nested ((...),) or flattened
+    # (ltv, lt, lb, bitmap, label); handle both shapes.
+    category = result[0]
+    if isinstance(category, int):
+        return int(result[1]), int(result[2])
+    return int(category[1]), int(category[2])
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +405,16 @@ def fetch_reserves(
         abi=POOL_DATA_PROVIDER_ABI,
     )
 
+    # getReservesList lives on the Pool contract; the AaveProtocolDataProvider
+    # reverts on it (verified on Base mainnet). Per-reserve reads below still
+    # go to the data provider.
+    pool_list = w3.eth.contract(
+        address=Web3.to_checksum_address(pool_address),
+        abi=[POOL_DATA_PROVIDER_ABI[0]],
+    )
+
     reserve_list: list[str] = _retry_with_backoff(
-        lambda: data_provider.functions.getReservesList().call()
+        lambda: pool_list.functions.getReservesList().call()
     )
     logger.info("Found %d reserves", len(reserve_list))
 
@@ -534,7 +568,7 @@ def fetch_user_positions(
 
     borrowers: set[str] = set()
     try:
-        event_filter = pool.events.Borrow().create_filter(fromBlock=from_block, toBlock=latest)
+        event_filter = pool.events.Borrow().create_filter(from_block=from_block, to_block=latest)
         entries = _retry_with_backoff(event_filter.get_all_entries)
         for entry in entries:
             borrowers.add(entry["args"]["user"])
@@ -646,8 +680,12 @@ def serialize_snapshot(
 
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    # Atomic write (tmp sibling + os.replace) so a crash mid-write cannot leave
+    # a truncated snapshot that the engine would silently load as empty.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(snapshot, f, indent=2)
+    os.replace(tmp, path)
 
     logger.info("Snapshot written to %s (%d reserves, %d users)", output_path, len(reserves), len(positions))
 

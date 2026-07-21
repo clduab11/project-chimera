@@ -572,7 +572,7 @@ mod tests {
         // The legacy Address::ZERO price placeholder must NOT be written: it was
         // dead state no contract read, and it confused sim-freshness audits.
         assert!(
-            db.cache.accounts.get(&Address::ZERO).is_none(),
+            !db.cache.accounts.contains_key(&Address::ZERO),
             "no dead price placeholder account may be pre-warmed"
         );
     }

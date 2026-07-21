@@ -210,8 +210,7 @@ impl ReservePriceSource for ScriptedPricer {
 // Harness
 // ---------------------------------------------------------------------------
 
-struct Harness<P: alloy::providers::Provider<alloy::network::Ethereum> + Clone + Send + Sync + 'static>
-{
+struct Harness<P: alloy::providers::Provider<alloy::network::Ethereum> + Clone + 'static> {
     orchestrator: Orchestrator<P>,
     metrics: Arc<Metrics>,
     captured: Arc<StdMutex<Vec<(Address, U256)>>>,
@@ -226,8 +225,7 @@ fn build_harness(
     refresher_parts: Option<(Arc<dyn ReservePriceSource>, std::path::PathBuf)>,
     risk_config: RiskConfig,
     execute_mode: &str,
-) -> Harness<impl alloy::providers::Provider<alloy::network::Ethereum> + Clone + Send + Sync + 'static>
-{
+) -> Harness<impl alloy::providers::Provider<alloy::network::Ethereum> + Clone + 'static> {
     let dir = TempDir::new().unwrap();
     let chain_id = 8453u64;
 
@@ -428,6 +426,9 @@ async fn test_reprice_failure_retains_prices_and_keeps_scanning() {
 #[tokio::test]
 async fn test_snapshot_reload_swaps_between_scans() {
     fn generator_json(block: u64, weth_price_dollars: f64) -> String {
+        let weth = format!("{COLL_WETH:#x}");
+        let usdc = format!("{DEBT_USDC:#x}");
+        let user = format!("{USER:#x}");
         format!(
             r#"{{
   "chain": "base",
@@ -458,9 +459,6 @@ async fn test_snapshot_reload_swaps_between_scans() {
   }}
 }}"#,
             ts = chrono::Utc::now().timestamp(),
-            weth = format!("{:#x}", COLL_WETH),
-            usdc = format!("{:#x}", DEBT_USDC),
-            user = format!("{:#x}", USER),
         )
     }
     fn write_atomically(path: &std::path::Path, content: &str) {

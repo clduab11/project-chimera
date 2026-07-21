@@ -35,6 +35,7 @@ See README.md for architecture overview. This file provides constraints for LLM 
   - rotate_eoa.py: wallet rotation
   - update_venues.py: DEX liquidity discovery
   - emergency_pause.py: circuit-breaker webhook
+  - dashboard.py: stdlib-only ops console on 127.0.0.1:9553 (proxies engine metrics on 9554, tails logs/, public ETH/USD ticker)
 </module_boundaries>
 
 ## Validation Gate

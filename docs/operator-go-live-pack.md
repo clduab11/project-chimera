@@ -214,6 +214,20 @@ watch -n 10 'curl -s http://localhost:9553/metrics | grep -E "chimera_breaker_st
 python scripts/status.py --chain base      # needs rich+PyYAML
 ```
 
+**Ops dashboard (preferred):** `python scripts/dashboard.py` serves a dark
+ops console at **http://localhost:9553** — status panel (mode, breaker, uptime,
+block/snapshot age), auto-refreshing financials (5s), highlighted execution
+events with BaseScan tx links, live ETH/USD ticker (Kraken → Binance → Coinbase
+fallback, shown next to the engine's Chainlink oracle price with divergence),
+and a filtered ANSI-stripped log tail.
+
+> **Port remap (2026-07-21):** the dashboard owns **9553**; the engine was moved
+> to **9554** via `CHIMERA_METRICS_PORT=9101` in `.env.live`. NB: the env var is
+> the *base* port — the binary adds `chain_id % 1000` (9101 + 453 = **9554**;
+> `core/src/main.rs:158-167`). Setting it to 9554 would bind 10007 instead.
+> `curl localhost:9553/metrics` still works — the dashboard transparently
+> proxies the engine.
+
 Halt immediately if anything is unexpected:
 
 ```bash

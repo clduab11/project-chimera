@@ -1,7 +1,18 @@
-# Project Chimera - Routing & Venue Configuration (v1.0)
+# Project Chimera - Routing & Venue Configuration (v1.1)
 # L2-focused: no Flashbots eth_sendBundle assumption.
 # Primary path = low-latency private RPC or direct sequencer submission.
 # All venues must be non-KYC, >$50k liquidity, unregulated.
+#
+# 2026-07-21 reconciliation (verified vs Basescan name tags / Uniswap docs):
+#   - Every router_address previously held the venue's *factory* (no swap fn) →
+#     100% of Base collateral→debt swaps reverted. Corrected to real routers.
+#   - sushi-base: now points at the real Sushi V2 router → executable today.
+#   - aerodrome-base: real Aerodrome router pinned, BUT compatibility demoted to
+#     "custom" — Aerodrome is a Solidly fork requiring Route[] calldata; the
+#     Executor's V2 path[] encoder would revert. The resolver skips non-"v2"
+#     venues, so it stays out of selection until the Aerodrome encoder ships.
+#   - uniswap-v3-* : real SwapRouter02 (Base) pinned; inert (resolver skips v3)
+#     until the V3 encoder ships.
 
 primary: "alchemy-base-private"          # or "arbitrum-sequencer" / "direct-rpc"
 fallbacks:
@@ -18,8 +29,8 @@ venues:
     liquidity_usd_min: 50000
     type: "dex"
     kyc: false
-    router_compatibility: "v2"
-    router_address: "0x71524B4f93c58fcbF659783284E38825f0622859"
+    router_compatibility: "custom"        # was "v2" — Solidly Route[]; parked until Aerodrome encoder (Phase Charlie)
+    router_address: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"   # verified Aerodrome Router (was 0x71524B4f = Sushi factory)
     pairs:
       - token_in: "0x4200000000000000000000000000000000000006"
         token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -31,7 +42,7 @@ venues:
     type: "dex"
     kyc: false
     router_compatibility: "v3"
-    router_address: "0x33128a8fC17869897dcE68Ed026d694621f6FdfD"
+    router_address: "0x2626664c2603336E57B271c5C0b26F421741e481"   # verified Uniswap V3 SwapRouter02 (was 0x33128a8f = V3 factory); inert until Phase Delta
     pairs:
       - token_in: "0x4200000000000000000000000000000000000006"
         token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -41,7 +52,7 @@ venues:
     type: "dex"
     kyc: false
     router_compatibility: "v2"
-    router_address: "0x71524B4f93c58fcbF659783284E38825f0622859"
+    router_address: "0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891"   # verified Sushi V2 Router (was 0x71524B4f = Sushi factory); EXECUTABLE with current Executor
     pairs:
       - token_in: "0x4200000000000000000000000000000000000006"
         token_out: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -51,7 +62,7 @@ venues:
     type: "dex"
     kyc: false
     router_compatibility: "v2"
-    router_address: "0x6EcCab422D763aC031210895C81787E87b43a652"
+    router_address: "0xc873fecbd354f5a56e00e710b90ef4201db2448d"   # verified Camelot Router (was 0x6EcCab = Camelot factory)
     pairs:
       - token_in: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
         token_out: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
@@ -63,7 +74,7 @@ venues:
     type: "dex"
     kyc: false
     router_compatibility: "v3"
-    router_address: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    router_address: "0x1F98431c8aD98523631AE4a59f267346ea31F984"   # TODO: real Arb SwapRouter02 pre-Delta (currently V3 factory placeholder; inert, resolver skips v3)
     pairs:
       - token_in: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
         token_out: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"

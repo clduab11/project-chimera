@@ -37,10 +37,23 @@ rand = "0.8"
 parking_lot = "0.12"
 url = { version = "2", features = ["serde"] }
 
+[features]
+# Test-only injection hooks (mock simulator, mock gas price, single-scan entry
+# point) consumed by the core/tests integration suite. OFF by default so the
+# release binary carries NO mock-injection surface. The self path-dependency in
+# [dev-dependencies] enables it automatically for the test build (dev-deps are
+# excluded from release builds under workspace resolver "2"), so the documented
+# gate `cargo test -p chimera-core` still needs no extra flags.
+test-hooks = []
+
 [dev-dependencies]
 proptest = "1.4"
 tempfile = "3.10"
 rust_decimal_macros = "1.35"
+# Self path-dependency: enables `test-hooks` for the test build only. Does not
+# affect `cargo build`/`cargo build --release` (dev-dependencies are not compiled
+# for those, and resolver "2" does not unify dev-dep features into normal builds).
+chimera-core = { path = ".", features = ["test-hooks"] }
 
 [[bin]]
 name = "chimera"

@@ -79,6 +79,7 @@ impl Default for OrchestratorConfig {
 /// and a [`CrossProcessPacing`] that wraps a pre-built [`PacingEngine`].
 /// Execution is gated on `execute_mode == "live"` AND pacing-allowed AND profitable.
 /// Test-only simulation override used by shadow/e2e harnesses.
+#[cfg(any(test, feature = "test-hooks"))]
 type MockSimFn = Arc<dyn Fn(&crate::LiquidationCandidate) -> crate::SimulationResult + Send + Sync>;
 
 pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
@@ -97,7 +98,12 @@ pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
     risk_config: RiskConfig,
     signer_registry: Arc<SignerRegistry>,
     mempool_watcher: Option<Arc<dyn MempoolWatcher>>,
+    // Test-only injection hooks — absent from release builds (see the
+    // `test-hooks` feature in Cargo.toml). The live pipeline always uses the
+    // real provider gas price and the real REVM simulator.
+    #[cfg(any(test, feature = "test-hooks"))]
     mock_gas_price_wei: Option<u128>,
+    #[cfg(any(test, feature = "test-hooks"))]
     mock_sim_fn: Option<MockSimFn>,
 }
 
@@ -136,7 +142,9 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             risk_config,
             signer_registry,
             mempool_watcher,
+            #[cfg(any(test, feature = "test-hooks"))]
             mock_gas_price_wei: None,
+            #[cfg(any(test, feature = "test-hooks"))]
             mock_sim_fn: None,
         }
     }
@@ -307,10 +315,12 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_mock_gas_price(&mut self, price_wei: u128) {
         self.mock_gas_price_wei = Some(price_wei);
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_mock_sim_fn(
         &mut self,
         f: impl Fn(&LiquidationCandidate) -> crate::SimulationResult + Send + Sync + 'static,
@@ -318,10 +328,38 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
         self.mock_sim_fn = Some(Arc::new(f));
     }
 
+    /// Gas-price override for tests. Always `None` in release builds — the
+    /// backing field and setter do not exist without the `test-hooks` feature,
+    /// so the live pipeline unconditionally queries the provider.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn mock_gas_price(&self) -> Option<u128> {
+        self.mock_gas_price_wei
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    #[inline(always)]
+    #[allow(clippy::unused_self)]
+    fn mock_gas_price(&self) -> Option<u128> {
+        None
+    }
+
+    /// Simulation override for tests. Always `None` in release builds, so the
+    /// live pipeline unconditionally runs the real REVM simulator.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn mock_sim(&self, candidate: &LiquidationCandidate) -> Option<crate::SimulationResult> {
+        self.mock_sim_fn.as_ref().map(|f| f(candidate))
+    }
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    #[inline(always)]
+    #[allow(clippy::unused_self)]
+    fn mock_sim(&self, _candidate: &LiquidationCandidate) -> Option<crate::SimulationResult> {
+        None
+    }
+
     /// Single-scan entry point for integration testing.
     ///
     /// Performs detection, metric updates, and candidate iteration exactly once
     /// without entering the infinite loop. Returns the number of candidates found.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub async fn run_single_scan(&self) -> Result<usize, ChimeraError> {
         let detector = LiquidationDetector::new(self.snapshot.clone(), self.chain_id);
         let chain_label = self.chain_label_str();
@@ -352,8 +390,10 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
         &self,
         candidate: &LiquidationCandidate,
     ) -> Result<(), ChimeraError> {
-        // 1. Current gas price — use mock if set, otherwise query provider.
-        let gas_price_wei = if let Some(mock_price) = self.mock_gas_price_wei {
+        // 1. Current gas price — use the test hook if present, otherwise query
+        //    the provider. `mock_gas_price()` is a `None`-returning no-op in
+        //    release builds, so the branch collapses to the provider path.
+        let gas_price_wei = if let Some(mock_price) = self.mock_gas_price() {
             mock_price
         } else {
             self.provider
@@ -374,10 +414,12 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             return Ok(());
         }
 
-        // 2. Simulation — use mock if set, otherwise run the real REVM simulator.
+        // 2. Simulation — use the test hook if present, otherwise run the real
+        //    REVM simulator. `mock_sim()` is a `None`-returning no-op in release
+        //    builds, so the branch collapses to the real simulator path.
         let sim_start = std::time::Instant::now();
-        let sim_result = if let Some(ref mock_fn) = self.mock_sim_fn {
-            mock_fn(candidate)
+        let sim_result = if let Some(mock_result) = self.mock_sim(candidate) {
+            mock_result
         } else {
             let mut sim_guard = self.simulator.lock().await;
             let sim = sim_guard

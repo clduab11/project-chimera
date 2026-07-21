@@ -613,14 +613,22 @@ fn is_seizable_collateral(reserve: &ReserveData) -> bool {
     reserve.active && !reserve.frozen && !reserve.paused
 }
 
-/// `10^exp` as [`U256`] — an asset's `assetUnit` (Aave decimals ≤ 18). `decimals`
-/// is a `u8`; a pathological value above 10^77 overflows U256 and falls back to
-/// `U256::MAX`, which drives that asset's USD value to ~0 (conservatively excluded)
-/// rather than panicking on a malformed snapshot.
+/// `10^exp` as [`U256`] — an asset's `assetUnit` (Aave decimals ≤ 18). Called
+/// per collateral/debt asset in the per-block detection loop, so the decimals
+/// real reserves use (6, 8, 18) take a constant fast path with no U256
+/// exponentiation. Anything unusual falls back to `checked_pow`; a pathological
+/// value above 10^77 overflows and yields `U256::MAX`, driving that asset's USD
+/// value to ~0 (conservatively excluded) rather than panicking.
 fn pow10(exp: u8) -> U256 {
-    U256::from(10u64)
-        .checked_pow(U256::from(exp))
-        .unwrap_or(U256::MAX)
+    match exp {
+        0 => U256::from(1u64),
+        6 => U256::from(1_000_000u64),
+        8 => U256::from(100_000_000u64),
+        18 => U256::from(1_000_000_000_000_000_000u64),
+        _ => U256::from(10u64)
+            .checked_pow(U256::from(exp))
+            .unwrap_or(U256::MAX),
+    }
 }
 
 #[cfg(test)]
@@ -748,7 +756,11 @@ mod tests {
         let candidates = detector.find_at_risk_positions();
 
         // True HF = (5000 * 0.825) / 4500 = 0.9167 → below the 1.05 threshold → flagged.
-        assert_eq!(candidates.len(), 1, "underwater mixed-decimal position must be flagged");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "underwater mixed-decimal position must be flagged"
+        );
         let c = &candidates[0];
         assert_eq!(c.user, user);
         // HF ≈ 0.9167e27; the pre-fix bug would yield ~0.9167e39 (10^12 too high).

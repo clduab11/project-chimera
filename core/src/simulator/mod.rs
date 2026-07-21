@@ -92,6 +92,14 @@ pub struct LiquidationCandidate {
     /// unprofitable for a searcher), but the flag lets the orchestrator/simulator
     /// defensively skip any candidate that ever carries it set.
     pub bad_debt: bool,
+    /// Decimals of the debt asset (e.g. 6 for USDC, 18 for WETH). Profit from a
+    /// liquidation is denominated in native debt-asset units; converting to USD
+    /// requires the asset's own unit, not a hardcoded 1e18.
+    pub debt_decimals: u8,
+    /// USD price of the debt asset in Aave-oracle 8-decimal units, captured from the
+    /// detector snapshot at emission time. Zero means "unknown" and makes the
+    /// simulator fall back to the legacy 18-dec ETH-denominated conversion.
+    pub debt_price_usd: U256,
 }
 
 /// Result of a full REVM simulation of a liquidation (or flash + liquidation bundle).
@@ -384,37 +392,58 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
             net_profit_in_collateral - actual_debt_covered
         };
 
-        // Convert to USD using live oracle price.
-        let profit_wei = profit_in_debt; // Assuming debt is ETH/WETH for now
-        let eth_price = self.fetch_eth_price().await?;
-        let eth_price_f64 = eth_price.to_f64().ok_or_else(|| {
-            ChimeraError::ConversionError("ETH price Decimal to f64 failed".into())
-        })?;
-        let profit_usd = checked_u256_to_f64(profit_wei) / 1e18 * eth_price_f64;
+        // Profit is denominated in native debt-asset units; convert with the debt
+        // asset's own decimals + price (a 6-dec USDC profit divided by 1e18 and
+        // priced as ETH understates by ~12 orders of magnitude).
+        let profit_usd = self.debt_units_to_usd(profit_in_debt, candidate).await?;
 
-        Ok((profit_wei, profit_usd))
+        Ok((profit_in_debt, profit_usd))
+    }
+
+    /// Convert an amount in native debt-asset units to USD (f64, internal-only per
+    /// invariant #3 — the Decimal boundary is SimulationResult construction).
+    ///
+    /// Uses the candidate's `debt_decimals` + 8-dec `debt_price_usd` captured at
+    /// detection time. A zero price means the caller had no reserve data (e.g.
+    /// golden replays); fall back to the legacy 18-dec ETH-denominated conversion
+    /// with a warning rather than silently reporting $0.
+    async fn debt_units_to_usd(
+        &self,
+        amount: U256,
+        candidate: &LiquidationCandidate,
+    ) -> Result<f64, ChimeraError> {
+        if candidate.debt_price_usd.is_zero() {
+            tracing::warn!(
+                target: "chimera::simulator",
+                debt_asset = %candidate.debt_asset,
+                "Debt price unknown; falling back to 18-dec ETH-denominated profit conversion"
+            );
+            let eth_price = self.fetch_eth_price().await?;
+            let eth_price_f64 = eth_price.to_f64().ok_or_else(|| {
+                ChimeraError::ConversionError("ETH price Decimal to f64 failed".into())
+            })?;
+            return Ok(checked_u256_to_f64(amount) / 1e18 * eth_price_f64);
+        }
+        let asset_unit = 10f64.powi(candidate.debt_decimals as i32);
+        let price_usd = checked_u256_to_f64(candidate.debt_price_usd) / 1e8;
+        Ok(checked_u256_to_f64(amount) / asset_unit * price_usd)
     }
 
     /// Fallback profit estimation when delta extraction is unavailable.
-    /// Conservative: assumes liquidation bonus on debt covered.
+    /// Conservative: profit is the liquidation BONUS PORTION only — the seized
+    /// collateral above the repaid principal. `liquidationBonus` is 1e4-scaled with
+    /// 10000 = break-even (10500 = 5% bonus), so the portion is `bps - 10000`.
     async fn estimate_profit_heuristic(
         &self,
         candidate: &LiquidationCandidate,
         _l1_fee: &U256,
         _pacing: &PacingConfig,
     ) -> Result<(U256, f64), ChimeraError> {
-        // Default 5% liquidation bonus: bonus = debt_to_cover * DEFAULT_LIQUIDATION_BONUS_BPS / 10000
-        let bonus_bps = U256::from(DEFAULT_LIQUIDATION_BONUS_BPS);
-        let bonus = candidate.debt_to_cover * bonus_bps / U256::from(10000);
-        let gross_profit = candidate.debt_to_cover.saturating_add(bonus);
+        let bonus_portion_bps =
+            U256::from(DEFAULT_LIQUIDATION_BONUS_BPS.saturating_sub(10_000));
+        let estimated_profit = candidate.debt_to_cover * bonus_portion_bps / U256::from(10000);
 
-        // Convert to f64 safely (avoid panic on large U256).
-        let profit_wei_f64 = checked_u256_to_f64(gross_profit);
-        let eth_price = self.fetch_eth_price().await?;
-        let eth_price_f64 = eth_price.to_f64().ok_or_else(|| {
-            ChimeraError::ConversionError("ETH price Decimal to f64 failed".into())
-        })?;
-        let profit_usd = profit_wei_f64 / 1e18 * eth_price_f64;
+        let profit_usd = self.debt_units_to_usd(estimated_profit, candidate).await?;
 
         info!(
             target: "chimera::simulator",
@@ -423,7 +452,7 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
             "Using heuristic profit estimate"
         );
 
-        Ok((gross_profit, profit_usd))
+        Ok((estimated_profit, profit_usd))
     }
 
     /// Fetch the liquidation bonus (in basis points, 1e4 scale) for a reserve from on-chain data.
@@ -648,6 +677,8 @@ mod tests {
             current_hf: U256::from(1),
             chain_id: 8453,
             bad_debt: false,
+            debt_decimals: 18,
+            debt_price_usd: U256::from(3_500u64) * U256::from(100_000_000u64), // $3500, 8-dec
         };
         let result = sim
             .simulate_liquidation(
@@ -667,6 +698,98 @@ mod tests {
             result.revert_reason
         );
         assert!(result.profitable, "heuristic profit path should mark this profitable");
+    }
+
+    /// Test-only harness: a simulator over an unreachable provider with a mock
+    /// ETH/USD oracle, for exercising internal conversion paths without RPC.
+    async fn offline_sim() -> LiquidationSimulator<impl Provider<Ethereum> + Clone> {
+        let eth_asset = Address::with_last_byte(0xEE);
+        let oracle: Arc<dyn crate::oracle::PriceOracle> = Arc::new(MockOracle {
+            prices: [(eth_asset, dec!(3500))].into_iter().collect(),
+            staleness: Duration::from_secs(300),
+        });
+        let provider = Arc::new(
+            alloy::providers::ProviderBuilder::new()
+                .connect_http("http://127.0.0.1:1".parse().unwrap()),
+        );
+        LiquidationSimulator::new(provider, Address::with_last_byte(0xAA), oracle, eth_asset)
+            .await
+            .expect("construction is lazy; no RPC")
+    }
+
+    fn candidate_with_debt(debt_decimals: u8, debt_price_usd: U256) -> LiquidationCandidate {
+        LiquidationCandidate {
+            user: Address::with_last_byte(0x01),
+            collateral_asset: Address::with_last_byte(0x02),
+            debt_asset: Address::with_last_byte(0x03),
+            debt_to_cover: U256::from(1_000u64),
+            receive_a_token: false,
+            current_hf: U256::from(1),
+            chain_id: 8453,
+            bad_debt: false,
+            debt_decimals,
+            debt_price_usd,
+        }
+    }
+
+    /// B2 regression: profit in 6-dec USDC units must convert to a sane USD value.
+    /// The old code divided by 1e18 and multiplied by the ETH price, turning a $50
+    /// USDC profit into ~1.9e-7 USD — every USDC-debt candidate (the dominant Base
+    /// shape) was gated out as unprofitable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn profit_conversion_usdc_six_decimals() {
+        let sim = offline_sim().await;
+        // $0.9999 in 8-dec oracle units; 50 USDC profit in 6-dec native units.
+        let candidate = candidate_with_debt(6, U256::from(99_990_000u64));
+        let usd = sim
+            .debt_units_to_usd(U256::from(50_000_000u64), &candidate)
+            .await
+            .unwrap();
+        assert!(
+            (usd - 49.995).abs() < 0.001,
+            "50 USDC at $0.9999 must be ≈$49.995, got {usd}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn profit_conversion_weth_eighteen_decimals() {
+        let sim = offline_sim().await;
+        // $2500 WETH, 0.02 WETH profit => $50.
+        let candidate = candidate_with_debt(18, U256::from(2_500u64) * U256::from(100_000_000u64));
+        let usd = sim
+            .debt_units_to_usd(U256::from(20_000_000_000_000_000u128), &candidate)
+            .await
+            .unwrap();
+        assert!((usd - 50.0).abs() < 0.001, "0.02 WETH at $2500 must be $50, got {usd}");
+    }
+
+    /// Zero debt price = unknown (golden replays): falls back to the legacy
+    /// 18-dec ETH-denominated conversion via the oracle instead of reporting $0.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn profit_conversion_unknown_price_falls_back_to_eth() {
+        let sim = offline_sim().await;
+        let candidate = candidate_with_debt(18, U256::ZERO);
+        let usd = sim
+            .debt_units_to_usd(U256::from(1_000_000_000_000_000_000u128), &candidate)
+            .await
+            .unwrap();
+        assert!((usd - 3500.0).abs() < 0.001, "1e18 at ETH $3500 must be $3500, got {usd}");
+    }
+
+    /// Heuristic fallback estimates the bonus PORTION (5% of debt covered), not
+    /// principal + full seize amount (the old math reported ~2.05x debt as profit).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heuristic_profit_is_bonus_portion_only() {
+        let sim = offline_sim().await;
+        let mut candidate = candidate_with_debt(6, U256::from(100_000_000u64)); // $1.00
+        candidate.debt_to_cover = U256::from(1_000_000_000u64); // 1000 USDC
+        let (native, usd) = sim
+            .estimate_profit_heuristic(&candidate, &U256::ZERO, &PacingConfig::default())
+            .await
+            .unwrap();
+        // 5% of 1000 USDC = 50 USDC = $50.
+        assert_eq!(native, U256::from(50_000_000u64));
+        assert!((usd - 50.0).abs() < 0.001, "expected ≈$50, got {usd}");
     }
 
     #[tokio::test]

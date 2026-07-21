@@ -249,15 +249,32 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         gas_price: U256,
         snapshot_block: u64,
     ) -> Result<BlockEnv, ChimeraError> {
+        // block.timestamp must be a real wall-clock time, never 0: Aave's interest
+        // accrual computes `block.timestamp - lastUpdateTimestamp` (MathUtils), and the
+        // prewarmed reserves carry real on-chain lastUpdateTimestamp values (~1.7e9).
+        // With timestamp 0 that subtraction underflows (Solidity 0.8 revert), so every
+        // liquidationCall against a real snapshot would report success=false.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         Ok(BlockEnv {
             number: U256::from(snapshot_block),
             beneficiary: Address::ZERO,
-            timestamp: U256::from(0),
+            timestamp: U256::from(now_secs),
             gas_limit: 30_000_000,
             basefee: checked_u256_to_u64(gas_price)?,
             difficulty: U256::ZERO,
             prevrandao: Some(B256::ZERO),
-            blob_excess_gas_and_price: None,
+            // Cancun header validation requires excess_blob_gas to be present even
+            // though L2 liquidation txs never carry blobs; `None` fails every
+            // simulation with "header validation error: excess_blob_gas not set".
+            blob_excess_gas_and_price: Some(
+                revm::context_interface::block::BlobExcessGasAndPrice {
+                    excess_blob_gas: 0,
+                    blob_gasprice: 1,
+                },
+            ),
             slot_num: 0,
         })
     }
@@ -575,6 +592,81 @@ mod tests {
             parse_liquidation_bonus(configuration),
             DEFAULT_LIQUIDATION_BONUS_BPS
         );
+    }
+
+    /// B1 regression: BlockEnv.timestamp must be real wall-clock time, not 0.
+    ///
+    /// Aave's interest accrual computes `block.timestamp - lastUpdateTimestamp`; the
+    /// prewarmed reserves carry real on-chain timestamps (~1.7e9), so a zero block
+    /// timestamp underflows and reverts every liquidationCall. This test installs a
+    /// contract at the pool address that reverts iff `block.timestamp < ~1.69e9` —
+    /// exactly the failure the old `timestamp: U256::from(0)` env produced — and
+    /// asserts a simulation now completes successfully.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulation_block_timestamp_is_wall_clock_not_zero() {
+        use revm::state::{AccountInfo, Bytecode};
+
+        let eth_asset = Address::with_last_byte(0xEE);
+        let oracle: Arc<dyn crate::oracle::PriceOracle> = Arc::new(MockOracle {
+            prices: [(eth_asset, dec!(3500))].into_iter().collect(),
+            staleness: Duration::from_secs(300),
+        });
+        // Unreachable provider: everything the sim touches must come from the cache.
+        let provider = Arc::new(
+            alloy::providers::ProviderBuilder::new()
+                .connect_http("http://127.0.0.1:1".parse().unwrap()),
+        );
+        let pool = Address::with_last_byte(0xAA);
+        let mut sim = LiquidationSimulator::new(provider, pool, oracle, eth_asset)
+            .await
+            .expect("construction is lazy; no RPC");
+
+        // Runtime bytecode: PUSH4 0x65000000 (~1.694e9); TIMESTAMP; LT;
+        // PUSH1 0x0d; JUMPI; STOP; <pad>; JUMPDEST; PUSH1 0; PUSH1 0; REVERT.
+        // Reverts iff block.timestamp < 0x65000000.
+        let code_bytes: &[u8] = &[
+            0x63, 0x65, 0x00, 0x00, 0x00, 0x42, 0x10, 0x60, 0x0d, 0x57, 0x00, 0x00, 0x00, 0x5b,
+            0x60, 0x00, 0x60, 0x00, 0xfd,
+        ];
+        let bytecode = Bytecode::new_raw(alloy::primitives::Bytes::copy_from_slice(code_bytes));
+        let guard_info = AccountInfo {
+            code_hash: bytecode.hash_slow(),
+            code: Some(bytecode),
+            ..Default::default()
+        };
+        sim.db.insert_account_info(pool, guard_info);
+        // Caller + beneficiary (both Address::ZERO) must be cached so REVM never
+        // touches the (unreachable) provider.
+        sim.db.insert_account_info(Address::ZERO, AccountInfo::default());
+
+        let candidate = LiquidationCandidate {
+            user: Address::with_last_byte(0x01),
+            collateral_asset: Address::with_last_byte(0x02),
+            debt_asset: Address::with_last_byte(0x03),
+            debt_to_cover: U256::from(1_000_000_000_000_000_000u128),
+            receive_a_token: false,
+            current_hf: U256::from(1),
+            chain_id: 8453,
+            bad_debt: false,
+        };
+        let result = sim
+            .simulate_liquidation(
+                &candidate,
+                U256::ZERO, // zero gas price: no caller balance needed
+                U256::ZERO,
+                123,
+                &PacingConfig::default(),
+            )
+            .await
+            .expect("simulation must not error");
+
+        assert!(
+            result.revert_reason.is_none(),
+            "timestamp-guard contract reverted: BlockEnv.timestamp is not wall-clock \
+             (got revert {:?})",
+            result.revert_reason
+        );
+        assert!(result.profitable, "heuristic profit path should mark this profitable");
     }
 
     #[tokio::test]

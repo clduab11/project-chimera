@@ -286,7 +286,7 @@ impl MarketSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReserveData {
     pub a_token: Address,
     pub variable_debt_token: Address,

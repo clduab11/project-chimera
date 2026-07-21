@@ -28,6 +28,12 @@ pub struct Metrics {
     pub sweep_total: IntCounterVec,
     pub sweep_skipped_breaker: IntCounterVec,
     pub sweep_amount_wei: Gauge,
+    pub price_refresh_age_seconds: GaugeVec,
+    pub price_refresh_total: IntCounterVec,
+    pub snapshot_age_seconds: GaugeVec,
+    pub snapshot_block_number: GaugeVec,
+    pub snapshot_reload_total: IntCounterVec,
+    pub scans_skipped_stale_price: IntCounterVec,
 }
 
 impl Metrics {
@@ -112,6 +118,55 @@ impl Metrics {
         let sweep_amount_wei =
             Gauge::new("chimera_sweep_amount_wei", "Last sweep amount in wei").unwrap();
 
+        let price_refresh_age_seconds = GaugeVec::new(
+            Opts::new(
+                "chimera_price_refresh_age_seconds",
+                "Seconds since the last successful live reserve-price refresh",
+            ),
+            &["chain"],
+        )
+        .unwrap();
+        let price_refresh_total = IntCounterVec::new(
+            Opts::new(
+                "chimera_price_refresh_total",
+                "Live reserve-price refresh attempts by result",
+            ),
+            &["chain", "result"],
+        )
+        .unwrap();
+        let snapshot_age_seconds = GaugeVec::new(
+            Opts::new(
+                "chimera_snapshot_age_seconds",
+                "Seconds since the loaded market snapshot was generated",
+            ),
+            &["chain"],
+        )
+        .unwrap();
+        let snapshot_block_number = GaugeVec::new(
+            Opts::new(
+                "chimera_snapshot_block_number",
+                "Block number of the currently loaded market snapshot",
+            ),
+            &["chain"],
+        )
+        .unwrap();
+        let snapshot_reload_total = IntCounterVec::new(
+            Opts::new(
+                "chimera_snapshot_reload_total",
+                "Discovery snapshot reload outcomes (applied/rejected/read_error)",
+            ),
+            &["chain", "result"],
+        )
+        .unwrap();
+        let scans_skipped_stale_price = IntCounterVec::new(
+            Opts::new(
+                "chimera_scans_skipped_stale_price_total",
+                "Scans that skipped candidate emission due to stale live prices",
+            ),
+            &["chain"],
+        )
+        .unwrap();
+
         // Register all metrics
         r.register(Box::new(candidates_seen.clone())).ok();
         r.register(Box::new(sims_run.clone())).ok();
@@ -126,6 +181,12 @@ impl Metrics {
         r.register(Box::new(sweep_total.clone())).ok();
         r.register(Box::new(sweep_skipped_breaker.clone())).ok();
         r.register(Box::new(sweep_amount_wei.clone())).ok();
+        r.register(Box::new(price_refresh_age_seconds.clone())).ok();
+        r.register(Box::new(price_refresh_total.clone())).ok();
+        r.register(Box::new(snapshot_age_seconds.clone())).ok();
+        r.register(Box::new(snapshot_block_number.clone())).ok();
+        r.register(Box::new(snapshot_reload_total.clone())).ok();
+        r.register(Box::new(scans_skipped_stale_price.clone())).ok();
 
         Self {
             candidates_seen,
@@ -141,7 +202,49 @@ impl Metrics {
             sweep_total,
             sweep_skipped_breaker,
             sweep_amount_wei,
+            price_refresh_age_seconds,
+            price_refresh_total,
+            snapshot_age_seconds,
+            snapshot_block_number,
+            snapshot_reload_total,
+            scans_skipped_stale_price,
         }
+    }
+
+    pub fn set_price_refresh_age(&self, chain: &str, secs: u64) {
+        self.price_refresh_age_seconds
+            .with_label_values(&[chain])
+            .set(secs as f64);
+    }
+
+    pub fn observe_price_refresh(&self, chain: &str, result: &str) {
+        self.price_refresh_total
+            .with_label_values(&[chain, result])
+            .inc();
+    }
+
+    pub fn set_snapshot_age(&self, chain: &str, secs: u64) {
+        self.snapshot_age_seconds
+            .with_label_values(&[chain])
+            .set(secs as f64);
+    }
+
+    pub fn set_snapshot_block(&self, chain: &str, block: u64) {
+        self.snapshot_block_number
+            .with_label_values(&[chain])
+            .set(block as f64);
+    }
+
+    pub fn observe_snapshot_reload(&self, chain: &str, result: &str) {
+        self.snapshot_reload_total
+            .with_label_values(&[chain, result])
+            .inc();
+    }
+
+    pub fn observe_scan_skipped_stale(&self, chain: &str) {
+        self.scans_skipped_stale_price
+            .with_label_values(&[chain])
+            .inc();
     }
 
     pub fn observe_candidate(&self, chain: &str) {

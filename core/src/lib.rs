@@ -13,6 +13,7 @@ pub mod pacing_engine;
 pub mod routing;
 pub mod signer_registry;
 pub mod simulator;
+pub mod snapshot_refresh;
 pub mod state;
 pub mod strategy;
 pub mod sweep_scheduler;
@@ -37,6 +38,7 @@ pub use pacing_engine::{
 pub use routing::{ResolvedV2Route, RoutingResolver};
 pub use signer_registry::{ManagedSigner, SignerRegistry};
 pub use simulator::{L2ChainType, LiquidationCandidate, LiquidationSimulator, SimulationResult};
+pub use snapshot_refresh::{RefreshOutcome, ReservePriceSource, SharedSnapshot, SnapshotRefresher};
 pub use state::{JsonlPersistence, ReservationRecord, ReservationStatus, StatePersistence};
 pub use strategy::assembler::StrategyAssembler;
 pub use sweep_scheduler::SweepScheduler;

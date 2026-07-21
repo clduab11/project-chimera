@@ -1472,6 +1472,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "async-trait",
+ "chimera-core",
  "chrono",
  "dashmap",
  "futures",

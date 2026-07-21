@@ -447,7 +447,7 @@ mod tests {
 
         // venue-a is rotation-blocked: resolution must fall through to venue-b
         // instead of returning venue-a (which pacing would deny → candidate drop).
-        let recent = vec!["venue-a".to_string()];
+        let recent = ["venue-a".to_string()];
         let route = resolver
             .resolve_v2_eligible(collateral, debt, "base", debt_to_cover, |venue| {
                 !recent.iter().any(|r| r == venue)

@@ -721,6 +721,13 @@ def _scan_borrowers(
     former's block range, so a single wide query 400s. Each chunk is retried and
     a failed chunk is skipped (logged) rather than aborting the whole scan.
     """
+    # Guard the chunk step: a non-positive log_chunk would never advance `start`
+    # (min(start + log_chunk - 1, latest) <= start - 1 < start), so the loop
+    # would spin forever. Clamp to a single-block step.
+    if log_chunk < 1:
+        logger.warning("log_chunk %d < 1; clamping to 1 to keep the scan progressing", log_chunk)
+        log_chunk = 1
+
     from_block = max(latest - scan_blocks + 1, 0)
     borrowers: set[str] = set()
     chunks = 0
@@ -736,8 +743,12 @@ def _scan_borrowers(
             for entry in entries:
                 # The debt-bearer is onBehalfOf (the account whose debt increased),
                 # not user (the caller). Collect it as the candidate borrower.
+                # Skip a malformed log with neither field so `None` never enters
+                # the set (it would break the later sorted(borrowers)).
                 args = entry["args"]
-                borrowers.add(args.get("onBehalfOf") or args.get("user"))
+                borrower = args.get("onBehalfOf") or args.get("user")
+                if borrower:
+                    borrowers.add(borrower)
         except Exception as exc:  # noqa: BLE001 - skip the chunk, keep scanning
             failed += 1
             logger.warning("Borrow log chunk %d-%d failed after retries: %s", start, end, exc)

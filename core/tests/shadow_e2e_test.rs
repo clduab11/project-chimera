@@ -135,7 +135,7 @@ fn test_pacing_config(eoa_pool_path: &str) -> PacingConfig {
         log_level: "info".into(),
         metrics_port: 9101,
         chain_id: 8453,
-        oracle_staleness_seconds: 300,
+        oracle_staleness_seconds: 1500,
         eth_price_usd_fallback: Decimal::from(1800),
         eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70".into(),
         recent_outcomes_capacity: 128,

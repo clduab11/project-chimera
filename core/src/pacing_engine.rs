@@ -16,8 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::Path;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Opportunity {
@@ -317,6 +318,10 @@ pub struct PacingEngine {
     state_path: Option<std::path::PathBuf>,
     state_persistence: Option<Arc<dyn StatePersistence + Send + Sync>>,
     eth_price_oracle: Option<Arc<dyn PriceOracle + Send + Sync>>,
+    /// Epoch-seconds of the last oracle-refresh failure warn (0 = never).
+    /// Refreshes run once per scan cycle (~2s on Base), so a persistent
+    /// feed/RPC failure would flood the log without this rate limit.
+    last_oracle_warn_epoch: Arc<AtomicU64>,
 }
 impl Clone for PacingEngine {
     fn clone(&self) -> Self {
@@ -325,6 +330,7 @@ impl Clone for PacingEngine {
             state_path: self.state_path.clone(),
             state_persistence: self.state_persistence.clone(),
             eth_price_oracle: self.eth_price_oracle.clone(),
+            last_oracle_warn_epoch: self.last_oracle_warn_epoch.clone(),
         }
     }
 }
@@ -384,6 +390,7 @@ impl PacingEngine {
             state_path,
             state_persistence: None,
             eth_price_oracle: None,
+            last_oracle_warn_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
     pub fn with_state_persistence(
@@ -418,16 +425,42 @@ impl PacingEngine {
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            target: "chimera::pacing",
-                            error = %e,
-                            "Oracle refresh failed; using cached or fallback ETH/USD"
-                        );
+                        // Rate-limited: refreshes run every scan cycle (~2s on
+                        // Base); a persistent failure repeats identically, so
+                        // one warn per window carries the signal. Relaxed
+                        // ordering is fine — refreshes are sequential (one
+                        // orchestrator loop) and a rare duplicate warn is
+                        // harmless.
+                        let now = Utc::now().timestamp().max(0) as u64;
+                        let last = self.last_oracle_warn_epoch.load(Ordering::Relaxed);
+                        if Self::should_emit_oracle_warn(last, now) {
+                            self.last_oracle_warn_epoch.store(now, Ordering::Relaxed);
+                            warn!(
+                                target: "chimera::pacing",
+                                error = %e,
+                                "Oracle refresh failed; using cached or fallback ETH/USD"
+                            );
+                        } else {
+                            debug!(
+                                target: "chimera::pacing",
+                                error = %e,
+                                "Oracle refresh failed (warn rate-limited); using cached or fallback ETH/USD"
+                            );
+                        }
                     }
                 }
             }
         }
     }
+
+    /// Emit the oracle-refresh failure warn at most once per
+    /// [`Self::ORACLE_WARN_INTERVAL_SECS`]. First failure always warns.
+    fn should_emit_oracle_warn(last_epoch: u64, now_epoch: u64) -> bool {
+        last_epoch == 0 || now_epoch.saturating_sub(last_epoch) >= Self::ORACLE_WARN_INTERVAL_SECS
+    }
+
+    /// Minimum seconds between oracle-refresh failure warns.
+    const ORACLE_WARN_INTERVAL_SECS: u64 = 60;
     /// Load the EOA pool from either a JSON array of address strings or the
     /// structured `config/eoa_pool.json` shape with a `wallets[].address` list.
     pub fn load_eoa_pool(path: &str) -> Result<Vec<String>, ChimeraError> {
@@ -991,7 +1024,7 @@ mod tests {
             log_level: "info".into(),
             metrics_port: 9100,
             chain_id: 8453,
-            oracle_staleness_seconds: 300,
+            oracle_staleness_seconds: 1500,
             eth_price_usd_fallback: Decimal::from(1800),
             eth_usd_feed_address: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70".into(),
             recent_outcomes_capacity: 128,
@@ -1102,6 +1135,27 @@ mod tests {
         let is_eligible = |venue: &str| !recent.iter().any(|r| r == venue);
         assert!(!is_eligible("sushi-base"));
         assert!(is_eligible("venue-b"));
+    }
+
+    #[test]
+    fn test_oracle_warn_rate_limit_window() {
+        // First failure always warns.
+        assert!(PacingEngine::should_emit_oracle_warn(0, 1_700_000_000));
+        // Within the window: suppressed (2s scan cadence must not flood).
+        assert!(!PacingEngine::should_emit_oracle_warn(
+            1_700_000_000,
+            1_700_000_000 + PacingEngine::ORACLE_WARN_INTERVAL_SECS - 1
+        ));
+        // Window elapsed: warns again.
+        assert!(PacingEngine::should_emit_oracle_warn(
+            1_700_000_000,
+            1_700_000_000 + PacingEngine::ORACLE_WARN_INTERVAL_SECS
+        ));
+        // Clock skew backwards must not panic or warm-spam (saturating_sub).
+        assert!(!PacingEngine::should_emit_oracle_warn(
+            1_700_000_000,
+            1_699_999_000
+        ));
     }
 
     #[test]

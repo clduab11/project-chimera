@@ -77,7 +77,9 @@ fn default_chain_id() -> u64 {
     8453
 }
 fn default_oracle_staleness_seconds() -> u64 {
-    300
+    // Must exceed the Base ETH/USD Chainlink heartbeat (1200s; on-chain max
+    // inter-round gap 1232s) or pacing sees a "stale" price between heartbeats.
+    1500
 }
 fn default_eth_price_usd_fallback() -> Decimal {
     Decimal::from(1800)
@@ -134,7 +136,7 @@ impl Default for PacingConfig {
             log_level: "info".into(),
             metrics_port: 9100,
             chain_id: 8453,
-            oracle_staleness_seconds: 300,
+            oracle_staleness_seconds: 1500,
             eth_price_usd_fallback: Decimal::from(1800),
             eth_usd_feed_address: default_eth_usd_feed_address(),
             recent_outcomes_capacity: 128,
@@ -546,7 +548,7 @@ execute_mode: shadow
 log_level: info
 metrics_port: 9100
 chain_id: 8453
-oracle_staleness_seconds: 300
+oracle_staleness_seconds: 1500
 eth_price_usd_fallback: 1800
 eth_usd_feed_address: \"0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70\"
 recent_outcomes_capacity: 128
@@ -577,7 +579,7 @@ ws_endpoint: \"\"
         assert_eq!(cfg.max_single_transfer_usd, Decimal::from(1000));
         assert_eq!(cfg.execute_mode, "shadow");
         assert_eq!(cfg.chain_id, 8453);
-        assert_eq!(cfg.oracle_staleness_seconds, 300);
+        assert_eq!(cfg.oracle_staleness_seconds, 1500);
         assert_eq!(cfg.eth_price_usd_fallback, Decimal::from(1800));
         assert_eq!(
             cfg.eth_usd_feed_address,

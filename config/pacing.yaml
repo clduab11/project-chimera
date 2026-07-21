@@ -25,7 +25,11 @@ execute_mode: shadow             # shadow | live  (NEVER change without 7d valid
 log_level: info
 metrics_port: 9100
 chain_id: 8453                   # Base mainnet by default
-oracle_staleness_seconds: 300
+# Must exceed the ETH/USD feed's on-chain heartbeat or the price reads "stale"
+# between heartbeats. Base ETH/USD (0x71041d...) heartbeat = 1200s / 0.15%
+# deviation (verified on-chain 2026-07-21: max inter-round gap 1232s over the
+# last 12 rounds). 1500 = heartbeat + 300s transmission/clock margin.
+oracle_staleness_seconds: 1500
 # Conservative ETH/USD floor for gas-cost pacing when oracle is unreachable.
 # Updated June 2026 based on ETH trading range. See Chainlink ETH/USD for live price.
 # Sources: https://docs.chain.link/data-feeds/price-feeds/addresses?network=base

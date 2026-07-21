@@ -33,7 +33,8 @@ use chimera_core::{
     start_metrics_server, AaveOracle, BlockWatch, ChainlinkOracle, CrossProcessPacing,
     JsonlPersistence, L2ChainType, LiquidationSimulator, MarketSnapshot, MempoolWatcher, Metrics,
     Orchestrator, OrchestratorConfig, PacingConfig, PacingEngine, PriceOracle, RiskConfig,
-    RoutingConfig, RpcSubmitter, SequencerFeed, SignerRegistry, SweepScheduler, MIN_GAS_BUDGET_WEI,
+    RoutingConfig, RpcSubmitter, SequencerFeed, SignerRegistry, SnapshotRefresher, SweepScheduler,
+    MIN_GAS_BUDGET_WEI,
 };
 
 alloy::sol! {
@@ -304,6 +305,9 @@ where
     // Oracles. Aave is the simulator's primary USD price source; Chainlink is wired
     // with the configured ETH/USD feed so gas-cost pacing can refresh live prices.
     let aave_oracle = AaveOracle::new((*provider).clone(), addrs.oracle, staleness);
+    // Second handle to the same oracle: the live snapshot repricer batches
+    // getAssetsPrices through it (raw 8-dec U256, one eth_call per refresh).
+    let reprice_source = aave_oracle.clone();
     let oracle: Arc<dyn PriceOracle> = Arc::new(aave_oracle);
     let feed_addr: Address = pacing_cfg.eth_usd_feed_address.parse().map_err(|e| {
         anyhow::anyhow!(
@@ -428,6 +432,7 @@ where
         }
     };
 
+    let price_refresh_secs = risk_cfg.price_refresh_secs;
     let orchestrator = Orchestrator::new(
         OrchestratorConfig::default(),
         pacing,
@@ -445,6 +450,19 @@ where
         signer_registry.clone(),
         mempool_watcher,
     );
+
+    // Live detection refresh: paced oracle repricing + discovery reload of the
+    // snapshot file, ticked inline by the scan loop over the SAME shared
+    // snapshot the detector reads. Without this the snapshot stays frozen at
+    // boot and a near-miss position can never be observed crossing HF 1.05.
+    let refresher = Arc::new(SnapshotRefresher::new(
+        orchestrator.shared_snapshot(),
+        Arc::new(reprice_source),
+        snapshot_path.clone(),
+        chain_id,
+        price_refresh_secs,
+    ));
+    let orchestrator = orchestrator.with_snapshot_refresher(refresher);
 
     // Spawn sweep/refund scheduler task (must start before orchestrator.run()).
     if !signer_registry.is_empty() || pacing_cfg.execute_mode == "shadow" {

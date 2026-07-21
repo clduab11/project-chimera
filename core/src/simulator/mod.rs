@@ -175,6 +175,23 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         Ok(())
     }
 
+    /// Discard the fork DB — both prewarmed slots AND lazily cached live state —
+    /// and rebuild it from the given snapshot file.
+    ///
+    /// `CacheDB` never evicts entries, and [`Self::load_snapshot`] only
+    /// overwrites: users removed from a newer snapshot would keep their stale
+    /// cached balances forever, and oracle/aggregator storage cached on first
+    /// touch would freeze simulated prices. Called on every applied discovery
+    /// reload; the cost is lazy refetch-on-miss at the next simulation.
+    pub async fn rebuild_db(&mut self, path: &std::path::Path) -> Result<(), ChimeraError> {
+        let alloy_db = AlloyDB::new((*self.provider).clone(), BlockId::latest());
+        let wrapped_db = WrapDatabaseAsync::new(alloy_db).ok_or_else(|| {
+            ChimeraError::SimulationFailed("tokio runtime is required for AlloyDB".into())
+        })?;
+        self.db = CacheDB::new(wrapped_db);
+        self.load_snapshot(path).await
+    }
+
     /// High-fidelity simulation of an Aave V3 liquidationCall.
     /// Returns precise profit after every cost, using real L2 + L1 fee model.
     pub async fn simulate_liquidation(

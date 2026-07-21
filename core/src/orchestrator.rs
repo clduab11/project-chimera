@@ -1,6 +1,7 @@
 //! Continuous detection → simulation → execution orchestrator loop.
 
 use crate::config::{RiskConfig, RoutingConfig};
+use crate::snapshot_refresh::{SharedSnapshot, SnapshotRefresher};
 use crate::{
     check_eoa_gas_sufficient, ChimeraError, CrossProcessPacing, LiquidationCandidate,
     LiquidationDetector, LiquidationSimulator, MarketSnapshot, MempoolWatcher, Metrics,
@@ -88,7 +89,7 @@ pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
     pacing_cfg: PacingConfig,
     metrics: Arc<Metrics>,
     provider: Arc<P>,
-    snapshot: MarketSnapshot,
+    snapshot: SharedSnapshot,
     chain_id: u64,
     simulator: Mutex<Option<LiquidationSimulator<P>>>,
     submitter: RpcSubmitter<P>,
@@ -98,6 +99,9 @@ pub struct Orchestrator<P: Provider<Ethereum> + Clone + Send + Sync + 'static> {
     risk_config: RiskConfig,
     signer_registry: Arc<SignerRegistry>,
     mempool_watcher: Option<Arc<dyn MempoolWatcher>>,
+    // Live snapshot refresher (reprice + discovery reload), ticked inline at the
+    // top of every non-emergency scan. None = legacy frozen-snapshot behavior.
+    refresher: Option<Arc<SnapshotRefresher>>,
     // Test-only injection hooks — absent from release builds (see the
     // `test-hooks` feature in Cargo.toml). The live pipeline always uses the
     // real provider gas price and the real REVM simulator.
@@ -132,7 +136,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             pacing_cfg,
             metrics,
             provider,
-            snapshot,
+            snapshot: SharedSnapshot::new(snapshot),
             chain_id,
             simulator: Mutex::new(simulator),
             submitter,
@@ -142,11 +146,26 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             risk_config,
             signer_registry,
             mempool_watcher,
+            refresher: None,
             #[cfg(any(test, feature = "test-hooks"))]
             mock_gas_price_wei: None,
             #[cfg(any(test, feature = "test-hooks"))]
             mock_sim_fn: None,
         }
+    }
+
+    /// Handle to the live shared snapshot (used by `main.rs` to construct the
+    /// [`SnapshotRefresher`] over the same state the scan loop reads).
+    pub fn shared_snapshot(&self) -> SharedSnapshot {
+        self.snapshot.clone()
+    }
+
+    /// Attach the live snapshot refresher (builder style, mirrors
+    /// `PacingEngine::with_eth_oracle`). Without one, the snapshot stays frozen
+    /// at its boot contents.
+    pub fn with_snapshot_refresher(mut self, refresher: Arc<SnapshotRefresher>) -> Self {
+        self.refresher = Some(refresher);
+        self
     }
 
     pub async fn run(&self) -> Result<(), ChimeraError> {
@@ -156,7 +175,6 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             execute_mode = %self.execute_mode,
             "Orchestrator starting"
         );
-        let detector = LiquidationDetector::new(self.snapshot.clone(), self.chain_id);
         let chain_label = self.chain_label_str();
 
         // Resolve the emergency flag path once. Operators (scripts/emergency_pause.py)
@@ -177,18 +195,9 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             if let Some(reason) = Self::read_emergency_flag(&emergency_flag_path) {
                 self.handle_emergency(&reason);
             } else {
-                let candidates = detector.find_at_risk_positions();
-                self.metrics
-                    .observe_candidates(chain_label, candidates.len());
-
-                for candidate in candidates
-                    .iter()
-                    .take(self.config.max_opportunities_per_scan)
-                {
-                    if let Err(e) = self.process_candidate(candidate).await {
-                        warn!(target = "chimera::orchestrator", error = %e, "Candidate failed");
-                    }
-                }
+                // Refresh + detect + process. Inside the non-emergency branch so an
+                // operator pause spends zero RPC on repricing or reload checks.
+                self.scan_once().await;
             }
 
             // Update rolling gauges + breaker state every scan (Decimal -> f64 only here).
@@ -357,13 +366,51 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
 
     /// Single-scan entry point for integration testing.
     ///
-    /// Performs detection, metric updates, and candidate iteration exactly once
-    /// without entering the infinite loop. Returns the number of candidates found.
+    /// Delegates to the SAME [`Self::scan_once`] the live loop runs — refresh
+    /// tick, simulator rebuild on reload, staleness gate, detection, candidate
+    /// processing — exactly once, without entering the infinite loop. Returns
+    /// the number of candidates found.
     #[cfg(any(test, feature = "test-hooks"))]
     pub async fn run_single_scan(&self) -> Result<usize, ChimeraError> {
-        let detector = LiquidationDetector::new(self.snapshot.clone(), self.chain_id);
+        Ok(self.scan_once().await)
+    }
+
+    /// One full scan: refresh tick (reprice + discovery reload), simulator
+    /// rebuild when a reload was applied, staleness gate, detector rebuild from
+    /// the CURRENT shared snapshot, and candidate processing.
+    ///
+    /// The snapshot is cloned exactly once per scan; the detector, the HF math,
+    /// and the block number handed to the simulator all come from that clone, so
+    /// a refresh landing mid-scan can never produce a mixed-epoch scan.
+    async fn scan_once(&self) -> usize {
         let chain_label = self.chain_label_str();
 
+        if let Some(refresher) = &self.refresher {
+            let outcome = refresher.tick(&self.metrics, chain_label).await;
+            if outcome.reloaded {
+                self.rebuild_simulator(refresher.snapshot_path()).await;
+            }
+
+            // Staleness halt, live mode only: stale prices produce false
+            // candidates, and a false candidate costs real gas when live. In
+            // shadow the age gauge + reprice-failure warns cover observability.
+            if self.execute_mode == "live"
+                && refresher.price_age_secs() > self.risk_config.price_max_stale_secs
+            {
+                warn!(
+                    target = "chimera::orchestrator",
+                    price_age_secs = refresher.price_age_secs(),
+                    max = self.risk_config.price_max_stale_secs,
+                    "Live prices stale; skipping candidate emission this scan"
+                );
+                self.metrics.observe_scan_skipped_stale(chain_label);
+                return 0;
+            }
+        }
+
+        let snap = self.snapshot.snapshot();
+        let snapshot_block = snap.block_number;
+        let detector = LiquidationDetector::new(snap, self.chain_id);
         let candidates = detector.find_at_risk_positions();
         self.metrics
             .observe_candidates(chain_label, candidates.len());
@@ -372,12 +419,31 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             .iter()
             .take(self.config.max_opportunities_per_scan)
         {
-            if let Err(e) = self.process_candidate(candidate).await {
+            if let Err(e) = self.process_candidate(candidate, snapshot_block).await {
                 warn!(target = "chimera::orchestrator", error = %e, "Candidate failed");
             }
         }
 
-        Ok(candidates.len())
+        candidates.len()
+    }
+
+    /// Rebuild the simulator's fork DB from the just-reloaded snapshot file.
+    ///
+    /// `CacheDB` never evicts: without a rebuild, users removed from the
+    /// snapshot keep their old cached balances and the first-touch-cached
+    /// oracle rounds drift from reality indefinitely. Non-fatal — a failed
+    /// rebuild keeps the previous DB and warns.
+    async fn rebuild_simulator(&self, path: &std::path::Path) {
+        let mut guard = self.simulator.lock().await;
+        if let Some(sim) = guard.as_mut() {
+            if let Err(e) = sim.rebuild_db(path).await {
+                warn!(
+                    target = "chimera::orchestrator",
+                    error = %e,
+                    "Simulator rebuild after snapshot reload failed; keeping previous DB"
+                );
+            }
+        }
     }
 
     /// Number of submit-path invocations (includes dry-run).
@@ -389,6 +455,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
     pub async fn process_candidate(
         &self,
         candidate: &LiquidationCandidate,
+        snapshot_block: u64,
     ) -> Result<(), ChimeraError> {
         // 1. Current gas price — use the test hook if present, otherwise query
         //    the provider. `mock_gas_price()` is a `None`-returning no-op in
@@ -430,7 +497,9 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
                     candidate,
                     gas_price_u256,
                     U256::from(DEFAULT_L1_FEE_SCALAR),
-                    self.snapshot.block_number,
+                    // The scan's captured snapshot epoch — NOT a live read of the
+                    // shared snapshot, which a mid-scan reload could have advanced.
+                    snapshot_block,
                     &self.pacing_cfg,
                 )
                 .await;

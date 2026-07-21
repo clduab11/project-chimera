@@ -988,6 +988,21 @@ pub struct TradingPair {
     pub token_out: String,
 }
 
+/// Known DEX *factory* addresses (lowercased). A factory in a `router_address`
+/// slot is a catastrophic config error: factories expose no swap selector, so
+/// every collateral→debt swap reverts silently. Config load hard-fails on these.
+///
+/// NOTE: the canonical Uniswap V3 factory (0x1f98431c8ad98523631ae4a59f267346ea31f984)
+/// is deliberately NOT listed: the committed `uniswap-v3-arbitrum` venue still
+/// carries it as a known placeholder (inert — the resolver skips "v3") pending
+/// Phase Delta re-verification. Listing it would make the committed
+/// routing.yaml fail to load and brick engine startup. The ops dashboard
+/// surfaces it as a soft config-lint warning instead.
+pub const KNOWN_FACTORY_ROUTERS: &[&str] = &[
+    "0x71524b4f93c58fcbf659783284e38825f0622859", // SushiSwap V2 factory (Base)
+    "0x33128a8fc17869897dce68ed026d694621f6fdfd", // Uniswap V3 factory (Base)
+];
+
 /// Routing and venue configuration. Loaded from `config/routing.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RoutingConfig {
@@ -1028,6 +1043,13 @@ impl RoutingConfig {
     }
 
     fn validate(&self) -> Result<(), ChimeraError> {
+        self.validate_with_factories(KNOWN_FACTORY_ROUTERS)
+    }
+
+    /// Full validation with an explicit factory denylist (lowercased 0x-hex
+    /// addresses). `validate()` calls this with [`KNOWN_FACTORY_ROUTERS`].
+    pub fn validate_with_factories(&self, known_factories: &[&str]) -> Result<(), ChimeraError> {
+        const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
         if self.primary.is_empty() {
             return Err(ChimeraError::ConfigError(
                 "routing.yaml primary RPC must not be empty".into(),
@@ -1038,6 +1060,8 @@ impl RoutingConfig {
                 "routing.yaml submission_style must be 'single_atomic_tx' or 'bundle'".into(),
             ));
         }
+        // (chain, lowercased router, venue name) for same-chain duplicate detection.
+        let mut seen_routers: Vec<(String, String, String)> = Vec::new();
         for venue in &self.venues {
             if venue.kyc {
                 return Err(ChimeraError::ConfigError(format!(
@@ -1056,6 +1080,44 @@ impl RoutingConfig {
                     "routing.yaml venue '{}' has unknown router_compatibility '{}'",
                     venue.name, venue.router_compatibility
                 )));
+            }
+
+            let router_lc = venue.router_address.to_lowercase();
+
+            // A venue that declares a router_compatibility is (now or in a
+            // later phase) selectable by the resolver — it must carry a real
+            // router. Venues with an empty compatibility remain legacy/inert
+            // and may omit the router (existing fixtures rely on this).
+            let selectable = venue.venue_type == "dex" && !venue.router_compatibility.is_empty();
+            if selectable && (router_lc.is_empty() || router_lc == ZERO_ADDRESS) {
+                return Err(ChimeraError::ConfigError(format!(
+                    "routing.yaml venue '{}' (router_compatibility '{}') has an empty/zero \
+                     router_address — selectable venues need a real router",
+                    venue.name, venue.router_compatibility
+                )));
+            }
+
+            if !router_lc.is_empty() {
+                if known_factories.contains(&router_lc.as_str()) {
+                    return Err(ChimeraError::ConfigError(format!(
+                        "routing.yaml venue '{}' router_address {} is a known DEX *factory*, \
+                         not a router — every swap through it would revert",
+                        venue.name, venue.router_address
+                    )));
+                }
+                // Same-chain duplicate routers are a copy-paste error. The same
+                // address on DIFFERENT chains is legitimate (deterministic
+                // cross-chain deployments), so the check is scoped per chain.
+                if let Some((_, _, other)) = seen_routers
+                    .iter()
+                    .find(|(chain, router, _)| *chain == venue.chain && *router == router_lc)
+                {
+                    return Err(ChimeraError::ConfigError(format!(
+                        "routing.yaml venues '{}' and '{}' share router_address {} on chain '{}'",
+                        other, venue.name, venue.router_address, venue.chain
+                    )));
+                }
+                seen_routers.push((venue.chain.clone(), router_lc, venue.name.clone()));
             }
         }
         Ok(())
@@ -1222,6 +1284,119 @@ forensic_tag_sources:
             valid_routing_yaml().replace("liquidity_usd_min: 50000", "liquidity_usd_min: 10000");
         writeln!(tmp, "{}", yaml).unwrap();
         assert!(RoutingConfig::load(tmp.path()).is_err());
+    }
+
+    /// Minimal selectable-venue YAML for router-guard tests.
+    fn selectable_venue_yaml(name: &str, chain: &str, compat: &str, router: &str) -> String {
+        format!(
+            r#"  - name: {name}
+    chain: {chain}
+    liquidity_usd_min: 50000
+    type: dex
+    kyc: false
+    router_compatibility: "{compat}"
+    router_address: "{router}"
+"#
+        )
+    }
+
+    fn routing_yaml_with_venues(venues: &str) -> String {
+        format!(
+            "primary: alchemy-base-private\nsubmission_style: single_atomic_tx\nvenues:\n{venues}"
+        )
+    }
+
+    #[test]
+    fn test_routing_rejects_zero_router_on_selectable_venue() {
+        // Rule (a): a venue the resolver can select must not have a zero router.
+        let yaml = routing_yaml_with_venues(&selectable_venue_yaml(
+            "bad-dex",
+            "base",
+            "v2",
+            "0x0000000000000000000000000000000000000000",
+        ));
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+
+        // ...nor an empty router.
+        let yaml = routing_yaml_with_venues(&selectable_venue_yaml("bad-dex", "base", "v2", ""));
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_routing_rejects_factory_as_router() {
+        // Rule (b): a known DEX factory in a router slot must fail config load
+        // (factories have no swap selector — every swap would revert).
+        // Checksummed casing on purpose: the check must be case-insensitive.
+        let yaml = routing_yaml_with_venues(&selectable_venue_yaml(
+            "sushi-base",
+            "base",
+            "v2",
+            "0x71524B4f93c58fcbF659783284E38825f0622859", // Sushi V2 FACTORY
+        ));
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn test_routing_rejects_duplicate_router_same_chain() {
+        // Rule (c): two venues on the SAME chain sharing a router is a
+        // copy-paste error...
+        let venues = format!(
+            "{}{}",
+            selectable_venue_yaml(
+                "dex-one",
+                "base",
+                "v2",
+                "0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891"
+            ),
+            selectable_venue_yaml(
+                "dex-two",
+                "base",
+                "v2",
+                "0x6bded42c6da8fbf0d2ba55b2fa120c5e0c8d7891" // same router, different case
+            ),
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", routing_yaml_with_venues(&venues)).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_err());
+
+        // ...but the same address on DIFFERENT chains is legitimate
+        // (deterministic cross-chain deployments) and must load.
+        let venues = format!(
+            "{}{}",
+            selectable_venue_yaml(
+                "dex-base",
+                "base",
+                "v2",
+                "0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891"
+            ),
+            selectable_venue_yaml(
+                "dex-arb",
+                "arbitrum",
+                "v2",
+                "0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891"
+            ),
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", routing_yaml_with_venues(&venues)).unwrap();
+        assert!(RoutingConfig::load(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_risk_config_rejects_underflow_slippage() {
+        // Rule (d): slippage_max_bps > 10000 would underflow the amountOutMin
+        // discount at resolver::compute_amount_out_min. The existing 200 bps
+        // ceiling (validate()) already rejects it — this test locks that the
+        // underflow region stays unreachable even if the ceiling is ever raised.
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_risk_yaml().replace("slippage_max_bps: 50", "slippage_max_bps: 10001");
+        writeln!(tmp, "{}", yaml).unwrap();
+        assert!(RiskConfig::load(tmp.path()).is_err());
     }
 
     #[test]

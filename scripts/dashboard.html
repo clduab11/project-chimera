@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CHIMERA // OPS</title>
+<style>
+  :root {
+    --bg: #0a0e13; --panel: #10161d; --panel2: #0d1218; --border: #1d2833;
+    --text: #c9d6e0; --dim: #647688; --green: #2fd27d; --red: #ff5c5c;
+    --amber: #ffb347; --cyan: #57c7ff; --purple: #b98cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+    font-size: 13px; line-height: 1.45; min-height: 100vh;
+  }
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  header {
+    display: flex; align-items: stretch; gap: 14px; flex-wrap: wrap;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    background: var(--panel2); position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; flex-direction: column; justify-content: center; }
+  .brand h1 { font-size: 16px; letter-spacing: 2px; color: var(--cyan); }
+  .brand .sub { color: var(--dim); font-size: 11px; letter-spacing: 1px; }
+
+  .ticker {
+    flex: 1; min-width: 340px; display: flex; align-items: center; gap: 18px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 16px;
+  }
+  .tick-price { font-size: 26px; font-weight: 700; transition: color .25s; }
+  .tick-price.up { color: var(--green); }
+  .tick-price.down { color: var(--red); }
+  .tick-price.stale { color: var(--dim); }
+  .tick-meta { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--dim); }
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 700;
+  }
+  .pill.up { background: rgba(47,210,125,.15); color: var(--green); }
+  .pill.down { background: rgba(255,92,92,.15); color: var(--red); }
+  .pill.flat { background: rgba(100,118,136,.15); color: var(--dim); }
+  .hdr-right { display: flex; flex-direction: column; align-items: flex-end; justify-content: center; gap: 4px; }
+  .badge { padding: 2px 10px; border-radius: 4px; font-weight: 700; letter-spacing: 1px; font-size: 12px; }
+  .badge.live { background: rgba(255,92,92,.18); color: var(--red); border: 1px solid var(--red); }
+  .badge.shadow { background: rgba(255,179,71,.15); color: var(--amber); border: 1px solid var(--amber); }
+  .badge.unknown { background: rgba(100,118,136,.15); color: var(--dim); border: 1px solid var(--dim); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+  .dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.degraded { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+  .dot.bad { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+  #breaker-banner {
+    display: none; padding: 10px 16px; text-align: center; font-weight: 800;
+    letter-spacing: 2px; color: #fff; background: var(--red);
+    animation: flash 1s step-start infinite;
+  }
+  #breaker-banner.on { display: block; }
+  @keyframes flash { 50% { background: #7a1f1f; } }
+  #engine-down {
+    display: none; padding: 8px 16px; text-align: center; font-weight: 700;
+    letter-spacing: 1px; color: #ffd7d7; background: #4a1414; border-bottom: 1px solid var(--red);
+  }
+  #engine-down.on { display: block; }
+
+  main { padding: 14px 16px; display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 14px; min-width: 0;
+  }
+  .panel h2 {
+    font-size: 11px; letter-spacing: 2px; color: var(--dim);
+    border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 10px;
+  }
+  .wide { grid-column: 1 / -1; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; }
+  .kv .k { color: var(--dim); white-space: nowrap; }
+  .kv .v { text-align: right; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .v.pos { color: var(--green); } .v.neg { color: var(--red); }
+  .v.warn { color: var(--amber); } .v.dim { color: var(--dim); }
+  .v.breaker-ok { color: var(--green); } .v.breaker-trip { color: var(--red); font-weight: 800; }
+  .est { font-size: 10px; color: var(--dim); }
+
+  #events { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .ev {
+    border-left: 3px solid var(--dim); background: var(--panel2);
+    padding: 5px 9px; border-radius: 3px; font-size: 12px;
+    display: flex; gap: 10px; align-items: baseline;
+  }
+  .ev .ts { color: var(--dim); flex-shrink: 0; }
+  .ev .tag { flex-shrink: 0; font-weight: 700; font-size: 10px; letter-spacing: 1px; }
+  .ev .msg { color: var(--text); word-break: break-all; }
+  .ev.success { border-left-color: var(--green); } .ev.success .tag { color: var(--green); }
+  .ev.failure { border-left-color: var(--red); }   .ev.failure .tag { color: var(--red); }
+  .ev.breaker { border-left-color: var(--red); background: #2a1010; } .ev.breaker .tag { color: var(--red); }
+  .ev.oracle  { border-left-color: var(--amber); } .ev.oracle .tag { color: var(--amber); }
+  .ev.pacing  { border-left-color: var(--purple); } .ev.pacing .tag { color: var(--purple); }
+  .ev.tx      { border-left-color: var(--cyan); }  .ev.tx .tag { color: var(--cyan); }
+  .ev.treasury{ border-left-color: var(--cyan); }  .ev.treasury .tag { color: var(--cyan); }
+  .empty { color: var(--dim); font-style: italic; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .stat {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 5px;
+    padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 0;
+  }
+  .stat .lbl { font-size: 10px; letter-spacing: 1px; color: var(--dim); }
+  .stat .val { font-size: 20px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
+  .stat .val small { font-size: 11px; color: var(--dim); font-weight: 400; }
+  .stat .val.pos { color: var(--green); } .stat .val.warn { color: var(--amber); }
+  .stat .val.neg { color: var(--red); }
+  @keyframes bump { 0% { color: var(--green); text-shadow: 0 0 10px rgba(47,210,125,.7); } 100% { color: var(--text); } }
+  .stat .val.bump { animation: bump .8s ease-out; }
+
+  .tailbar { display: flex; gap: 10px; margin-bottom: 8px; align-items: center; }
+  .tailbar input {
+    flex: 1; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 9px; border-radius: 4px; font-family: inherit; font-size: 12px;
+  }
+  .tailbar input:focus { outline: 1px solid var(--cyan); }
+  .tailbar button {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+  }
+  .tailbar button.on { border-color: var(--amber); color: var(--amber); }
+  #tail {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 10px; height: 340px; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-all; font-size: 11.5px; line-height: 1.5;
+  }
+  #tail .t-dim { color: var(--dim); }
+  #tail .t-warn { color: var(--amber); }
+  #tail .t-err { color: var(--red); }
+
+  table.swap { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+  table.swap th, table.swap td { text-align: left; padding: 3px 8px; border-bottom: 1px solid var(--border); }
+  table.swap th { color: var(--dim); font-weight: 400; letter-spacing: 1px; font-size: 10.5px; }
+  .lint-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 4px; }
+  .pill.crit { background: rgba(255,92,92,.15); color: var(--red); }
+  .pill.warn { background: rgba(255,179,71,.15); color: var(--amber); }
+
+  footer { padding: 8px 16px 16px; color: var(--dim); font-size: 11px; display: flex; justify-content: space-between; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>CHIMERA // OPS</h1>
+    <div class="sub">AAVE V3 LIQUIDATION ENGINE · BASE (8453)</div>
+  </div>
+  <div class="ticker" id="ticker">
+    <div>
+      <div class="tick-price stale" id="tick-price">—</div>
+      <div class="tick-meta"><span id="tick-src">ETH/USD · waiting…</span></div>
+    </div>
+    <div class="tick-meta">
+      <span id="tick-chg"><span class="pill flat">24h —</span></span>
+      <span id="tick-hilo"></span>
+      <span id="tick-oracle"></span>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <span class="badge unknown" id="mode-badge">MODE ?</span>
+    <span><span class="dot bad" id="engine-dot"></span><span id="engine-lbl" style="font-size:11px;color:var(--dim)">engine</span></span>
+    <span id="clock" style="font-size:11px;color:var(--dim)"></span>
+  </div>
+</header>
+
+<div id="breaker-banner">⛔ CIRCUIT BREAKER TRIPPED — ENGINE SELF-HALTED ⛔</div>
+<div id="engine-down">ENGINE UNREACHABLE on metrics port — showing log/snapshot data only</div>
+
+<main>
+  <section class="panel">
+    <h2>STATUS</h2>
+    <div class="kv" id="status-kv"></div>
+  </section>
+
+  <section class="panel">
+    <h2>FINANCIALS</h2>
+    <div class="kv" id="fin-kv"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>ACTIVITY — SCAN CYCLES (1 NEW BASE BLOCK = 1 SCAN)</h2>
+    <div class="stats" id="activity-stats"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>SWAP / ROUTING</h2>
+    <div id="swap"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>EVENTS</h2>
+    <div id="events"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>LIVE LOG TAIL</h2>
+    <div class="tailbar">
+      <input id="filter" type="text" placeholder="filter (substring)…">
+      <button id="pause">⏸ pause</button>
+    </div>
+    <div id="tail"></div>
+  </section>
+</main>
+
+<footer>
+  <span id="updated">never updated</span>
+  <span>proxy: engine 127.0.0.1:<span id="engport">?</span> · refresh 5s · read-only</span>
+</footer>
+
+<script>
+let paused = false, prevPrice = null, lastState = null, prevBlock = null;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtUsd = (v, dp=2) => v == null ? '—' :
+  (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US',{minimumFractionDigits:dp,maximumFractionDigits:dp});
+const fmtEth = (v, dp=6) => v == null ? '—' : Number(v).toFixed(dp) + ' ETH';
+const fmtNum = v => v == null ? '—' : Number(v).toLocaleString('en-US');
+const fmtAge = s => {
+  if (s == null) return '—';
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  if (h < 24) return h + 'h ' + m + 'm';
+  return Math.floor(h/24) + 'd ' + (h%24) + 'h';
+};
+const usdClass = v => v == null ? 'dim' : (v > 0 ? 'pos' : (v < 0 ? 'neg' : ''));
+const kv = (k, v, cls='') => `<div class="k">${k}</div><div class="v ${cls}">${v}</div>`;
+
+function renderTicker(t) {
+  const el = $('tick-price'), src = $('tick-src');
+  const live = t && t.live;
+  if (live && live.price != null) {
+    const p = live.price;
+    el.textContent = fmtUsd(p);
+    el.classList.remove('stale','up','down');
+    if (prevPrice != null && p !== prevPrice) {
+      el.classList.add(p > prevPrice ? 'up' : 'down');
+      setTimeout(() => el.classList.remove('up','down'), 900);
+    }
+    prevPrice = p;
+    const age = live.fetched_at ? Math.max(0, Math.round(Date.now()/1000 - live.fetched_at)) : null;
+    src.textContent = `ETH/USD · ${live.src} · ${age != null ? age + 's ago' : ''}`;
+    if (live.chg24_pct != null) {
+      const up = live.chg24_pct >= 0;
+      $('tick-chg').innerHTML =
+        `<span class="pill ${up?'up':'down'}">24h ${up?'▲':'▼'} ${Math.abs(live.chg24_pct).toFixed(2)}%</span>`;
+    } else $('tick-chg').innerHTML = '<span class="pill flat">24h n/a</span>';
+    $('tick-hilo').textContent = (live.high24 && live.low24)
+      ? `H ${fmtUsd(live.high24,0)} · L ${fmtUsd(live.low24,0)}` : '';
+  } else {
+    el.textContent = '—'; el.className = 'tick-price stale';
+    src.textContent = 'ETH/USD · ticker unavailable';
+    $('tick-chg').innerHTML = '<span class="pill flat">24h —</span>';
+    $('tick-hilo').textContent = '';
+  }
+  if (t && t.oracle_usd) {
+    const div = t.divergence_pct;
+    const divTxt = div == null ? '' :
+      ` · div ${div >= 0 ? '+' : ''}${div.toFixed(2)}%`;
+    const warn = div != null && Math.abs(div) > 1 ? ' ⚠' : '';
+    $('tick-oracle').textContent = `oracle (chainlink, engine) ${fmtUsd(t.oracle_usd)}${divTxt}${warn}`;
+  } else {
+    $('tick-oracle').textContent = 'oracle price: n/a';
+  }
+}
+
+function renderStatus(s) {
+  const m = s.engine.metrics || {};
+  const engRow = s.engine.status === 'up'
+    ? kv('engine', 'REACHABLE', 'pos')
+    : (s.engine.status === 'degraded'
+       ? kv('engine', 'DEGRADED — cached metrics <span class="est">' +
+            esc(s.engine.consecutive_fails) + ' poll fail(s), last ok ' +
+            fmtAge(s.engine.last_ok_age_s) + ' ago</span>', 'warn')
+       : kv('engine', esc(s.engine.error || 'DOWN'), 'neg'));
+  const rows = [
+    engRow,
+    kv('execute_mode', esc(s.mode.execute_mode), s.mode.execute_mode === 'live' ? 'neg' : 'warn'),
+    kv('chain_id', fmtNum(s.mode.chain_id)),
+    kv('breaker_state', m.chimera_breaker_state == null ? '—' :
+       (m.chimera_breaker_state >= 1 ? 'TRIPPED' : 'armed'),
+       m.chimera_breaker_state >= 1 ? 'breaker-trip' : 'breaker-ok'),
+    kv('uptime', fmtAge(s.mode.uptime_s) + (s.mode.started_at ? ' <span class="est">since ' + esc(s.mode.started_at.slice(11,19)) + 'Z</span>' : '')),
+    kv('candidates seen', fmtNum(m.chimera_candidates_seen_total)),
+    kv('base block', fmtNum(s.block.latest) + ' <span class="est">' + fmtAge(s.block.age_s) + ' ago</span>'),
+    kv('snapshot block', s.snapshot ? fmtNum(s.snapshot.block_number) +
+       ' <span class="est">' + fmtAge(s.snapshot.timestamp ? s.now - s.snapshot.timestamp : null) + ' ago · ' +
+       esc(s.snapshot.reserves) + ' reserves</span>' : '—',
+       s.snapshot && s.snapshot.timestamp && (s.now - s.snapshot.timestamp) > 3600 ? 'warn' : ''),
+  ];
+  $('status-kv').innerHTML = rows.join('');
+}
+
+function renderFin(s) {
+  const f = s.financials;
+  const rows = [
+    kv('daily net', fmtUsd(f.daily_net_usd), usdClass(f.daily_net_usd)),
+    kv('weekly net', fmtUsd(f.weekly_net_usd), usdClass(f.weekly_net_usd)),
+    kv('swept to treasury', fmtEth(f.sweep_eth)),
+    kv('L1 data fee accrual', fmtEth(f.l1_fee_eth)),
+    kv('gas top-ups (recent)', fmtEth(f.topups_eth_recent) +
+       ` <span class="est">×${esc(f.topups_count_recent)}</span>`),
+    kv('gained vs spent <span class="est">est</span>',
+       `${fmtUsd(f.gained_usd)} / ${f.spent_usd_est == null ? '—' : fmtUsd(f.spent_usd_est)}` +
+       `<br><span class="est">net ≈ ${fmtUsd(f.net_est_usd)} · spent = l1 fee + top-ups @ live px</span>`,
+       usdClass(f.net_est_usd)),
+    kv('high-water daily', fmtUsd(f.high_water.max_daily_net_usd), 'dim'),
+    kv('high-water weekly', fmtUsd(f.high_water.max_weekly_net_usd), 'dim'),
+  ];
+  $('fin-kv').innerHTML = rows.join('');
+}
+
+function renderActivity(s) {
+  const a = s.activity || {};
+  const stat = (lbl, val, cls='', id='') =>
+    `<div class="stat"><div class="lbl">${lbl}</div><div class="val ${cls}" ${id ? `id="${id}"` : ''}>${val}</div></div>`;
+  const blk = a.blocks_processed;
+  const blkTxt = blk != null ? fmtNum(blk)
+    : '+' + fmtNum(a.scan_cycles_tail) + ' <small>since dashboard attach</small>';
+  const pos = a.positions_tracked;
+  const posCls = pos === 0 ? 'warn' : '';
+  const posTxt = pos == null ? '—' : fmtNum(pos) + (pos === 0 ? ' <small>⚠ 0 = no liquidations possible</small>' : '');
+  const sims = (a.sims_success || 0) + (a.sims_failure || 0);
+  const html =
+    stat('LATEST BASE BLOCK', fmtNum(s.block.latest), '', 'stat-block') +
+    stat('BLOCKS SCANNED <span style="text-transform:none">(this run)</span>', blkTxt, 'pos') +
+    stat('SCAN RATE', a.blocks_per_min != null ? a.blocks_per_min.toFixed(1) + ' <small>blk/min</small>' : '—') +
+    stat('POSITIONS TRACKED', posTxt, posCls) +
+    stat('RESERVES TRACKED', a.reserves_tracked != null ? fmtNum(a.reserves_tracked) : '—') +
+    stat('CANDIDATES', fmtNum(a.candidates_seen), a.candidates_seen > 0 ? 'pos' : '') +
+    stat('SIMULATIONS', fmtNum(sims) + (sims ? ` <small>✓${fmtNum(a.sims_success)} ✗${fmtNum(a.sims_failure)}</small>` : ''));
+  const el = $('activity-stats');
+  el.innerHTML = html;
+  if (s.block.latest != null && prevBlock != null && s.block.latest !== prevBlock) {
+    const b = $('stat-block');
+    if (b) { b.classList.remove('bump'); void b.offsetWidth; b.classList.add('bump'); }
+  }
+  prevBlock = s.block.latest;
+}
+
+const EV_LABEL = {success:'LIQD ✓', failure:'FAIL', breaker:'BREAKER', oracle:'ORACLE',
+                  pacing:'PACED', tx:'TX', treasury:'TREAS'};
+function renderEvents(s) {
+  const evs = (s.events || []).slice().reverse();
+  if (!evs.length) { $('events').innerHTML = '<div class="empty">no events yet</div>'; return; }
+  $('events').innerHTML = evs.map(e => {
+    const tx = e.tx ? ` · <a href="https://basescan.org/tx/${esc(e.tx)}" target="_blank" rel="noopener">${esc(e.tx.slice(0,10))}…</a>` : '';
+    const cnt = e.count > 1 ? ` <span class="est">×${e.count}</span>` : '';
+    const msg = esc(e.msg.length > 200 ? e.msg.slice(0,200) + '…' : e.msg);
+    return `<div class="ev ${esc(e.kind)}"><span class="ts">${esc(e.ts ? e.ts.slice(11,19) : '--:--:--')}</span>` +
+           `<span class="tag">${EV_LABEL[e.kind] || esc(e.kind)}${cnt}</span>` +
+           `<span class="msg">${msg}${tx}</span></div>`;
+  }).join('');
+}
+
+function renderTail(s) {
+  if (paused) return;
+  const q = $('filter').value.toLowerCase();
+  let lines = s.tail || [];
+  if (q) lines = lines.filter(l => l.text.toLowerCase().includes(q));
+  lines = lines.slice(-50);
+  const el = $('tail');
+  el.innerHTML = lines.map(l => {
+    let cls = 't-dim';
+    if (/ ERROR /.test(l.text)) cls = 't-err';
+    else if (/ WARN /.test(l.text)) cls = 't-warn';
+    return `<div class="${cls}">${esc(l.text)}</div>`;
+  }).join('') || '<div class="empty">no matching lines</div>';
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderSwap(s) {
+  const sw = s.swap, el = $('swap');
+  if (!sw) { el.innerHTML = '<div class="empty">no swap state</div>'; return; }
+  const issues = (sw.config_lint && sw.config_lint.issues) || [];
+  const lint = issues.length
+    ? issues.map(i =>
+        `<span class="pill ${i.severity === 'critical' ? 'crit' : 'warn'}" title="${esc(i.detail)}">` +
+        `${esc(i.venue)}: ${esc(i.kind)}</span>`).join('')
+    : '<span class="pill up">config lint clean</span>';
+  const rr = sw.route_resolution || {};
+  const kinds = Object.entries(sw.reverts_by_route_kind || {})
+    .map(([k, n]) => `${esc(k)}: ${fmtNum(n)}`).join(' · ') || 'none';
+  const rows = (sw.venues || []).map(v => `
+    <tr>
+      <td>${esc(v.name)}</td>
+      <td>${esc(v.chain)}</td>
+      <td>${esc(v.route_kind)}</td>
+      <td>${fmtNum(v.executions)}</td>
+      <td class="${v.reverts ? 'neg' : ''}">${fmtNum(v.reverts)}</td>
+      <td class="${usdClass(v.realized_net_usd)}">${fmtUsd(v.realized_net_usd)}</td>
+      <td>${v.avg_slippage_bps == null ? '—' :
+            v.avg_slippage_bps.toFixed(1) + ' bps (' + v.slippage_samples + ')'}</td>
+    </tr>`).join('');
+  el.innerHTML =
+    `<div class="lint-row">${lint}</div>` +
+    `<div class="lint-row" style="color:var(--dim)">` +
+    `route misses: ${fmtNum(rr.misses)} · rotation re-routes: ${fmtNum(rr.rotation_reroutes)} · ` +
+    `rotation post-hoc denials: ${fmtNum(rr.rotation_denied)} · ` +
+    `swap reverts by kind — ${kinds}</div>` +
+    `<table class="swap"><tr><th>VENUE</th><th>CHAIN</th><th>KIND</th><th>EXECS</th>` +
+    `<th>REVERTS</th><th>REALIZED</th><th>SLIPPAGE (REAL vs SIM)</th></tr>${rows}</table>`;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/state', {cache: 'no-store'});
+    const s = await r.json();
+    if (s.error) throw new Error(s.error);
+    lastState = s;
+    $('breaker-banner').classList.toggle('on', !!s.breaker_banner);
+    const down = s.engine.status === 'down';
+    // Restore the canonical banner text: the catch below repurposes this
+    // element for state errors, and stale error text must not survive into a
+    // later genuine engine-down condition.
+    $('engine-down').textContent = 'ENGINE UNREACHABLE on metrics port — showing log/snapshot data only';
+    $('engine-down').classList.toggle('on', down);
+    $('engine-dot').className = 'dot ' +
+      (s.engine.status === 'up' ? 'ok' : (s.engine.status === 'degraded' ? 'degraded' : 'bad'));
+    $('engine-lbl').textContent = 'engine ' + s.engine.status;
+    const badge = $('mode-badge');
+    const mode = s.mode.execute_mode || 'unknown';
+    badge.textContent = mode.toUpperCase();
+    badge.className = 'badge ' + (mode === 'live' ? 'live' : (mode === 'shadow' ? 'shadow' : 'unknown'));
+    $('engport').textContent = s.dashboard.engine_port;
+    renderTicker(s.ticker);
+    renderStatus(s);
+    renderFin(s);
+    renderActivity(s);
+    renderSwap(s);
+    renderEvents(s);
+    renderTail(s);
+    $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    $('engine-down').classList.add('on');
+    $('engine-down').textContent = 'DASHBOARD STATE ERROR: ' + e.message;
+    $('engine-dot').className = 'dot bad';
+  }
+}
+
+$('pause').addEventListener('click', () => {
+  paused = !paused;
+  $('pause').classList.toggle('on', paused);
+  $('pause').textContent = paused ? '▶ resume' : '⏸ pause';
+});
+$('filter').addEventListener('input', () => { if (lastState) renderTail(lastState); });
+setInterval(() => { $('clock').textContent = new Date().toLocaleTimeString(); }, 1000);
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

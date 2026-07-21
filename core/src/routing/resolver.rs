@@ -9,7 +9,7 @@
 use crate::config::{RiskConfig, RoutingConfig, TradingPair};
 use alloy::primitives::{Address, U256};
 use std::str::FromStr;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// A resolved V2 DEX route for a collateral/debt pair.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +51,8 @@ impl<'a> RoutingResolver<'a> {
     /// a matching trading pair, and returns a [`ResolvedV2Route`] with the router
     /// address, token path, and slippage-adjusted minimum output.
     ///
+    /// Equivalent to [`Self::resolve_v2_eligible`] with every venue eligible.
+    ///
     /// # Returns
     /// - `Some(ResolvedV2Route)` if a matching V2 route is found.
     /// - `None` if no matching route exists (candidate will be skipped).
@@ -61,7 +63,32 @@ impl<'a> RoutingResolver<'a> {
         chain_label: &str,
         debt_to_cover: U256,
     ) -> Option<ResolvedV2Route> {
+        self.resolve_v2_eligible(collateral, debt, chain_label, debt_to_cover, |_| true)
+    }
+
+    /// Rotation-aware resolution: like [`Self::resolve_v2`], but a venue whose
+    /// name fails the `is_eligible` predicate is skipped and resolution falls
+    /// through to the next matching venue.
+    ///
+    /// The caller passes a predicate over venue names — typically
+    /// `|venue| !recent_venues.contains(venue)` built from
+    /// `PacingEngine::recent_venues()` — so the resolver never returns a venue
+    /// the pacing rotation gate would deny post-hoc (which previously dropped
+    /// the candidate instead of re-routing it).
+    ///
+    /// # Returns
+    /// - `Some(ResolvedV2Route)` for the first eligible venue with a matching pair.
+    /// - `None` if no eligible matching route exists (candidate will be skipped).
+    pub fn resolve_v2_eligible(
+        &self,
+        collateral: Address,
+        debt: Address,
+        chain_label: &str,
+        debt_to_cover: U256,
+        is_eligible: impl Fn(&str) -> bool,
+    ) -> Option<ResolvedV2Route> {
         let venues = self.routing.venues_for_chain(chain_label);
+        let mut ineligible_matches: u32 = 0;
 
         for venue in venues {
             // Only V2-compatible DEX venues with a router address are in scope.
@@ -89,6 +116,16 @@ impl<'a> RoutingResolver<'a> {
             // The Executor swaps seized collateral → debt;
             // pairs in routing.yaml are declared as collateral→debt.
             if let Some(pair) = Self::find_matching_pair(&venue.pairs, collateral, debt) {
+                if !is_eligible(&venue.name) {
+                    ineligible_matches += 1;
+                    info!(
+                        target = "chimera::routing",
+                        venue = %venue.name,
+                        "Venue has a matching route but is rotation-blocked; trying next venue"
+                    );
+                    continue;
+                }
+
                 let amount_out_min =
                     Self::compute_amount_out_min(debt_to_cover, self.risk.slippage_max_bps);
 
@@ -106,7 +143,8 @@ impl<'a> RoutingResolver<'a> {
             %collateral,
             %debt,
             chain = %chain_label,
-            "No V2 route found for collateral/debt pair"
+            rotation_blocked = ineligible_matches,
+            "No eligible V2 route found for collateral/debt pair"
         );
         None
     }
@@ -153,7 +191,15 @@ impl<'a> RoutingResolver<'a> {
         let premium = U256::from(FLASH_LOAN_PREMIUM_BPS);
         let slippage = U256::from(slippage_max_bps);
         // amount_out_min = debt_to_cover * (10000 + 5 - slippage) / 10000
-        debt_to_cover * (basis + premium - slippage) / basis
+        //
+        // RiskConfig::validate caps slippage_max_bps at 200, but a
+        // hand-constructed RiskConfig can bypass load(). If slippage would
+        // underflow the discount, fail closed: drop the slippage discount
+        // entirely so amountOutMin still covers full repayment + premium.
+        let discount = (basis + premium)
+            .checked_sub(slippage)
+            .unwrap_or(basis + premium);
+        debt_to_cover * discount / basis
     }
 }
 
@@ -351,6 +397,112 @@ mod tests {
             // Verify slippage_max_bps is the configured 50 bps default
             assert_eq!(risk.slippage_max_bps, 50);
         }
+    }
+
+    /// Two v2 venues on the same chain, both matching the pair.
+    fn two_venue_routing_config() -> RoutingConfig {
+        let pair = TradingPair {
+            token_in: "0x3333333333333333333333333333333333333333".into(),
+            token_out: "0x2222222222222222222222222222222222222222".into(),
+        };
+        RoutingConfig {
+            primary: "test".into(),
+            fallbacks: vec![],
+            submission_style: "single_atomic_tx".into(),
+            venues: vec![
+                VenueEntry {
+                    name: "venue-a".into(),
+                    chain: "base".into(),
+                    liquidity_usd_min: 50_000,
+                    venue_type: "dex".into(),
+                    kyc: false,
+                    router_compatibility: "v2".into(),
+                    router_address: "0x1111111111111111111111111111111111111111".into(),
+                    pairs: vec![pair.clone()],
+                },
+                VenueEntry {
+                    name: "venue-b".into(),
+                    chain: "base".into(),
+                    liquidity_usd_min: 50_000,
+                    venue_type: "dex".into(),
+                    kyc: false,
+                    router_compatibility: "v2".into(),
+                    router_address: "0x4444444444444444444444444444444444444444".into(),
+                    pairs: vec![pair],
+                },
+            ],
+            forensic_tag_sources: vec![],
+        }
+    }
+
+    #[test]
+    fn test_resolve_v2_eligible_falls_through_to_next_eligible_venue() {
+        let routing = two_venue_routing_config();
+        let risk = test_risk_config();
+        let resolver = RoutingResolver::new(&routing, &risk);
+
+        let debt = address!("0x2222222222222222222222222222222222222222");
+        let collateral = address!("0x3333333333333333333333333333333333333333");
+        let debt_to_cover = U256::from(1_000_000u64);
+
+        // venue-a is rotation-blocked: resolution must fall through to venue-b
+        // instead of returning venue-a (which pacing would deny → candidate drop).
+        let recent = vec!["venue-a".to_string()];
+        let route = resolver
+            .resolve_v2_eligible(collateral, debt, "base", debt_to_cover, |venue| {
+                !recent.iter().any(|r| r == venue)
+            })
+            .expect("should fall through to the next eligible venue");
+
+        assert_eq!(route.venue_name, "venue-b");
+        assert_eq!(
+            route.router,
+            address!("0x4444444444444444444444444444444444444444")
+        );
+        // amount_out_min semantics preserved: same slippage formula as resolve_v2.
+        let expected_min = debt_to_cover * U256::from(9955) / U256::from(10000);
+        assert_eq!(route.amount_out_min, expected_min);
+    }
+
+    #[test]
+    fn test_resolve_v2_eligible_all_blocked_returns_none() {
+        let routing = two_venue_routing_config();
+        let risk = test_risk_config();
+        let resolver = RoutingResolver::new(&routing, &risk);
+
+        let debt = address!("0x2222222222222222222222222222222222222222");
+        let collateral = address!("0x3333333333333333333333333333333333333333");
+
+        let result =
+            resolver.resolve_v2_eligible(collateral, debt, "base", U256::from(1000), |_| false);
+        assert!(result.is_none(), "all venues blocked must resolve to None");
+    }
+
+    #[test]
+    fn test_resolve_v2_eligible_all_eligible_matches_resolve_v2() {
+        let routing = two_venue_routing_config();
+        let risk = test_risk_config();
+        let resolver = RoutingResolver::new(&routing, &risk);
+
+        let debt = address!("0x2222222222222222222222222222222222222222");
+        let collateral = address!("0x3333333333333333333333333333333333333333");
+        let debt_to_cover = U256::from(1_000_000u64);
+
+        let via_default = resolver.resolve_v2(collateral, debt, "base", debt_to_cover);
+        let via_eligible =
+            resolver.resolve_v2_eligible(collateral, debt, "base", debt_to_cover, |_| true);
+        assert_eq!(via_default, via_eligible);
+        assert_eq!(via_default.unwrap().venue_name, "venue-a");
+    }
+
+    #[test]
+    fn test_compute_amount_out_min_absurd_slippage_fails_closed() {
+        // Slippage above basis+premium would underflow the discount term.
+        // The guard must fail closed: no slippage discount at all, i.e.
+        // amountOutMin = debt * (10000 + 5) / 10000 — never a tiny/zero minimum.
+        let debt = U256::from(1_000_000u64);
+        let result = RoutingResolver::compute_amount_out_min(debt, 20_000);
+        assert_eq!(result, U256::from(1_000_500u64));
     }
 
     #[test]

@@ -468,6 +468,16 @@ impl PacingEngine {
             })
             .collect())
     }
+    /// Snapshot of the venue names currently inside the rotation window.
+    ///
+    /// The routing resolver uses this (via `resolve_v2_eligible`) to skip
+    /// venues the rotation gate in [`PacingEngineInner::check`] would deny
+    /// post-hoc, so resolution falls through to the next eligible venue
+    /// instead of resolving a to-be-denied venue and dropping the candidate.
+    pub fn recent_venues(&self) -> Vec<String> {
+        self.inner.read().venue_rotation.iter().cloned().collect()
+    }
+
     /// Select the next EOA from the rotation pool and cycle it to the back.
     pub fn select_next_eoa(&self) -> Option<String> {
         let mut inner = self.inner.write();
@@ -1061,6 +1071,65 @@ mod tests {
             matches!(decision, PacingDecision::Deny { ref reason } if reason.contains("rotation")),
             "Expected venue rotation denial, got {:?}",
             decision
+        );
+    }
+
+    #[test]
+    fn test_recent_venues_exposes_rotation_window() {
+        let mut config = make_test_config();
+        config.min_interval_hours = 0;
+        let engine = PacingEngine::new(config);
+        assert!(
+            engine.recent_venues().is_empty(),
+            "fresh engine has no recently used venues"
+        );
+
+        let opp = Opportunity {
+            id: "test-1".into(),
+            expected_net_usd: Decimal::from(100),
+            gas_estimate_gwei: 1,
+            venue: "sushi-base".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        engine.record_outcome(&opp, Decimal::from(100), Decimal::ZERO, false);
+
+        let recent = engine.recent_venues();
+        assert_eq!(recent, vec!["sushi-base".to_string()]);
+
+        // The snapshot mirrors exactly what the rotation gate denies: a
+        // resolver eligibility predicate built from it skips the same venue.
+        let is_eligible = |venue: &str| !recent.iter().any(|r| r == venue);
+        assert!(!is_eligible("sushi-base"));
+        assert!(is_eligible("venue-b"));
+    }
+
+    #[test]
+    fn test_recent_venues_eviction_window_is_count_minus_one() {
+        // Pins the `>=` eviction at record_outcome (effective window =
+        // venue_rotation_count - 1), which recent_venues() now feeds into
+        // route resolution. A change to either the comparator or the backing
+        // state would alter which venues the resolver rotation-skips.
+        let mut config = make_test_config();
+        config.min_interval_hours = 0;
+        config.venue_rotation_count = 3;
+        let engine = PacingEngine::new(config);
+        for (i, venue) in ["a", "b", "c", "d"].iter().enumerate() {
+            let opp = Opportunity {
+                id: format!("test-{}", i),
+                expected_net_usd: Decimal::from(10),
+                gas_estimate_gwei: 1,
+                venue: venue.to_string(),
+                eoa: "0xClean1".into(),
+                timestamp: Utc::now(),
+            };
+            engine.record_outcome(&opp, Decimal::from(10), Decimal::ZERO, false);
+        }
+        // count=3 with `>=` eviction holds at most 2 entries: a and b evicted
+        // (routable again), c and d still inside the rotation window.
+        assert_eq!(
+            engine.recent_venues(),
+            vec!["c".to_string(), "d".to_string()]
         );
     }
 

@@ -422,13 +422,18 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
 
         // 2.5 — Route resolution: find a V2 DEX route for this collateral/debt pair.
         // Must happen BEFORE Opportunity construction so the venue field is accurate.
+        // Rotation-aware: venues inside the pacing rotation window are skipped
+        // here so resolution falls through to the next eligible venue instead
+        // of resolving one the rotation gate would deny (candidate drop).
         let chain_label = self.chain_label_str();
         let resolver = RoutingResolver::new(&self.routing_config, &self.risk_config);
-        let route = resolver.resolve_v2(
+        let recent_venues = self.pacing.engine().recent_venues();
+        let route = resolver.resolve_v2_eligible(
             candidate.collateral_asset,
             candidate.debt_asset,
             chain_label,
             candidate.debt_to_cover,
+            |venue| !recent_venues.iter().any(|recent| recent == venue),
         );
 
         let Some(route) = route else {
@@ -436,7 +441,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
                 target = "chimera::orchestrator",
                 collateral = %candidate.collateral_asset,
                 debt = %candidate.debt_asset,
-                "No V2 route found; skipping candidate"
+                "No eligible V2 route found; skipping candidate"
             );
             return Ok(());
         };

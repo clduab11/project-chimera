@@ -490,7 +490,61 @@ In addition to the daily checklist, perform these tasks once per week:
 
 ---
 
-## 8. Related Documentation
+## 8. Live Detection Refresh (Snapshot + Prices)
+
+Detection state is refreshed on two axes; both retain last-known-good on any failure and
+never regress the in-memory snapshot.
+
+### 8.1 Live repricing (engine-internal, seconds cadence)
+
+The engine refreshes every reserve's USD price from the Aave oracle (the same source the
+protocol's `liquidationCall` uses) in ONE batched `eth_call` per interval, then re-evaluates
+every tracked position against the 1.05 HF threshold. Knobs in `config/risk.yaml`:
+
+```yaml
+price_refresh_secs: 8        # min seconds between refreshes; failures back off to <= 60s
+price_max_stale_secs: 300    # past this age: shadow warns; LIVE skips candidate emission
+```
+
+No operator action needed; repricing pauses automatically while the emergency flag is active.
+
+### 8.2 Discovery refresh (operator-scheduled, ~15 min cadence)
+
+Discovery of NEW at-risk borrowers requires regenerating `config/snapshot.json`. The engine
+only watches the file (the generator's temp+`os.replace` write is atomic); a changed file is
+validated (parse, chain match, non-empty reserves, block number must not go backwards or be
+zero) and swapped in within one scan, and the simulator's fork DB is rebuilt from it.
+
+Schedule the generator externally — WSL cron (or a Windows Scheduled Task invoking
+`wsl.exe -e`), every ~15 minutes:
+
+```bash
+# WSL crontab -e  (BASE_RPC_URL from .env.live; --logs-rpc = a public/log-capable endpoint,
+# Alchemy free tier caps eth_getLogs at 10 blocks)
+*/15 * * * * cd /mnt/c/Users/cld-main/Desktop/github-projects/project-chimera && \
+  python3 scripts/snapshot_generator.py --chain base --output config/snapshot.json \
+  --scan-blocks 50000 --hf-max 1.10 --logs-rpc "$LOGS_RPC_URL" >> logs/snapshot_gen.log 2>&1
+```
+
+### 8.3 Refresh metrics & alarms (port 9554 in the current deployment)
+
+| Metric | Healthy | Alarm |
+|---|---|---|
+| `chimera_price_refresh_age_seconds` | < 3× `price_refresh_secs` | > `price_max_stale_secs`: repricing degraded (RPC 429s?); in live mode scans are being skipped |
+| `chimera_price_refresh_total{result="error"}` | rate ≈ 0 | sustained growth = rate-limited RPC; backoff is automatic, consider a paid tier |
+| `chimera_snapshot_age_seconds` | < 2× generator cadence | growing unbounded = generator dead / cron broken |
+| `chimera_snapshot_block_number` | advances every generator run | flat = generator writing stale data or reloads being rejected |
+| `chimera_snapshot_reload_total{result="rejected"/"read_error"}` | ≈ 0 | rejected = generator regression (backwards block / wrong chain / mock output) |
+| `chimera_scans_skipped_stale_price_total` | 0 in shadow | any growth in live mode = detection halted on stale prices |
+
+Note: metric names above are the engine's; the derived default port for Base
+(`9100 + 8453 % 1000 = 9553`) collides with the dashboard's own bind — the current
+deployment runs the engine's metrics on **9554** via explicit override. Do not assume the
+derived default.
+
+---
+
+## 9. Related Documentation
 
 - [`README.md`](../README.md) — Quick start, financial guardrails, "Never" rules
 - [`docs/architecture.md`](architecture.md) — Component diagrams, data flow, security model

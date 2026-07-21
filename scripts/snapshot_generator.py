@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 import tomllib
@@ -45,6 +46,43 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("snapshot_generator")
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+# ---------------------------------------------------------------------------
+# RPC provider URLs embed the API key in the path (…/v2/<key>) or a query
+# param (?apikey=<key>). web3 surfaces the full URL in connection/HTTP error
+# strings, so an unredacted log line leaks the key. Redact before it reaches
+# any handler. Patterns cover Alchemy/Infura path-keys and generic key params.
+_REDACT_PATH_KEY = re.compile(r"(https?://[^\s\"']*?/(?:v2|v3)/)[A-Za-z0-9_\-]+")
+_REDACT_QS_KEY = re.compile(r"([?&](?:api[_-]?key|key|token|apiKey)=)[A-Za-z0-9_\-]+", re.I)
+
+
+def _redact(text: str) -> str:
+    """Strip RPC API keys from a string (URLs in error messages)."""
+    text = _REDACT_PATH_KEY.sub(r"\1<redacted>", text)
+    return _REDACT_QS_KEY.sub(r"\1<redacted>", text)
+
+
+class _RedactFilter(logging.Filter):
+    """Redact RPC API keys from every log record before it is emitted."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 - never let logging raise
+            return True
+        red = _redact(msg)
+        if red != msg:
+            record.msg = red
+            record.args = ()
+        return True
+
+
+logger.addFilter(_RedactFilter())
+for _h in logging.getLogger().handlers:  # cover the root handler basicConfig added
+    _h.addFilter(_RedactFilter())
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -148,10 +186,19 @@ POOL_ABI: list[dict[str, Any]] = [
         "type": "event",
     },
     {
+        # Aave V3 Borrow event — full signature. The debt-bearer is `onBehalfOf`
+        # (indexed), NOT `user` (the caller). The prior 2-arg stub computed the
+        # wrong topic0 and could not decode the borrower, so no scan could work.
+        # Canonical: Borrow(address,address,address,uint256,uint8,uint256,uint16)
         "anonymous": False,
         "inputs": [
             {"indexed": True, "internalType": "address", "name": "reserve", "type": "address"},
-            {"indexed": True, "internalType": "address", "name": "user", "type": "address"},
+            {"indexed": False, "internalType": "address", "name": "user", "type": "address"},
+            {"indexed": True, "internalType": "address", "name": "onBehalfOf", "type": "address"},
+            {"indexed": False, "internalType": "uint256", "name": "amount", "type": "uint256"},
+            {"indexed": False, "internalType": "uint8", "name": "interestRateMode", "type": "uint8"},
+            {"indexed": False, "internalType": "uint256", "name": "borrowRate", "type": "uint256"},
+            {"indexed": True, "internalType": "uint16", "name": "referralCode", "type": "uint16"},
         ],
         "name": "Borrow",
         "type": "event",
@@ -183,7 +230,74 @@ POOL_ABI: list[dict[str, Any]] = [
         "stateMutability": "view",
         "type": "function",
     },
+    {
+        # Aggregated user account state. healthFactor is 1e18-scaled; it equals
+        # type(uint256).max when the user has no debt. Used to triage discovered
+        # borrowers down to the at-risk set before the per-asset balance reads.
+        "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+        "name": "getUserAccountData",
+        "outputs": [
+            {"internalType": "uint256", "name": "totalCollateralBase", "type": "uint256"},
+            {"internalType": "uint256", "name": "totalDebtBase", "type": "uint256"},
+            {"internalType": "uint256", "name": "availableBorrowsBase", "type": "uint256"},
+            {"internalType": "uint256", "name": "currentLiquidationThreshold", "type": "uint256"},
+            {"internalType": "uint256", "name": "ltv", "type": "uint256"},
+            {"internalType": "uint256", "name": "healthFactor", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+        "name": "getUserEMode",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
+
+# Aave V3 Oracle (IAaveOracle) — returns asset prices in the protocol base
+# currency (USD, BASE_CURRENCY_UNIT = 1e8 on Base/Arbitrum). Used to populate
+# reserve.price_usd, which the Rust detector consumes for health-factor math.
+IAAVE_ORACLE_ABI: list[dict[str, Any]] = [
+    {
+        "inputs": [{"internalType": "address[]", "name": "assets", "type": "address[]"}],
+        "name": "getAssetsPrices",
+        "outputs": [{"internalType": "uint256[]", "name": "", "type": "uint256[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "asset", "type": "address"}],
+        "name": "getAssetPrice",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "BASE_CURRENCY_UNIT",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+# Known Aave V3 Oracle addresses. Prefer config/pools.toml.
+DEFAULT_ORACLES: dict[str, str] = {
+    "base": "0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156",
+    "arbitrum": "0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7",
+}
+
+# Public RPC endpoints used for the historical Borrow-event scan (getLogs) when
+# the primary key can't serve it. Verified 2026-07-21: Alchemy's *free* tier
+# caps eth_getLogs at a 10-block range (useless for discovery), while the
+# official public endpoints below allow up to a 10,000-block range. State reads
+# (eth_call) stay on the primary/private RPC; only getLogs uses these.
+PUBLIC_LOGS_RPC: dict[str, str] = {
+    "base": "https://mainnet.base.org",
+    "arbitrum": "https://arb1.arbitrum.io/rpc",
+}
 
 # Known Aave V3 PoolDataProvider addresses. Prefer config/pools.toml.
 DEFAULT_DATA_PROVIDERS: dict[str, str] = {
@@ -513,6 +627,64 @@ def fetch_reserves(
     return reserves
 
 
+def fetch_oracle_prices(
+    w3: Web3,
+    oracle_address: str,
+    reserve_addresses: list[str],
+) -> dict[str, float]:
+    """Fetch USD prices for every reserve from the Aave V3 oracle.
+
+    Returns {asset_address -> price_usd_float}. The oracle reports prices in the
+    protocol base currency (USD) with BASE_CURRENCY_UNIT precision (1e8 on
+    Base/Arbitrum); we normalise to a float USD value that the Rust detector
+    converts back to 8-decimal fixed point. Falls back to per-asset calls if the
+    batch call reverts, and leaves an asset unpriced (absent) on failure.
+    """
+    if not reserve_addresses:
+        return {}
+    logger.info("Fetching oracle prices for %d reserves from %s", len(reserve_addresses), oracle_address)
+    oracle = w3.eth.contract(
+        address=Web3.to_checksum_address(oracle_address),
+        abi=IAAVE_ORACLE_ABI,
+    )
+
+    # BASE_CURRENCY_UNIT is the denominator (1e8). Default to 1e8 if the call
+    # is unavailable so a transient failure does not zero every price.
+    try:
+        base_unit = int(_retry_with_backoff(lambda: oracle.functions.BASE_CURRENCY_UNIT().call()))
+        if base_unit <= 0:
+            base_unit = 10**8
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("BASE_CURRENCY_UNIT call failed (%s); assuming 1e8", exc)
+        base_unit = 10**8
+
+    checksummed = [Web3.to_checksum_address(a) for a in reserve_addresses]
+    prices: dict[str, float] = {}
+
+    # Preferred: one batched getAssetsPrices call.
+    try:
+        raw = _retry_with_backoff(lambda: oracle.functions.getAssetsPrices(checksummed).call())
+        for asset, raw_price in zip(reserve_addresses, raw):
+            if int(raw_price) > 0:
+                prices[asset] = int(raw_price) / base_unit
+    except Exception as exc:  # noqa: BLE001 - fall back to per-asset below
+        logger.warning("Batched getAssetsPrices failed (%s); falling back to per-asset", exc)
+
+    # Fill any gaps (batch failed, or a specific asset returned 0) individually.
+    for asset, checksum in zip(reserve_addresses, checksummed):
+        if prices.get(asset, 0.0) > 0.0:
+            continue
+        try:
+            raw_price = int(_retry_with_backoff(lambda c=checksum: oracle.functions.getAssetPrice(c).call()))
+            if raw_price > 0:
+                prices[asset] = raw_price / base_unit
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("getAssetPrice failed for %s (%s); leaving unpriced", asset, exc)
+
+    logger.info("Resolved %d/%d oracle prices", len(prices), len(reserve_addresses))
+    return prices
+
+
 def _resolve_symbol(w3: Web3, token_address: str) -> str:
     """Best-effort ERC20 symbol resolution."""
     try:
@@ -536,74 +708,177 @@ def _resolve_symbol(w3: Web3, token_address: str) -> str:
 # ---------------------------------------------------------------------------
 # User position fetching
 # ---------------------------------------------------------------------------
+def _scan_borrowers(
+    pool: Any,
+    latest: int,
+    scan_blocks: int,
+    log_chunk: int,
+) -> set[str]:
+    """Collect unique borrower addresses from recent Borrow events.
+
+    Uses chunked ``eth_getLogs`` (via ``event.get_logs``) rather than a stateful
+    ``eth_newFilter``: providers such as Alchemy reject the latter or cap the
+    former's block range, so a single wide query 400s. Each chunk is retried and
+    a failed chunk is skipped (logged) rather than aborting the whole scan.
+    """
+    from_block = max(latest - scan_blocks + 1, 0)
+    borrowers: set[str] = set()
+    chunks = 0
+    failed = 0
+    start = from_block
+    while start <= latest:
+        end = min(start + log_chunk - 1, latest)
+        chunks += 1
+        try:
+            entries = _retry_with_backoff(
+                lambda s=start, e=end: pool.events.Borrow().get_logs(from_block=s, to_block=e)
+            )
+            for entry in entries:
+                # The debt-bearer is onBehalfOf (the account whose debt increased),
+                # not user (the caller). Collect it as the candidate borrower.
+                args = entry["args"]
+                borrowers.add(args.get("onBehalfOf") or args.get("user"))
+        except Exception as exc:  # noqa: BLE001 - skip the chunk, keep scanning
+            failed += 1
+            logger.warning("Borrow log chunk %d-%d failed after retries: %s", start, end, exc)
+        start = end + 1
+
+    logger.info(
+        "Scanned blocks %d-%d in %d chunk(s) (%d failed); %d unique borrowers",
+        from_block, latest, chunks, failed, len(borrowers),
+    )
+    if failed:
+        logger.warning(
+            "%d/%d log chunk(s) failed — borrower set is INCOMPLETE for this window",
+            failed, chunks,
+        )
+    return borrowers
+
+
 def fetch_user_positions(
     w3: Web3,
     pool_address: str,
     data_provider_address: str,
     reserve_addresses: list[str],
+    reserve_index: dict[str, dict[str, int]] | None = None,
+    logs_w3: Web3 | None = None,
+    scan_blocks: int = 50000,
+    log_chunk: int = 9000,
+    hf_max: float = 1.10,
+    max_candidates: int = 1500,
+    max_users: int = 300,
 ) -> dict[str, UserPosition]:
-    """
-    Scan for users with active debt positions.
+    """Discover at-risk Aave V3 positions and serialize them as scaled balances.
 
-    NOTE: A full scan requires an indexer (The Graph, Dune, or custom events).
-    This implementation does a best-effort scan of recent Borrow events to find
-    candidate users, then queries their balances. For production, replace with
-    a dedicated indexer query.
+    Pipeline:
+      1. Chunked Borrow-event scan over the last ``scan_blocks`` blocks →
+         candidate borrower set (capped at ``max_candidates``).
+      2. ``getUserAccountData`` triage: keep only users with active debt whose
+         live health factor is ≤ ``hf_max`` (near or below liquidation), capped
+         at ``max_users``.
+      3. Per-asset ``getUserReserveData`` → SCALED balances the detector expects
+         (it re-applies the reserve index): variable debt uses the on-chain
+         ``scaledVariableDebt``; aToken collateral is de-scaled from the current
+         balance via the reserve's ``liquidity_index`` (same index the detector
+         re-applies, so the round-trip is consistent).
+
+    NOTE: an event scan only surfaces borrowers active in the window. Complete
+    at-risk coverage requires an indexer (The Graph / Dune / provider subgraph)
+    queried by health factor. The caps above are logged when they bind so the
+    snapshot never silently under-reports.
     """
-    logger.info("Scanning for at-risk users (event-based heuristic)...")
+    logger.info("Discovering at-risk users (Borrow scan → HF triage → scaled balances)...")
+    ray = 10**27
+    reserve_index = reserve_index or {}
 
     data_provider = w3.eth.contract(
         address=Web3.to_checksum_address(data_provider_address),
         abi=POOL_DATA_PROVIDER_ABI,
     )
-
-    # Heuristic: scan last N blocks for Borrow events to find active borrowers
-    latest = w3.eth.block_number
-    from_block = max(latest - 5000, 0)
-
     pool = w3.eth.contract(
         address=Web3.to_checksum_address(pool_address),
         abi=POOL_ABI,
     )
 
-    borrowers: set[str] = set()
-    try:
-        event_filter = pool.events.Borrow().create_filter(from_block=from_block, to_block=latest)
-        entries = _retry_with_backoff(event_filter.get_all_entries)
-        for entry in entries:
-            borrowers.add(entry["args"]["user"])
-        logger.info("Found %d unique borrowers in blocks %d-%d", len(borrowers), from_block, latest)
-    except Exception as exc:
-        logger.warning("Failed to scan Borrow events: %s", exc)
+    # State reads (eth_call) use the primary RPC; the Borrow scan (getLogs) uses
+    # logs_w3 when provided (the primary key may cap getLogs — e.g. Alchemy free
+    # tier's 10-block limit). Its block height drives the scan range.
+    scan_w3 = logs_w3 or w3
+    logs_pool = scan_w3.eth.contract(
+        address=Web3.to_checksum_address(pool_address),
+        abi=POOL_ABI,
+    )
+    latest = scan_w3.eth.block_number
+    borrowers = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk)
+
+    candidates = sorted(borrowers)
+    if len(candidates) > max_candidates:
+        logger.warning(
+            "Borrower set (%d) exceeds max_candidates (%d); triaging first %d only",
+            len(candidates), max_candidates, max_candidates,
+        )
+        candidates = candidates[:max_candidates]
+
+    # Triage: getUserAccountData health factor (1e18-scaled; uint256 max = no debt).
+    hf_max_wad = int(hf_max * 10**18)
+    at_risk: list[str] = []
+    for user in candidates:
+        try:
+            acct = _retry_with_backoff(lambda u=user: pool.functions.getUserAccountData(u).call())
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("getUserAccountData failed for %s: %s", user, exc)
+            continue
+        total_debt_base = int(acct[1])
+        health_factor = int(acct[5])
+        if total_debt_base > 0 and health_factor <= hf_max_wad:
+            at_risk.append(user)
+            if len(at_risk) >= max_users:
+                logger.warning(
+                    "Reached max_users (%d); stopping triage early (more at-risk users may exist)",
+                    max_users,
+                )
+                break
+
+    logger.info("Triaged %d candidates → %d at-risk (HF ≤ %.3f)", len(candidates), len(at_risk), hf_max)
 
     positions: dict[str, UserPosition] = {}
-    for user in borrowers:
+    for user in at_risk:
         try:
+            emode = 0
+            try:
+                emode = int(_retry_with_backoff(lambda u=user: pool.functions.getUserEMode(u).call()))
+            except Exception as exc:  # noqa: BLE001 - emode is enrichment, not critical
+                logger.debug("getUserEMode failed for %s: %s", user, exc)
+
             collateral: dict[str, str] = {}
             debt: dict[str, str] = {}
-
             for asset in reserve_addresses:
                 user_data = _retry_with_backoff(
                     lambda a=asset, u=user: data_provider.functions.getUserReserveData(a, u).call()
                 )
-                a_token_balance = int(user_data[0])
-                variable_debt = int(user_data[2])
+                current_atoken = int(user_data[0])   # current (indexed) aToken balance
+                scaled_variable_debt = int(user_data[4])  # already scaled on-chain
 
-                if a_token_balance > 0:
-                    collateral[asset] = str(a_token_balance)
-                if variable_debt > 0:
-                    debt[asset] = str(variable_debt)
+                if current_atoken > 0:
+                    # De-scale to the balance the detector expects: it recomputes
+                    # current = scaled * liquidity_index / RAY, so store the scaled form.
+                    liq_index = reserve_index.get(asset, {}).get("liquidity_index", ray) or ray
+                    scaled_collateral = current_atoken * ray // liq_index
+                    if scaled_collateral > 0:
+                        collateral[asset] = str(scaled_collateral)
+                if scaled_variable_debt > 0:
+                    debt[asset] = str(scaled_variable_debt)
 
             if debt:
                 positions[user] = UserPosition(
                     collateral=collateral,
                     debt=debt,
-                    emode_category=0,  # Would require protocol data provider call
+                    emode_category=emode,
                 )
-        except Exception as exc:
-            logger.debug("Failed to fetch user data for %s: %s", user, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to build position for %s: %s", user, exc)
 
-    logger.info("Resolved %d positions with active debt", len(positions))
+    logger.info("Resolved %d at-risk positions with active debt", len(positions))
     return positions
 
 
@@ -886,6 +1161,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use mock data instead of live RPC calls (for testing).",
     )
     parser.add_argument(
+        "--oracle",
+        default=None,
+        help="Aave V3 Oracle address (defaults to pools.toml / known address for chain).",
+    )
+    parser.add_argument(
+        "--logs-rpc",
+        default=None,
+        help="RPC for the Borrow-event getLogs scan only (state reads stay on the "
+        "primary RPC). Defaults to the chain's public endpoint because Alchemy's "
+        "free tier caps getLogs at 10 blocks. Pass 'primary' to force the main RPC.",
+    )
+    parser.add_argument(
+        "--scan-blocks",
+        type=int,
+        default=50000,
+        help="How many recent blocks to scan for Borrow events (default 50000).",
+    )
+    parser.add_argument(
+        "--log-chunk",
+        type=int,
+        default=9000,
+        help="eth_getLogs block-range chunk size (default 9000; public Base RPC caps at 10000).",
+    )
+    parser.add_argument(
+        "--hf-max",
+        type=float,
+        default=1.10,
+        help="Keep only users whose live health factor is ≤ this (default 1.10).",
+    )
+    parser.add_argument(
+        "--max-candidates",
+        type=int,
+        default=1500,
+        help="Cap on borrowers triaged via getUserAccountData (default 1500).",
+    )
+    parser.add_argument(
+        "--max-users",
+        type=int,
+        default=300,
+        help="Cap on at-risk positions written to the snapshot (default 300).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -915,10 +1232,56 @@ def main() -> int:
             return 1
 
         pool_address = args.pool_address or pool_cfg.get("pool") or "0x0000000000000000000000000000000000000000"
+        oracle_address = args.oracle or pool_cfg.get("oracle") or DEFAULT_ORACLES.get(args.chain)
+        if not oracle_address:
+            logger.error("No Aave oracle for %s; pass --oracle", args.chain)
+            return 1
 
         reserves = fetch_reserves(w3, pool_address, data_provider)
         reserve_addrs = [r.address for r in reserves]
-        positions = fetch_user_positions(w3, pool_address, data_provider, reserve_addrs)
+
+        # Enrich reserves with live oracle prices (detector HF math needs them).
+        prices = fetch_oracle_prices(w3, oracle_address, reserve_addrs)
+        for r in reserves:
+            r.price_usd = prices.get(r.address, 0.0)
+
+        # Reserve index map for de-scaling aToken collateral balances.
+        reserve_index = {
+            r.address: {
+                "liquidity_index": r.liquidity_index,
+                "variable_borrow_index": r.variable_borrow_index,
+            }
+            for r in reserves
+        }
+
+        # Separate RPC for the getLogs scan (see PUBLIC_LOGS_RPC). "primary"
+        # forces the main RPC; an explicit URL overrides; default = public.
+        logs_w3 = None
+        if args.logs_rpc == "primary":
+            logs_w3 = None
+        else:
+            logs_url = args.logs_rpc or PUBLIC_LOGS_RPC.get(args.chain)
+            if logs_url:
+                try:
+                    logs_w3 = get_w3(args.chain, logs_url)
+                    logger.info("Borrow scan will use logs RPC: %s", _redact(logs_url))
+                except Exception as exc:  # noqa: BLE001 - fall back to primary
+                    logger.warning("logs RPC unavailable (%s); using primary for getLogs", exc)
+                    logs_w3 = None
+
+        positions = fetch_user_positions(
+            w3,
+            pool_address,
+            data_provider,
+            reserve_addrs,
+            reserve_index=reserve_index,
+            logs_w3=logs_w3,
+            scan_blocks=args.scan_blocks,
+            log_chunk=args.log_chunk,
+            hf_max=args.hf_max,
+            max_candidates=args.max_candidates,
+            max_users=args.max_users,
+        )
 
         # Validate live snapshot before writing.
         val_errors = _validate_live_snapshot(reserves, positions)

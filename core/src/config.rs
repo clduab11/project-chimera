@@ -862,6 +862,24 @@ pub struct RiskConfig {
     pub audit_max_contracts_per_day: u32,
     /// Minimum severity to treat a bounty finding as blocking (e.g. "MEDIUM").
     pub bounty_min_severity: String,
+    /// Minimum seconds between live oracle repricings of the detector snapshot.
+    /// One batched eth_call per refresh regardless of reserve count; consecutive
+    /// failures stretch the interval exponentially (capped at max(60, interval)).
+    #[serde(default = "default_price_refresh_secs")]
+    pub price_refresh_secs: u64,
+    /// Live-price age (seconds) past which detection is considered degraded:
+    /// shadow mode warns; live mode skips candidate emission for the scan
+    /// (stale prices produce false candidates, which cost real gas when live).
+    #[serde(default = "default_price_max_stale_secs")]
+    pub price_max_stale_secs: u64,
+}
+
+fn default_price_refresh_secs() -> u64 {
+    8
+}
+
+fn default_price_max_stale_secs() -> u64 {
+    300
 }
 
 impl Default for RiskConfig {
@@ -878,6 +896,8 @@ impl Default for RiskConfig {
             sequencer_stall_ms: 500,
             audit_max_contracts_per_day: 50,
             bounty_min_severity: "MEDIUM".into(),
+            price_refresh_secs: default_price_refresh_secs(),
+            price_max_stale_secs: default_price_max_stale_secs(),
         }
     }
 }
@@ -910,6 +930,18 @@ impl RiskConfig {
         if self.simulation_timeout_ms == 0 {
             return Err(ChimeraError::ConfigError(
                 "risk.yaml simulation_timeout_ms must be > 0".into(),
+            ));
+        }
+        if self.price_refresh_secs == 0 {
+            return Err(ChimeraError::ConfigError(
+                "risk.yaml price_refresh_secs must be > 0".into(),
+            ));
+        }
+        if self.price_max_stale_secs < self.price_refresh_secs {
+            return Err(ChimeraError::ConfigError(
+                "risk.yaml price_max_stale_secs must be >= price_refresh_secs \
+                 (a staleness bound below the refresh interval always trips)"
+                    .into(),
             ));
         }
         Ok(())

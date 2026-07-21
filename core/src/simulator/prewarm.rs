@@ -351,14 +351,10 @@ pub fn pre_warm_db<ExtDB: revm::database_interface::DatabaseRef>(
             let _ = db.insert_account_storage(snapshot.pool, base + U256::from(3), offset3);
         }
 
-        // Legacy price warming (kept for backward compatibility).
-        let price_slot = keccak256(reserve.address.as_slice());
-        let _ = db.insert_account_storage(
-            Address::ZERO,
-            price_slot.into(),
-            U256::from((reserve.price_usd * 1e8) as u128),
-        );
-        println!("[simulator] Pre-warmed price for {}", reserve.symbol);
+        // NOTE: prices are deliberately NOT prewarmed. Simulated liquidationCall
+        // executions read the Aave oracle's real storage (fetched live on first
+        // touch via AlloyDB); a price slot written to Address::ZERO was dead
+        // state no contract ever read.
     }
 
     println!("[simulator] Pre-warming complete.");
@@ -497,8 +493,9 @@ mod tests {
         // For each reserve we expect:
         //   - aToken account with 1 balance slot
         //   - variableDebtToken account with 1 balance slot
-        //   - Pool account with 4 reserve data slots + 1 price slot (at Address::ZERO)
-        // Total distinct contract accounts touched: aToken, debtToken, Pool, Address::ZERO
+        //   - Pool account with 4 reserve data slots
+        // Prices are NOT prewarmed: simulated calls read the real Aave oracle
+        // storage (fetched live on first touch).
 
         let a_token_account = db.cache.accounts.get(&snapshot.reserves[0].a_token);
         assert!(
@@ -572,10 +569,11 @@ mod tests {
             | U256::from(snapshot.reserves[0].last_update_timestamp);
         assert_eq!(*stored_offset3, expected_offset3, "offset 3 pack mismatch");
 
-        let price_account = db.cache.accounts.get(&Address::ZERO);
+        // The legacy Address::ZERO price placeholder must NOT be written: it was
+        // dead state no contract read, and it confused sim-freshness audits.
         assert!(
-            price_account.is_some(),
-            "Price oracle placeholder account should be pre-warmed"
+            db.cache.accounts.get(&Address::ZERO).is_none(),
+            "no dead price placeholder account may be pre-warmed"
         );
     }
 
@@ -654,12 +652,12 @@ mod tests {
                 !account.storage.contains_key(&debt_token_slot),
                 "debtToken storage slot should not be created"
             );
+            assert!(
+                account.storage.is_empty(),
+                "zero-token reserve must not warm any slot (incl. the removed \
+                 legacy price placeholder)"
+            );
         }
-        // Price slot is still inserted at Address::ZERO for backward compatibility.
-        assert!(
-            db.cache.accounts.contains_key(&Address::ZERO),
-            "Price slot should still be inserted at Address::ZERO"
-        );
     }
 
     #[test]

@@ -384,17 +384,14 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
                 .await;
         }
 
-        // Fetch actual liquidation bonus from on-chain reserve data (fallback to DEFAULT_LIQUIDATION_BONUS_BPS on RPC failure).
-        let bonus_bps = self.fetch_reserve_bonus(candidate.collateral_asset).await?;
-        let bonus_multiplier = U256::from(bonus_bps); // 1e4 scale
-
-        // Edge case 2 (liquidation protocol fee): Aave V3 takes a protocol fee on the
-        // BONUS portion of a liquidation. Fetch it from the packed reserve config (bits
-        // 152-167); fall back to 0 bps on RPC failure (no fee = conservative for "is it
-        // profitable", since it overstates our net profit only when the fee is unknown).
-        let protocol_fee_bps = self
-            .fetch_reserve_protocol_fee(candidate.collateral_asset)
+        // Fetch liquidation bonus + protocol fee from the SAME packed reserve
+        // configuration in one getReserveData call (previously two identical RPCs).
+        // Edge case 2 (liquidation protocol fee): Aave V3 takes a protocol fee on
+        // the BONUS portion of a liquidation (config bits 152-167).
+        let (bonus_bps, protocol_fee_bps) = self
+            .fetch_reserve_liquidation_params(candidate.collateral_asset)
             .await?;
+        let bonus_multiplier = U256::from(bonus_bps); // 1e4 scale
 
         // Profit in debt units: (liquidatedCollateral * bonus_bps / 10000) - actualDebtCovered
         let gross_bonus = liquidated_collateral * bonus_multiplier / U256::from(10000);
@@ -472,40 +469,28 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         Ok((estimated_profit, profit_usd))
     }
 
-    /// Fetch the liquidation bonus (in basis points, 1e4 scale) for a reserve from on-chain data.
-    /// Falls back to `DEFAULT_LIQUIDATION_BONUS_BPS` if the RPC call fails.
-    async fn fetch_reserve_bonus(&self, collateral: Address) -> Result<u16, ChimeraError> {
+    /// Fetch the liquidation bonus and protocol fee (both basis points, 1e4
+    /// scale) for a reserve from the SAME packed on-chain configuration word in
+    /// one `getReserveData` call. Falls back to the default bonus + 0 fee on RPC
+    /// failure (no fee = conservative only in the sense that the fee is unknown).
+    async fn fetch_reserve_liquidation_params(
+        &self,
+        collateral: Address,
+    ) -> Result<(u16, u16), ChimeraError> {
         let contract = IAavePool::new(self.aave_pool, &*self.provider);
         match contract.getReserveData(collateral).call().await {
-            Ok(result) => {
-                let bonus = parse_liquidation_bonus(result.configuration);
-                Ok(bonus)
-            }
+            Ok(result) => Ok((
+                parse_liquidation_bonus(result.configuration),
+                parse_protocol_fee(result.configuration),
+            )),
             Err(e) => {
                 tracing::warn!(
-                    "getReserveData RPC failed for {}: {}, using default bonus {}",
+                    "getReserveData RPC failed for {}: {}, using default bonus {} + 0 bps fee",
                     collateral,
                     e,
                     DEFAULT_LIQUIDATION_BONUS_BPS
                 );
-                Ok(DEFAULT_LIQUIDATION_BONUS_BPS)
-            }
-        }
-    }
-
-    /// Fetch the liquidation protocol fee (in basis points, 1e4 scale) for a reserve from
-    /// on-chain data. Falls back to `0` if the RPC call fails (no fee subtracted).
-    async fn fetch_reserve_protocol_fee(&self, collateral: Address) -> Result<u16, ChimeraError> {
-        let contract = IAavePool::new(self.aave_pool, &*self.provider);
-        match contract.getReserveData(collateral).call().await {
-            Ok(result) => Ok(parse_protocol_fee(result.configuration)),
-            Err(e) => {
-                tracing::warn!(
-                    "getReserveData RPC failed for {} (protocol fee): {}, using 0 bps",
-                    collateral,
-                    e
-                );
-                Ok(0)
+                Ok((DEFAULT_LIQUIDATION_BONUS_BPS, 0))
             }
         }
     }

@@ -472,12 +472,14 @@ impl LiquidationDetector {
         close_factor.min(max_position_debt)
     }
 
-    /// Select the collateral asset with the highest liquidation bonus.
-    /// A higher bonus = more profit for the liquidator.
+    /// Select the collateral asset with the highest USD-weighted liquidation
+    /// bonus (seizable balance value × bonus). A higher bonus on more valuable
+    /// collateral = more profit for the liquidator.
     fn select_best_collateral(
         &self,
         collateral: &HashMap<Address, U256>,
     ) -> Option<(Address, U256)> {
+        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
         collateral
             .iter()
             // Edge case 1: only seizable reserves (active && !frozen && !paused) are
@@ -490,13 +492,22 @@ impl LiquidationDetector {
                     .unwrap_or(false)
             })
             .map(|(&asset, balance)| {
-                let bonus_bps = self
+                // Weight by the USD value of the balance, not raw token units:
+                // raw units let an 18-dec asset dominate a 6/8-dec asset by
+                // 10^10-10^12 regardless of actual value. Same normalization as
+                // calculate_user_account_data (scaled × index / RAY, then price
+                // over assetUnit).
+                let weighted = self
                     .snapshot
                     .reserves
                     .get(&asset)
-                    .map(|r| r.liquidation_bonus_bps as u64)
-                    .unwrap_or(0);
-                (asset, *balance * U256::from(bonus_bps))
+                    .map(|r| {
+                        let current_balance = *balance * r.liquidity_index / ray;
+                        let balance_usd = current_balance * r.price_usd / pow10(r.decimals);
+                        balance_usd * U256::from(r.liquidation_bonus_bps)
+                    })
+                    .unwrap_or(U256::ZERO);
+                (asset, weighted)
             })
             .max_by_key(|(_, weighted_bonus)| *weighted_bonus)
             .map(|(asset, _)| (asset, *collateral.get(&asset).unwrap_or(&U256::ZERO)))
@@ -731,6 +742,51 @@ mod tests {
             emode_liquidation_bonus_bps: 0,
             siloed_borrowing: false,
         }
+    }
+
+    /// Regression: `select_best_collateral` must weight by USD value × bonus,
+    /// not raw token units. Raw units let an 18-dec asset with trivial value
+    /// (here $10 of JUNK = 1e19 raw units) dominate a 6-dec asset worth far
+    /// more ($5000 of USDC = 5e9 raw units) by ~10 orders of magnitude.
+    #[test]
+    fn test_best_collateral_weighted_by_usd_value_not_raw_units() {
+        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+        let junk = Address::from_str("0x000000000000000000000000000000000000aaaa").unwrap();
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7b").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(junk, test_reserve(18, 100_000_000, ray, ray, 8000)); // $1.00, 18-dec
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray, ray, 8000)); // $1.00, 6-dec
+        snap.reserves
+            .insert(weth, test_reserve(18, 250_000_000_000, ray, ray, 8250)); // $2500 debt asset
+        snap.users.insert(
+            user,
+            UserPosition {
+                collateral: HashMap::from([
+                    // $10 of JUNK: 10e18 raw units.
+                    (junk, U256::from(10_000_000_000_000_000_000u128)),
+                    // $5000 of USDC: 5000e6 raw units.
+                    (usdc, U256::from(5_000_000_000u128)),
+                ]),
+                // 1.6 WETH debt ($4000) → HF ≈ 0.99: liquidatable, not bad debt.
+                debt: HashMap::from([(weth, U256::from(1_600_000_000_000_000_000u128))]),
+                emode_category: 0,
+                is_in_isolation: false,
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let candidates = detector.find_at_risk_positions();
+        assert!(!candidates.is_empty(), "position must be liquidatable");
+        assert_eq!(
+            candidates[0].collateral_asset, usdc,
+            "must seize the $5000 USDC, not the $10 of 18-dec JUNK \
+             (raw-unit weighting would pick JUNK by ~10 orders of magnitude)"
+        );
     }
 
     /// Regression: a mixed-decimal position (18-dec WETH collateral, 6-dec USDC

@@ -500,7 +500,6 @@ impl LiquidationDetector {
     ) -> (U256, U256, U256, U256) {
         let _ = user; // retained for symmetry/logging; not used in the math itself
         let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
-        const USD_DECIMALS_SHIFT: u64 = 10u64.pow(8); // oracle prices are 8-decimal
 
         let mut total_collateral_usd: U256 = U256::ZERO; // RAY scaled collateral value
         let mut total_debt_usd: U256 = U256::ZERO; // RAY scaled debt value
@@ -539,12 +538,16 @@ impl LiquidationDetector {
                     continue;
                 }
 
-                // Convert RAY-scaled balance to USD:
-                // balance_ray * liquidity_index_ray / RAY / RAY * price_usd_8dec / USD_DECIMALS_SHIFT
-                // = (scaled_balance * liquidity_index) / RAY * price / USD_DECIMALS_SHIFT
-                let balance_usd = *scaled_balance * reserve.liquidity_index / ray
-                    * reserve.price_usd
-                    / U256::from(USD_DECIMALS_SHIFT);
+                // Aave GenericLogic._getUserBalanceInBaseCurrency:
+                //   balanceInBaseCurrency = (assetPrice * currentBalance) / assetUnit
+                // where currentBalance = scaled * liquidity_index / RAY (native token
+                // units) and assetUnit = 10^decimals. Dividing by assetUnit — NOT a
+                // fixed 1e8 — is what converts native-unit balances to whole tokens
+                // before pricing. Omitting it mis-scales HF by 10^(coll_dec - debt_dec)
+                // for any mixed-decimal position (18-dec WETH collateral vs 6-dec USDC
+                // debt is the dominant Base shape). Result is 8-decimal USD.
+                let current_balance = *scaled_balance * reserve.liquidity_index / ray;
+                let balance_usd = current_balance * reserve.price_usd / pow10(reserve.decimals);
 
                 total_collateral_usd += balance_usd;
 
@@ -569,9 +572,9 @@ impl LiquidationDetector {
         // Debt loop
         for (asset, scaled_debt) in &position.debt {
             if let Some(reserve) = self.snapshot.reserves.get(asset) {
-                let debt_usd = *scaled_debt * reserve.variable_borrow_index / ray
-                    * reserve.price_usd
-                    / U256::from(USD_DECIMALS_SHIFT);
+                // Same assetUnit (10^decimals) normalization as collateral above.
+                let current_debt = *scaled_debt * reserve.variable_borrow_index / ray;
+                let debt_usd = current_debt * reserve.price_usd / pow10(reserve.decimals);
 
                 total_debt_usd += debt_usd;
             }
@@ -608,6 +611,16 @@ impl LiquidationDetector {
 /// never count it toward the position's seizable value.
 fn is_seizable_collateral(reserve: &ReserveData) -> bool {
     reserve.active && !reserve.frozen && !reserve.paused
+}
+
+/// `10^exp` as [`U256`] — an asset's `assetUnit` (Aave decimals ≤ 18). `decimals`
+/// is a `u8`; a pathological value above 10^77 overflows U256 and falls back to
+/// `U256::MAX`, which drives that asset's USD value to ~0 (conservatively excluded)
+/// rather than panicking on a malformed snapshot.
+fn pow10(exp: u8) -> U256 {
+    U256::from(10u64)
+        .checked_pow(U256::from(exp))
+        .unwrap_or(U256::MAX)
 }
 
 #[cfg(test)]
@@ -667,6 +680,118 @@ mod tests {
         assert_eq!(reserve.liquidation_bonus_bps, 10500);
         // 3500.0 USD * 1e8 (8-decimal oracle convention)
         assert_eq!(reserve.price_usd, U256::from(350_000_000_000u128));
+    }
+
+    /// Build a minimal seizable reserve for HF tests.
+    #[allow(clippy::too_many_arguments)]
+    fn test_reserve(
+        decimals: u8,
+        price_8dec: u128,
+        liquidity_index: U256,
+        variable_borrow_index: U256,
+        lt_bps: u16,
+    ) -> ReserveData {
+        ReserveData {
+            a_token: Address::from_str("0x00000000000000000000000000000000000a1111").unwrap(),
+            variable_debt_token: Address::from_str("0x00000000000000000000000000000000000d2222")
+                .unwrap(),
+            liquidity_index,
+            variable_borrow_index,
+            liquidation_bonus_bps: 10500,
+            liquidation_threshold_bps: lt_bps,
+            price_usd: U256::from(price_8dec),
+            decimals,
+            is_isolated: false,
+            debt_ceiling: U256::ZERO,
+            e_mode_category: 0,
+            active: true,
+            frozen: false,
+            paused: false,
+            liquidation_protocol_fee_bps: 1000,
+            emode_liquidation_threshold_bps: 0,
+            emode_liquidation_bonus_bps: 0,
+            siloed_borrowing: false,
+        }
+    }
+
+    /// Regression: a mixed-decimal position (18-dec WETH collateral, 6-dec USDC
+    /// debt — the dominant Base shape) must compute a correct health factor. The
+    /// prior code divided by a fixed 1e8 instead of each asset's 10^decimals, so
+    /// HF was inflated by 10^(18-6)=10^12 and every such underwater position was
+    /// silently dropped by the `hf < threshold` pre-filter. There was NO test that
+    /// exercised calculate_user_account_data end-to-end, so the bug was dormant.
+    #[test]
+    fn test_hf_mixed_decimals_weth_collateral_usdc_debt() {
+        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7a").unwrap();
+
+        let mut snap = make_snapshot();
+        // RAY indices → scaled balance == current balance, isolating the decimals math.
+        snap.reserves
+            .insert(weth, test_reserve(18, 250_000_000_000, ray, ray, 8250)); // $2500, LT 82.5%
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray, ray, 8000)); // $1.00
+        snap.users.insert(
+            user,
+            UserPosition {
+                // 2 WETH collateral ($5000), 4500 USDC debt ($4500).
+                collateral: HashMap::from([(weth, U256::from(2_000_000_000_000_000_000u128))]),
+                debt: HashMap::from([(usdc, U256::from(4_500_000_000u128))]),
+                emode_category: 0,
+                is_in_isolation: false,
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let candidates = detector.find_at_risk_positions();
+
+        // True HF = (5000 * 0.825) / 4500 = 0.9167 → below the 1.05 threshold → flagged.
+        assert_eq!(candidates.len(), 1, "underwater mixed-decimal position must be flagged");
+        let c = &candidates[0];
+        assert_eq!(c.user, user);
+        // HF ≈ 0.9167e27; the pre-fix bug would yield ~0.9167e39 (10^12 too high).
+        let lo = U256::from(915_000_000_000_000_000_000_000_000u128); // 0.915e27
+        let hi = U256::from(918_000_000_000_000_000_000_000_000u128); // 0.918e27
+        assert!(
+            c.current_hf >= lo && c.current_hf <= hi,
+            "HF must be ~0.9167e27, got {}",
+            c.current_hf
+        );
+    }
+
+    /// A healthy mixed-decimal position (HF well above threshold) must NOT be
+    /// flagged — guards against the inverse error (HF scaled 10^12 too low, which
+    /// would emit every healthy position as a false candidate).
+    #[test]
+    fn test_hf_mixed_decimals_healthy_not_flagged() {
+        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7a").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(weth, test_reserve(18, 250_000_000_000, ray, ray, 8250));
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray, ray, 8000));
+        snap.users.insert(
+            user,
+            UserPosition {
+                // 2 WETH collateral ($5000) vs only 1000 USDC debt ($1000) → HF ≈ 4.1.
+                collateral: HashMap::from([(weth, U256::from(2_000_000_000_000_000_000u128))]),
+                debt: HashMap::from([(usdc, U256::from(1_000_000_000u128))]),
+                emode_category: 0,
+                is_in_isolation: false,
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        assert!(
+            detector.find_at_risk_positions().is_empty(),
+            "healthy position must not be flagged"
+        );
     }
 
     #[test]

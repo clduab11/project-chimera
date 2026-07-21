@@ -196,8 +196,11 @@ fn make_at_risk_snapshot() -> MarketSnapshot {
     let users: HashMap<Address, UserPosition> = vec![(
         USER,
         user_position(
+            // 1 WETH collateral ($3400) vs 2900 USDC debt. USDC is 6-decimal, so
+            // 2900 USDC = 2_900 * 1e6. (The amounts must match each reserve's
+            // decimals: the detector normalizes balances by 10^decimals.)
             vec![(*COLL_WETH.as_ref(), 1_000_000_000_000_000_000u128)],
-            vec![(*DEBT_USDC.as_ref(), 2_900_000_000_000_000_000_000u128)],
+            vec![(*DEBT_USDC.as_ref(), 2_900_000_000u128)],
             0,
             false,
         ),
@@ -235,8 +238,9 @@ fn make_multi_user_snapshot() -> MarketSnapshot {
         (
             USER,
             user_position(
+                // 1 WETH ($3400) vs 2900 USDC (6-decimal) debt → HF ≈ 0.97.
                 vec![(*COLL_WETH.as_ref(), 1_000_000_000_000_000_000u128)],
-                vec![(*DEBT_USDC.as_ref(), 2_900_000_000_000_000_000_000u128)],
+                vec![(*DEBT_USDC.as_ref(), 2_900_000_000u128)],
                 0,
                 false,
             ),
@@ -244,8 +248,9 @@ fn make_multi_user_snapshot() -> MarketSnapshot {
         (
             USER2,
             user_position(
+                // 2 WETH ($6800) vs 5500 USDT (6-decimal) debt → HF ≈ 1.02.
                 vec![(*COLL_WETH.as_ref(), 2_000_000_000_000_000_000u128)],
-                vec![(*DEBT_USDT.as_ref(), 5_500_000_000_000_000_000_000u128)],
+                vec![(*DEBT_USDT.as_ref(), 5_500_000_000u128)],
                 0,
                 false,
             ),

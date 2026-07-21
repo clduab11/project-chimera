@@ -508,6 +508,12 @@ price_max_stale_secs: 300    # past this age: shadow warns; LIVE skips candidate
 
 No operator action needed; repricing pauses automatically while the emergency flag is active.
 
+Feed quarantine: after 5 consecutive batch failures the engine probes feeds individually and
+quarantines only those with dead-feed EVIDENCE (zero price or on-chain revert — transport
+errors like 429s never quarantine). Quarantined feeds keep their last price, are excluded from
+batches, and are re-admitted automatically after 10 minutes (or dropped when a reload removes
+the reserve). Watch `chimera_price_refresh_total{result="quarantined"}` for occurrences.
+
 ### 8.2 Discovery refresh (operator-scheduled, ~15 min cadence)
 
 Discovery of NEW at-risk borrowers requires regenerating `config/snapshot.json`. The engine

@@ -391,6 +391,14 @@ impl LiquidationDetector {
                 if let Some((collateral_asset, _)) =
                     self.select_best_collateral(&position.collateral)
                 {
+                    // Collateral reserve metadata for the simulator's USD profit
+                    // accounting (selection already guarantees the reserve exists).
+                    let (collateral_decimals, collateral_price_usd) = self
+                        .snapshot
+                        .reserves
+                        .get(&collateral_asset)
+                        .map(|r| (r.decimals, r.price_usd))
+                        .unwrap_or((18, U256::ZERO));
                     for debt_asset in position.debt.keys() {
                         // Debt reserve metadata for the simulator's USD profit
                         // conversion. A debt asset missing from the reserves map
@@ -414,6 +422,8 @@ impl LiquidationDetector {
                             bad_debt: false,
                             debt_decimals,
                             debt_price_usd,
+                            collateral_decimals,
+                            collateral_price_usd,
                         };
                         candidates.push(candidate);
                     }

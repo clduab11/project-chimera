@@ -56,10 +56,12 @@ pub async fn run_golden_replays<P: alloy::providers::Provider<Ethereum> + Clone 
             current_hf: U256::ZERO,
             chain_id: if report.chain == "base" { 8453 } else { 42161 },
             bad_debt: false,
-            // Historical replay records carry no reserve metadata; zero price makes
-            // the simulator use its legacy ETH-denominated fallback conversion.
+            // Historical replay records carry no reserve metadata; zero prices make
+            // the simulator use its estimate/fallback conversions.
             debt_decimals: 18,
             debt_price_usd: U256::ZERO,
+            collateral_decimals: 18,
+            collateral_price_usd: U256::ZERO,
         };
 
         let result: SimulationResult = simulator

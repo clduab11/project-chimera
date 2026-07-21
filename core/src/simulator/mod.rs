@@ -100,6 +100,13 @@ pub struct LiquidationCandidate {
     /// detector snapshot at emission time. Zero means "unknown" and makes the
     /// simulator fall back to the legacy 18-dec ETH-denominated conversion.
     pub debt_price_usd: U256,
+    /// Decimals of the collateral asset. Seized collateral is denominated in its
+    /// own native units; USD profit accounting needs both sides' units.
+    pub collateral_decimals: u8,
+    /// USD price of the collateral asset (8-decimal), captured at emission time.
+    /// Zero means "unknown" (e.g. golden replays) — the event-path profit then
+    /// falls back to a bonus-portion estimate on the debt side.
+    pub collateral_price_usd: U256,
 }
 
 /// Result of a full REVM simulation of a liquidation (or flash + liquidation bundle).
@@ -184,12 +191,19 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
     /// touch would freeze simulated prices. Called on every applied discovery
     /// reload; the cost is lazy refetch-on-miss at the next simulation.
     pub async fn rebuild_db(&mut self, path: &std::path::Path) -> Result<(), ChimeraError> {
+        // Build + prewarm into a LOCAL db and assign only on success, so any
+        // failure (transient file read race, parse error) truly keeps the
+        // previous DB — matching the orchestrator's recovery log.
+        let content = std::fs::read_to_string(path)?;
+        let snapshot: prewarm::MarketSnapshot = serde_json::from_str(&content)?;
         let alloy_db = AlloyDB::new((*self.provider).clone(), BlockId::latest());
         let wrapped_db = WrapDatabaseAsync::new(alloy_db).ok_or_else(|| {
             ChimeraError::SimulationFailed("tokio runtime is required for AlloyDB".into())
         })?;
-        self.db = CacheDB::new(wrapped_db);
-        self.load_snapshot(path).await
+        let mut db = CacheDB::new(wrapped_db);
+        prewarm::pre_warm_db(&mut db, &snapshot)?;
+        self.db = db;
+        Ok(())
     }
 
     /// High-fidelity simulation of an Aave V3 liquidationCall.
@@ -242,7 +256,7 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         let l1_data_fee = self.calculate_l1_data_fee(&calldata, current_l1_fee_scalar)?;
 
         // Extract profit from state diff (post-execution balance changes).
-        let (_profit_wei, profit_usd) = self
+        let (_net_bonus_native, profit_usd) = self
             .extract_profit_from_state(&result, candidate, &l1_data_fee, pacing)
             .await?;
 
@@ -352,8 +366,9 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         }
     }
 
-    /// Extract profit from post-execution state diff.
-    /// Computes: collateral_received * liquidation_bonus - debt_repaid - protocol_fees.
+    /// Extract profit from post-execution state diff, accounted in USD:
+    /// `usd(collateral seized) − usd(protocol cut) − usd(debt repaid)`.
+    /// Returns `(net bonus portion in COLLATERAL native units, profit USD)`.
     /// Falls back to heuristic if delta extraction fails.
     async fn extract_profit_from_state(
         &self,
@@ -384,6 +399,29 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
                 .await;
         }
 
+        // Both event amounts are in DIFFERENT native units: liquidatedCollateralAmount
+        // in collateral-asset units, actualDebtToCover in debt-asset units. They can
+        // only be combined in USD — subtracting them in native units produced garbage
+        // for every mixed-decimal pair (and double-subtracted principal for same-asset
+        // pairs). Without BOTH prices we cannot do USD accounting (a zero-priced leg
+        // would silently value that side at $0); estimate as the bonus portion of the
+        // repaid debt instead (same shape as the heuristic).
+        if candidate.collateral_price_usd.is_zero() || candidate.debt_price_usd.is_zero() {
+            tracing::warn!(
+                target: "chimera::simulator",
+                collateral_asset = %candidate.collateral_asset,
+                debt_asset = %candidate.debt_asset,
+                "Price(s) unknown; estimating event profit as debt bonus portion"
+            );
+            let (bonus_bps, _) = self
+                .fetch_reserve_liquidation_params(candidate.collateral_asset)
+                .await?;
+            let portion_bps = U256::from(u32::from(bonus_bps.max(10_000)) - 10_000);
+            let estimated = actual_debt_covered * portion_bps / U256::from(10_000);
+            let profit_usd = self.debt_units_to_usd(estimated, candidate).await?;
+            return Ok((estimated, profit_usd));
+        }
+
         // Fetch liquidation bonus + protocol fee from the SAME packed reserve
         // configuration in one getReserveData call (previously two identical RPCs).
         // Edge case 2 (liquidation protocol fee): Aave V3 takes a protocol fee on
@@ -391,27 +429,14 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         let (bonus_bps, protocol_fee_bps) = self
             .fetch_reserve_liquidation_params(candidate.collateral_asset)
             .await?;
-        let bonus_multiplier = U256::from(bonus_bps); // 1e4 scale
 
-        // Profit in debt units: (liquidatedCollateral * bonus_bps / 10000) - actualDebtCovered
-        let gross_bonus = liquidated_collateral * bonus_multiplier / U256::from(10000);
-        // `profit_in_collateral` is the bonus over the repaid base, i.e. the bonus portion.
-        let profit_in_collateral = gross_bonus.saturating_sub(liquidated_collateral);
-        // Protocol fee is assessed on the bonus portion: net = bonus - bonus * fee / 10000.
-        let protocol_cut = profit_in_collateral * U256::from(protocol_fee_bps) / U256::from(10000);
-        let net_profit_in_collateral = profit_in_collateral.saturating_sub(protocol_cut);
-        let profit_in_debt = if actual_debt_covered > net_profit_in_collateral {
-            U256::ZERO
-        } else {
-            net_profit_in_collateral - actual_debt_covered
-        };
-
-        // Profit is denominated in native debt-asset units; convert with the debt
-        // asset's own decimals + price (a 6-dec USDC profit divided by 1e18 and
-        // priced as ETH understates by ~12 orders of magnitude).
-        let profit_usd = self.debt_units_to_usd(profit_in_debt, candidate).await?;
-
-        Ok((profit_in_debt, profit_usd))
+        Ok(event_profit_usd_known_prices(
+            liquidated_collateral,
+            actual_debt_covered,
+            bonus_bps,
+            protocol_fee_bps,
+            candidate,
+        ))
     }
 
     /// Convert an amount in native debt-asset units to USD (f64, internal-only per
@@ -543,6 +568,54 @@ fn checked_u256_to_u64(v: U256) -> Result<u64, ChimeraError> {
 fn checked_u256_to_u128(v: U256) -> Result<u128, ChimeraError> {
     u128::try_from(v)
         .map_err(|_| ChimeraError::ConversionError(format!("U256 value {v} exceeds u128::MAX")))
+}
+
+/// Convert an amount in an asset's native units to USD (f64, internal-only per
+/// invariant #3) using that asset's decimals and 8-decimal oracle price.
+fn asset_units_to_usd(amount: U256, decimals: u8, price_usd_8dec: U256) -> f64 {
+    let asset_unit = 10f64.powi(i32::from(decimals));
+    let price = checked_u256_to_f64(price_usd_8dec) / 1e8;
+    checked_u256_to_f64(amount) / asset_unit * price
+}
+
+/// Event-path profit with both prices known, accounted in USD:
+/// `usd(seized collateral) − usd(protocol cut) − usd(debt repaid)`.
+///
+/// The two event amounts live in DIFFERENT native units (collateral vs debt) and
+/// may only be combined in USD. The protocol cut is estimated on the bonus
+/// portion of the seizure (`seized − seized×10000/bonus_bps`) — conservative:
+/// the event amount may already exclude the fee, so subtracting it again only
+/// understates profit. Returns `(net bonus portion in COLLATERAL units, profit USD)`;
+/// the USD value can be negative for an unprofitable liquidation.
+fn event_profit_usd_known_prices(
+    liquidated_collateral: U256,
+    actual_debt_covered: U256,
+    bonus_bps: u16,
+    protocol_fee_bps: u16,
+    candidate: &LiquidationCandidate,
+) -> (U256, f64) {
+    let bonus_divisor = U256::from(u32::from(bonus_bps.max(10_000)));
+    let principal_equiv = liquidated_collateral * U256::from(10_000) / bonus_divisor;
+    let bonus_portion = liquidated_collateral.saturating_sub(principal_equiv);
+    let protocol_cut = bonus_portion * U256::from(protocol_fee_bps) / U256::from(10_000);
+    let net_bonus_in_collateral = bonus_portion.saturating_sub(protocol_cut);
+
+    let seized_usd = asset_units_to_usd(
+        liquidated_collateral,
+        candidate.collateral_decimals,
+        candidate.collateral_price_usd,
+    );
+    let cut_usd = asset_units_to_usd(
+        protocol_cut,
+        candidate.collateral_decimals,
+        candidate.collateral_price_usd,
+    );
+    let debt_usd = asset_units_to_usd(
+        actual_debt_covered,
+        candidate.debt_decimals,
+        candidate.debt_price_usd,
+    );
+    (net_bonus_in_collateral, seized_usd - cut_usd - debt_usd)
 }
 
 /// Safely converts U256 to f64 without panic on overflow.
@@ -681,6 +754,8 @@ mod tests {
             bad_debt: false,
             debt_decimals: 18,
             debt_price_usd: U256::from(3_500u64) * U256::from(100_000_000u64), // $3500, 8-dec
+            collateral_decimals: 18,
+            collateral_price_usd: U256::from(3_500u64) * U256::from(100_000_000u64),
         };
         let result = sim
             .simulate_liquidation(
@@ -731,7 +806,87 @@ mod tests {
             bad_debt: false,
             debt_decimals,
             debt_price_usd,
+            collateral_decimals: 18,
+            collateral_price_usd: U256::ZERO,
         }
+    }
+
+    /// Adversarial-review regression: event-path profit must be accounted in USD
+    /// per asset — the old math subtracted debt-unit principal from a
+    /// collateral-unit bonus and (post-B2) scaled the mix by debt decimals,
+    /// overstating the dominant WETH-collateral/USDC-debt shape by ~4e8x.
+    #[test]
+    fn event_profit_usd_weth_collateral_usdc_debt() {
+        // WETH $2500 (18-dec) collateral, USDC $1.00 (6-dec) debt.
+        let mut c = candidate_with_debt(6, U256::from(100_000_000u64));
+        c.collateral_decimals = 18;
+        c.collateral_price_usd = U256::from(2_500u64) * U256::from(100_000_000u64);
+        // Repaid 1000 USDC; seized 0.42 WETH ($1050) at 5% bonus, 10% protocol fee.
+        // principal_equiv = 0.4 WETH; bonus = 0.02 WETH ($50); cut = $5.
+        // profit = 1050 − 5 − 1000 = $45.
+        let (net_bonus, usd) = event_profit_usd_known_prices(
+            U256::from(420_000_000_000_000_000u128), // 0.42 WETH
+            U256::from(1_000_000_000u64),            // 1000 USDC
+            10_500,
+            1_000,
+            &c,
+        );
+        assert!((usd - 45.0).abs() < 0.01, "expected ≈$45, got {usd}");
+        assert_eq!(net_bonus, U256::from(18_000_000_000_000_000u128)); // 0.018 WETH
+    }
+
+    /// Reverse shape (6-dec collateral, 18-dec debt): the old math saturated this
+    /// to $0 and discarded genuinely profitable liquidations.
+    #[test]
+    fn event_profit_usd_usdc_collateral_weth_debt() {
+        let mut c = candidate_with_debt(18, U256::from(2_500u64) * U256::from(100_000_000u64));
+        c.collateral_decimals = 6;
+        c.collateral_price_usd = U256::from(100_000_000u64); // $1.00
+        // Repaid 0.4 WETH ($1000); seized 1050 USDC ($1050); no protocol fee.
+        let (_, usd) = event_profit_usd_known_prices(
+            U256::from(1_050_000_000u64),            // 1050 USDC
+            U256::from(400_000_000_000_000_000u128), // 0.4 WETH
+            10_500,
+            0,
+            &c,
+        );
+        assert!((usd - 50.0).abs() < 0.01, "expected ≈$50, got {usd}");
+    }
+
+    /// Same-asset pair: USD accounting must NOT double-subtract principal (old
+    /// math subtracted debt from a quantity already net of principal → always $0).
+    #[test]
+    fn event_profit_usd_same_asset_pair() {
+        let mut c = candidate_with_debt(18, U256::from(2_500u64) * U256::from(100_000_000u64));
+        c.collateral_decimals = 18;
+        c.collateral_price_usd = U256::from(2_500u64) * U256::from(100_000_000u64);
+        // Repaid 0.4 WETH ($1000); seized 0.42 WETH ($1050); no fee → $50 profit.
+        let (_, usd) = event_profit_usd_known_prices(
+            U256::from(420_000_000_000_000_000u128),
+            U256::from(400_000_000_000_000_000u128),
+            10_500,
+            0,
+            &c,
+        );
+        assert!((usd - 50.0).abs() < 0.01, "expected ≈$50, got {usd}");
+    }
+
+    /// A liquidation seized at a worse price than repaid must report NEGATIVE
+    /// profit, not saturate to zero-but-profitable.
+    #[test]
+    fn event_profit_usd_can_be_negative() {
+        let mut c = candidate_with_debt(6, U256::from(100_000_000u64));
+        c.collateral_decimals = 18;
+        c.collateral_price_usd = U256::from(2_500u64) * U256::from(100_000_000u64);
+        // Repaid 1100 USDC but seized only 0.42 WETH ($1050): −$50.
+        let (_, usd) = event_profit_usd_known_prices(
+            U256::from(420_000_000_000_000_000u128),
+            U256::from(1_100_000_000u64),
+            10_500,
+            0,
+            &c,
+        );
+        assert!(usd < -49.0 && usd > -51.0, "expected ≈−$50, got {usd}");
     }
 
     /// B2 regression: profit in 6-dec USDC units must convert to a sane USD value.

@@ -33,7 +33,9 @@ use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 /// Consecutive whole-batch reprice failures before a per-asset isolation pass
-/// runs to identify (and quarantine) dead price feeds.
+/// runs to identify (and quarantine) dead price feeds. The pass re-runs on every
+/// further multiple (10th, 15th, …) so a dead feed re-admitted by a discovery
+/// reload is re-identified without hammering the RPC on every failure.
 const QUARANTINE_AFTER_FAILURES: u64 = 5;
 /// Minimum seconds between repeated reprice/reload failure warns (mirrors the
 /// pacing engine's oracle-warn rate limiting).
@@ -41,6 +43,18 @@ const WARN_INTERVAL_SECS: u64 = 60;
 /// Backoff cap: consecutive failures stretch the reprice interval by up to 2^3,
 /// bounded by max(60, configured interval).
 const MAX_BACKOFF_SHIFT: u64 = 3;
+/// Hard deadline on the batched reprice eth_call. The tick runs inline in the
+/// scan loop, and the emergency flag is only polled between scans — a hung RPC
+/// endpoint must never stall the loop for the transport's default timeout.
+const BATCH_TIMEOUT_SECS: u64 = 5;
+/// Per-probe deadline inside the isolation pass.
+const PROBE_TIMEOUT_SECS: u64 = 2;
+/// Whole-isolation-pass budget; assets not probed before it expires simply stay
+/// unquarantined until a later pass.
+const ISOLATION_BUDGET_SECS: u64 = 8;
+/// Quarantined feeds are re-admitted to the batch after this long, so a feed
+/// that was only temporarily dead (or misjudged) self-heals.
+const QUARANTINE_TTL_SECS: u64 = 600;
 
 fn epoch_now() -> u64 {
     SystemTime::now()
@@ -147,7 +161,10 @@ pub struct SnapshotRefresher {
     consecutive_failures: AtomicU64,
     last_warn_epoch: AtomicU64,
     last_mtime: Mutex<Option<SystemTime>>,
-    quarantined: Mutex<HashSet<Address>>,
+    /// Dead price feeds excluded from the reprice batch, keyed to the epoch they
+    /// were quarantined (TTL re-admits them; a reload drops entries whose
+    /// reserves left the snapshot).
+    quarantined: Mutex<HashMap<Address, u64>>,
 }
 
 impl SnapshotRefresher {
@@ -181,7 +198,7 @@ impl SnapshotRefresher {
             consecutive_failures: AtomicU64::new(0),
             last_warn_epoch: AtomicU64::new(0),
             last_mtime: Mutex::new(boot_mtime),
-            quarantined: Mutex::new(HashSet::new()),
+            quarantined: Mutex::new(HashMap::new()),
         }
     }
 
@@ -204,7 +221,10 @@ impl SnapshotRefresher {
 
         let now = epoch_now();
         let mut repriced = false;
-        if self.reprice_due(now) {
+        // A reload FORCES a reprice: the file's prices are generation-age and may
+        // regress fresher live-repriced values; close that window immediately
+        // instead of waiting out the pacing interval.
+        if reloaded || self.reprice_due(now) {
             self.last_reprice_attempt_epoch.store(now, Ordering::Relaxed);
             repriced = self.reprice(metrics, chain_label).await;
         }
@@ -300,9 +320,22 @@ impl SnapshotRefresher {
                         }
                         let (users, reserves, block) =
                             (fresh.users.len(), fresh.reserves.len(), fresh.block_number);
+                        // The file's prices are generation-age: reset the price age
+                        // to the file's own timestamp so it never masquerades as
+                        // live-fresh (tick() then forces an immediate reprice).
+                        self.last_reprice_ok_epoch
+                            .store(fresh.timestamp.timestamp().max(0) as u64, Ordering::Relaxed);
+                        // Keep quarantine entries whose reserves still exist —
+                        // a known-dead feed stays quarantined across reloads (the
+                        // TTL provides the re-probe path); departed reserves drop.
+                        {
+                            let new_reserves: HashSet<Address> =
+                                fresh.reserves.keys().copied().collect();
+                            self.quarantined
+                                .lock()
+                                .retain(|asset, _| new_reserves.contains(asset));
+                        }
                         self.shared.replace(fresh);
-                        // New reserves may not overlap the old quarantine set.
-                        self.quarantined.lock().clear();
                         metrics.observe_snapshot_reload(chain_label, "applied");
                         info!(
                             target: "chimera::refresh",
@@ -333,39 +366,65 @@ impl SnapshotRefresher {
     }
 
     /// One batched price fetch, applied all-or-nothing (the batch is one atomic
-    /// eth_call, so applied prices are same-block consistent).
+    /// eth_call, so applied prices are same-block consistent). Deadline-bounded:
+    /// the tick runs inline in the scan loop, and a hung endpoint must not stall
+    /// scanning or emergency-flag polling.
     async fn reprice(&self, metrics: &Metrics, chain_label: &str) -> bool {
+        let now = epoch_now();
         let assets: Vec<Address> = {
-            let quarantined = self.quarantined.lock();
+            let mut quarantined = self.quarantined.lock();
+            // TTL: re-admit long-quarantined feeds so a temporarily-dead (or
+            // misjudged) feed self-heals via the normal batch path.
+            quarantined.retain(|_, since| now.saturating_sub(*since) < QUARANTINE_TTL_SECS);
             self.shared
                 .reserve_addresses()
                 .into_iter()
-                .filter(|a| !quarantined.contains(a))
+                .filter(|a| !quarantined.contains_key(a))
                 .collect()
         };
         if assets.is_empty() {
             return false;
         }
 
-        match self.price_source.get_prices_raw(&assets).await {
-            Ok(prices) if !prices.is_empty() => {
+        let batch = tokio::time::timeout(
+            std::time::Duration::from_secs(BATCH_TIMEOUT_SECS),
+            self.price_source.get_prices_raw(&assets),
+        )
+        .await;
+
+        match batch {
+            Ok(Ok(prices)) if !prices.is_empty() => {
                 let updated = self.shared.apply_prices(&prices);
                 self.mark_reprice_success(metrics, chain_label, updated);
                 true
             }
             other => {
-                if let Err(e) = other {
-                    if self.should_warn() {
-                        warn!(
+                if self.should_warn() {
+                    match &other {
+                        Ok(Err(e)) => warn!(
                             target: "chimera::refresh",
                             error = %e,
                             "Reserve reprice failed; retaining last prices"
-                        );
+                        ),
+                        Err(_) => warn!(
+                            target: "chimera::refresh",
+                            timeout_secs = BATCH_TIMEOUT_SECS,
+                            "Reserve reprice timed out; retaining last prices"
+                        ),
+                        Ok(Ok(_)) => warn!(
+                            target: "chimera::refresh",
+                            "Reserve reprice returned no prices; retaining last prices"
+                        ),
                     }
                 }
                 metrics.observe_price_refresh(chain_label, "error");
                 let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                if failures >= QUARANTINE_AFTER_FAILURES {
+                // Run the isolation pass on the 5th consecutive failure and every
+                // further multiple — bounded RPC amplification during outages,
+                // while a dead feed re-admitted by a reload is still re-identified.
+                if failures >= QUARANTINE_AFTER_FAILURES
+                    && failures.is_multiple_of(QUARANTINE_AFTER_FAILURES)
+                {
                     return self.isolate_and_quarantine(&assets, metrics, chain_label).await;
                 }
                 false
@@ -373,48 +432,76 @@ impl SnapshotRefresher {
         }
     }
 
-    /// After repeated whole-batch failures, probe each asset individually: healthy
-    /// feeds get their prices applied; dead feeds are quarantined (excluded from
-    /// future batches, stale price retained — the simulator gate rejects any
-    /// candidate touching an asset whose on-chain feed reverts). If EVERY probe
-    /// fails this is an RPC outage, not dead feeds — quarantine nothing.
+    /// After repeated whole-batch failures, probe each asset individually to find
+    /// dead feeds. Quarantine requires EVIDENCE of a dead feed — the oracle
+    /// returning zero/no price, or an on-chain revert. Transport failures (429s,
+    /// timeouts, connection errors) are NOT evidence and never quarantine: during
+    /// a partial RPC brownout the batch fails for reasons that have nothing to do
+    /// with feed health. Healthy probes' prices are applied (bounded mixed-epoch:
+    /// the pass runs under a deadline of a few seconds). Deadline-bounded overall;
+    /// unprobed assets simply stay unquarantined.
     async fn isolate_and_quarantine(
         &self,
         assets: &[Address],
         metrics: &Metrics,
         chain_label: &str,
     ) -> bool {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(ISOLATION_BUDGET_SECS);
         let mut healthy: HashMap<Address, U256> = HashMap::new();
         let mut dead: Vec<Address> = Vec::new();
         for asset in assets {
-            match self.price_source.get_prices_raw(std::slice::from_ref(asset)).await {
-                Ok(prices) if prices.values().any(|p| !p.is_zero()) => {
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    target: "chimera::refresh",
+                    budget_secs = ISOLATION_BUDGET_SECS,
+                    "Isolation pass budget exhausted; remaining assets left unprobed"
+                );
+                break;
+            }
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+                self.price_source.get_prices_raw(std::slice::from_ref(asset)),
+            )
+            .await;
+            match probe {
+                // Dead-feed evidence: the oracle answered with no usable price.
+                Ok(Ok(prices)) if prices.values().all(|p| p.is_zero()) => dead.push(*asset),
+                Ok(Ok(prices)) => {
                     healthy.extend(prices);
                 }
-                _ => dead.push(*asset),
+                // Dead-feed evidence: the call reverted on-chain.
+                Ok(Err(e)) if e.to_string().to_lowercase().contains("revert") => {
+                    dead.push(*asset)
+                }
+                // Transport failure or probe timeout: no evidence, no quarantine.
+                Ok(Err(_)) | Err(_) => {}
             }
         }
 
         if healthy.is_empty() {
-            // Whole-RPC outage: keep counting failures (backoff continues), touch nothing.
+            // Nothing priced: treat as an RPC outage regardless of probe shapes —
+            // keep counting failures (backoff continues), quarantine nothing.
             if self.should_warn() {
                 warn!(
                     target: "chimera::refresh",
                     probed = assets.len(),
-                    "Isolation pass: every probe failed (RPC outage); no quarantine"
+                    "Isolation pass priced nothing (RPC outage?); no quarantine"
                 );
             }
             return false;
         }
 
         if !dead.is_empty() {
+            let now = epoch_now();
             let mut quarantined = self.quarantined.lock();
             for asset in &dead {
-                quarantined.insert(*asset);
+                quarantined.insert(*asset, now);
             }
             warn!(
                 target: "chimera::refresh",
                 quarantined = ?dead,
+                ttl_secs = QUARANTINE_TTL_SECS,
                 "Quarantined dead price feeds (stale price retained, excluded from batches)"
             );
             metrics.observe_price_refresh(chain_label, "quarantined");
@@ -480,11 +567,13 @@ mod tests {
         snap
     }
 
+    /// Mirrors real getAssetsPrices semantics: a batch containing a dead feed
+    /// reverts wholesale; a single-asset probe for a dead feed returns no price
+    /// (zero omitted); the `fail` flag simulates a transport-level outage (429s,
+    /// timeouts) where NO call carries feed-health evidence.
     struct ScriptedSource {
-        /// Per-asset responses; assets absent here make any batch containing them fail.
         prices: Mutex<HashMap<Address, U256>>,
-        /// When true, batch calls (len > 1) always fail — isolates the quarantine path.
-        fail_batches: std::sync::atomic::AtomicBool,
+        fail: std::sync::atomic::AtomicBool,
     }
 
     impl ScriptedSource {
@@ -496,7 +585,7 @@ mod tests {
                         .map(|(a, p)| (*a, U256::from(*p)))
                         .collect(),
                 ),
-                fail_batches: std::sync::atomic::AtomicBool::new(false),
+                fail: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -507,21 +596,19 @@ mod tests {
             &self,
             assets: &[Address],
         ) -> Result<HashMap<Address, U256>, ChimeraError> {
-            if assets.len() > 1 && self.fail_batches.load(Ordering::Relaxed) {
-                return Err(ChimeraError::OracleError("batch reverted".into()));
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(ChimeraError::OracleError("429 too many requests".into()));
             }
             let prices = self.prices.lock();
-            let mut out = HashMap::new();
-            for a in assets {
-                match prices.get(a) {
-                    Some(p) => {
-                        out.insert(*a, *p);
-                    }
-                    // All-or-nothing semantics: one unknown asset fails the call.
-                    None => return Err(ChimeraError::OracleError(format!("no feed for {a}"))),
-                }
+            if assets.len() > 1 && assets.iter().any(|a| !prices.contains_key(a)) {
+                return Err(ChimeraError::OracleError(
+                    "execution reverted: dead feed in batch".into(),
+                ));
             }
-            Ok(out)
+            Ok(assets
+                .iter()
+                .filter_map(|a| prices.get(a).map(|p| (*a, *p)))
+                .collect())
         }
     }
 
@@ -674,9 +761,9 @@ mod tests {
     async fn dead_feed_quarantined_after_repeated_batch_failures() {
         let (healthy, dead) = (addr(1), addr(2));
         let metrics = Metrics::new();
-        // Batches always fail; individual probes succeed only for `healthy`.
+        // `dead` has no feed: batches containing it revert; its single-asset
+        // probe returns no price (dead-feed evidence).
         let source = Arc::new(ScriptedSource::new(&[(healthy, 150)]));
-        source.fail_batches.store(true, Ordering::Relaxed);
         let (shared, refresher) = refresher_over(
             snapshot_with_reserves(10, &[(healthy, 100), (dead, 200)]),
             source,
@@ -692,29 +779,66 @@ mod tests {
         // Failure 5 triggers the isolation pass.
         let ok = refresher.reprice(&metrics, "base").await;
         assert!(ok, "isolation pass with a healthy feed counts as success");
-        assert!(refresher.quarantined.lock().contains(&dead));
-        assert!(!refresher.quarantined.lock().contains(&healthy));
+        assert!(refresher.quarantined.lock().contains_key(&dead));
+        assert!(!refresher.quarantined.lock().contains_key(&healthy));
         // Healthy price applied; dead feed's stale price retained (never zeroed).
         assert_eq!(shared.snapshot().reserves[&healthy].price_usd, U256::from(150u64));
         assert_eq!(shared.snapshot().reserves[&dead].price_usd, U256::from(200u64));
         assert_eq!(refresher.consecutive_failures.load(Ordering::Relaxed), 0);
+
+        // With `dead` quarantined, the next batch is healthy-only and succeeds.
+        let ok = refresher.reprice(&metrics, "base").await;
+        assert!(ok, "quarantine must unblock the batch path");
     }
 
+    /// Transport failures (429s/timeouts) are NOT dead-feed evidence: a partial
+    /// or full RPC outage must never quarantine healthy feeds.
     #[tokio::test]
-    async fn full_rpc_outage_quarantines_nothing() {
+    async fn transport_outage_quarantines_nothing() {
         let (a, b) = (addr(1), addr(2));
         let metrics = Metrics::new();
-        let source = Arc::new(ScriptedSource::new(&[])); // every probe fails
+        let source = Arc::new(ScriptedSource::new(&[(a, 100), (b, 200)]));
+        source.fail.store(true, Ordering::Relaxed); // every call: 429
         let (_shared, refresher) = refresher_over(
             snapshot_with_reserves(10, &[(a, 100), (b, 200)]),
             source,
             PathBuf::from("nonexistent.json"),
         );
-        refresher.consecutive_failures.store(QUARANTINE_AFTER_FAILURES - 1, Ordering::Relaxed);
+        refresher
+            .consecutive_failures
+            .store(QUARANTINE_AFTER_FAILURES - 1, Ordering::Relaxed);
 
+        // 5th failure triggers the isolation pass; all probes are 429s.
         let ok = refresher.reprice(&metrics, "base").await;
         assert!(!ok);
-        assert!(refresher.quarantined.lock().is_empty(), "outage must not quarantine");
+        assert!(
+            refresher.quarantined.lock().is_empty(),
+            "transport outage must not quarantine"
+        );
+    }
+
+    /// Quarantined feeds are re-admitted after the TTL so temporary deadness
+    /// (or a misjudgment) self-heals.
+    #[tokio::test]
+    async fn quarantine_ttl_readmits_feed() {
+        let (a, b) = (addr(1), addr(2));
+        let metrics = Metrics::new();
+        let source = Arc::new(ScriptedSource::new(&[(a, 150), (b, 250)]));
+        let (shared, refresher) = refresher_over(
+            snapshot_with_reserves(10, &[(a, 100), (b, 200)]),
+            source,
+            PathBuf::from("nonexistent.json"),
+        );
+        // `b` quarantined long ago (past TTL).
+        refresher
+            .quarantined
+            .lock()
+            .insert(b, epoch_now() - QUARANTINE_TTL_SECS - 1);
+
+        let ok = refresher.reprice(&metrics, "base").await;
+        assert!(ok);
+        assert!(refresher.quarantined.lock().is_empty(), "TTL must expire the entry");
+        assert_eq!(shared.snapshot().reserves[&b].price_usd, U256::from(250u64));
     }
 
     // ---- discovery reload -----------------------------------------------------
@@ -800,6 +924,40 @@ mod tests {
 
         // Rejected file's mtime was recorded: no re-evaluation churn next tick.
         assert!(!refresher.check_reload(&metrics, "base"));
+    }
+
+    /// An applied reload must force an immediate reprice (the file's prices are
+    /// generation-age and may regress fresher live values) and reset the price
+    /// age to the file's timestamp rather than letting it read as live-fresh.
+    #[tokio::test]
+    async fn reload_forces_immediate_reprice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("snapshot.json");
+        write_atomically(&path, &snapshot_json(100, 2500.0));
+
+        let boot = MarketSnapshot::load_from_file(&path).unwrap();
+        let weth: Address = "0x4200000000000000000000000000000000000006".parse().unwrap();
+        let metrics = Metrics::new();
+        let source = Arc::new(ScriptedSource::new(&[(weth, 260_000_000_000)])); // $2600 live
+        let (shared, refresher) = refresher_over(boot, source, path.clone());
+
+        // Tick 1: normal reprice applies the live price.
+        let o1 = refresher.tick(&metrics, "base").await;
+        assert!(o1.repriced);
+        assert_eq!(shared.snapshot().reserves[&weth].price_usd, U256::from(260_000_000_000u64));
+
+        // Generator rewrites the file (older $2500 price baked in). The very next
+        // tick — well inside the pacing interval — must reload AND reprice, so
+        // the stale file price is immediately overwritten by the live one.
+        write_atomically(&path, &snapshot_json(101, 2500.0));
+        let o2 = refresher.tick(&metrics, "base").await;
+        assert!(o2.reloaded);
+        assert!(o2.repriced, "reload must force a reprice despite pacing");
+        assert_eq!(
+            shared.snapshot().reserves[&weth].price_usd,
+            U256::from(260_000_000_000u64),
+            "live price must win over the file's generation-age price"
+        );
     }
 
     #[tokio::test]

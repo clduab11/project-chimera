@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import json
 import logging
 import os
@@ -928,6 +929,8 @@ def _scan_borrowers(
     scan_blocks: int,
     log_chunk: int,
     from_block_override: int | None = None,
+    scan_workers: int = 12,
+    checkpoint=None,
 ) -> set[str]:
     """Collect unique borrower addresses from recent Borrow events.
 
@@ -951,30 +954,25 @@ def _scan_borrowers(
     borrowers: set[str] = set()
     chunks = 0
     failed = 0
+
+    ranges = []
     start = from_block
-    # A deep backfill is ~5,200 chunks and tens of minutes. Logging only on
-    # completion makes that indistinguishable from a hang, so emit periodic
-    # progress with an ETA derived from observed throughput.
-    total_chunks = max(1, (latest - from_block) // log_chunk + 1)
-    progress_every = max(1, total_chunks // 20)
-    scan_started = time.monotonic()
     while start <= latest:
         end = min(start + log_chunk - 1, latest)
-        chunks += 1
-        if chunks % progress_every == 0:
-            elapsed = time.monotonic() - scan_started
-            rate = chunks / elapsed if elapsed > 0 else 0
-            remaining = (total_chunks - chunks) / rate if rate > 0 else 0
-            logger.info(
-                "  scan progress: %d/%d chunks (%.0f%%), %d borrowers so far, "
-                "%.1f chunks/s, ETA %.0f min",
-                chunks, total_chunks, 100.0 * chunks / total_chunks,
-                len(borrowers), rate, remaining / 60.0,
-            )
+        ranges.append((start, end))
+        start = end + 1
+
+    total_chunks = max(1, len(ranges))
+    progress_every = max(1, total_chunks // 20)
+    scan_started = time.monotonic()
+
+    def _fetch(rng):
+        s, e = rng
         try:
             entries = _retry_with_backoff(
-                lambda s=start, e=end: pool.events.Borrow().get_logs(from_block=s, to_block=e)
+                lambda: pool.events.Borrow().get_logs(from_block=s, to_block=e)
             )
+            found = set()
             for entry in entries:
                 # The debt-bearer is onBehalfOf (the account whose debt increased),
                 # not user (the caller). Collect it as the candidate borrower.
@@ -983,11 +981,39 @@ def _scan_borrowers(
                 args = entry["args"]
                 borrower = args.get("onBehalfOf") or args.get("user")
                 if borrower:
-                    borrowers.add(borrower)
+                    found.add(borrower)
+            return (s, e, found, None)
         except Exception as exc:  # noqa: BLE001 - skip the chunk, keep scanning
-            failed += 1
-            logger.warning("Borrow log chunk %d-%d failed after retries: %s", start, end, exc)
-        start = end + 1
+            return (s, e, set(), exc)
+
+    # Chunks are fetched concurrently. A deep backfill is ~5,200 independent
+    # getLogs calls; issued serially at ~0.5s each that is well over an hour of
+    # wall clock during which a single stalled socket blocks everything behind
+    # it. Each future carries its own timeout via the provider's request_kwargs.
+    with cf.ThreadPoolExecutor(max_workers=scan_workers) as pool_exec:
+        for s, e, found, exc in pool_exec.map(_fetch, ranges):
+            chunks += 1
+            if exc is not None:
+                failed += 1
+                logger.warning("Borrow log chunk %d-%d failed after retries: %s", s, e, exc)
+            else:
+                borrowers |= found
+
+            if chunks % progress_every == 0:
+                elapsed = time.monotonic() - scan_started
+                rate = chunks / elapsed if elapsed > 0 else 0
+                remaining = (total_chunks - chunks) / rate if rate > 0 else 0
+                logger.info(
+                    "  scan progress: %d/%d chunks (%.0f%%), %d borrowers so far, "
+                    "%.1f chunks/s, ETA %.0f min",
+                    chunks, total_chunks, 100.0 * chunks / total_chunks,
+                    len(borrowers), rate, remaining / 60.0,
+                )
+                # Checkpoint. A backfill that dies at chunk 5,000 previously lost
+                # every borrower it had found, because nothing was written until
+                # the sweep completed. Progress is now durable.
+                if checkpoint is not None:
+                    checkpoint(borrowers)
 
     logger.info(
         "Scanned blocks %d-%d in %d chunk(s) (%d failed); %d unique borrowers",
@@ -1017,6 +1043,7 @@ def fetch_user_positions(
     borrower_cache: Path | None = None,
     backfill: bool = False,
     deployment_block: int | None = None,
+    scan_workers: int = 12,
 ) -> dict[str, UserPosition]:
     """Discover at-risk Aave V3 positions and serialize them as scaled balances.
 
@@ -1076,13 +1103,29 @@ def fetch_user_positions(
     if borrower_cache is not None:
         cached, last_scanned = _load_borrower_cache(borrower_cache, chain, pool_address)
 
+    def _checkpoint(found_so_far: set[str]) -> None:
+        """Persist partial progress mid-sweep.
+
+        Records `last_scanned` (NOT `latest`): the concurrent scan completes
+        chunks out of order, so the only block height we can honestly claim to
+        have covered is the one we started from. A resumed run therefore
+        re-scans the window rather than skipping a hole in it.
+        """
+        if borrower_cache is None:
+            return
+        _save_borrower_cache(
+            borrower_cache, chain, pool_address, cached | found_so_far, last_scanned
+        )
+
     if borrower_cache is not None and last_scanned > 0 and not backfill:
         # Incremental: re-scan from the last covered block. Overlap by one block
         # rather than starting at last+1, so a reorg at the boundary cannot drop
         # a borrower permanently from the persisted set.
         scan_from = max(last_scanned, 0)
         logger.info("Incremental borrow scan from block %d to %d", scan_from, latest)
-        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk, from_block_override=scan_from)
+        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk,
+                                from_block_override=scan_from,
+                                scan_workers=scan_workers, checkpoint=_checkpoint)
     elif borrower_cache is not None:
         floor = deployment_block or POOL_DEPLOYMENT_BLOCK.get(chain, 0)
         logger.info(
@@ -1090,9 +1133,12 @@ def fetch_user_positions(
             "one-time; subsequent runs scan only new blocks",
             floor, latest, latest - floor, max(1, (latest - floor) // max(log_chunk, 1)),
         )
-        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk, from_block_override=floor)
+        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk,
+                                from_block_override=floor,
+                                scan_workers=scan_workers, checkpoint=_checkpoint)
     else:
-        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk)
+        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk,
+                                scan_workers=scan_workers)
 
     borrowers = cached | found
     if borrower_cache is not None:
@@ -1527,6 +1573,14 @@ def build_parser() -> argparse.ArgumentParser:
              "rolling --scan-blocks window.",
     )
     parser.add_argument(
+        "--scan-workers",
+        type=int,
+        default=12,
+        help="Concurrent eth_getLogs requests during the borrow scan (default 12). "
+             "A deep backfill is ~5,200 independent calls; serially that is over "
+             "an hour, and one stalled socket blocks every chunk behind it.",
+    )
+    parser.add_argument(
         "--backfill",
         action="store_true",
         help="Force a one-time deep scan from the Pool's deployment block instead "
@@ -1625,6 +1679,7 @@ def main() -> int:
             borrower_cache=(Path(args.borrower_cache) if args.borrower_cache else None),
             backfill=args.backfill,
             deployment_block=args.deployment_block,
+            scan_workers=args.scan_workers,
         )
 
         # Validate live snapshot before writing.

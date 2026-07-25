@@ -365,6 +365,154 @@ class UserPosition:
 # ---------------------------------------------------------------------------
 # Retry / rate-limit helpers
 # ---------------------------------------------------------------------------
+# Multicall3 — same address on every major EVM chain, including Base.
+# https://github.com/mds1/multicall
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+# Borrowers per aggregate3 call. 250 keeps the response well inside provider
+# response-size limits while cutting request count by ~250x.
+MULTICALL_BATCH = 250
+
+MULTICALL3_ABI = [
+    {
+        "name": "aggregate3",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [
+            {
+                "name": "calls",
+                "type": "tuple[]",
+                "components": [
+                    {"name": "target", "type": "address"},
+                    {"name": "allowFailure", "type": "bool"},
+                    {"name": "callData", "type": "bytes"},
+                ],
+            }
+        ],
+        "outputs": [
+            {
+                "name": "returnData",
+                "type": "tuple[]",
+                "components": [
+                    {"name": "success", "type": "bool"},
+                    {"name": "returnData", "type": "bytes"},
+                ],
+            }
+        ],
+    }
+]
+
+
+def _multicall_user_account_data(w3, pool, users: list[str]):
+    """Batch ``getUserAccountData`` for ``users`` through Multicall3.
+
+    Yields ``(user, decoded_tuple_or_None)`` preserving input order. A failed
+    sub-call yields ``None`` for that user rather than aborting the batch, so one
+    bad borrower cannot sink an entire scan.
+
+    Falls back to sequential calls if the batch itself fails, so a provider that
+    dislikes large multicalls degrades in speed rather than breaking discovery.
+    """
+    fn = pool.functions.getUserAccountData
+    calls = [(pool.address, True, fn(u)._encode_transaction_data()) for u in users]
+
+    try:
+        mc = w3.eth.contract(
+            address=w3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI
+        )
+        raw = _retry_with_backoff(lambda: mc.functions.aggregate3(calls).call())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Multicall3 batch of %d failed (%s); falling back to sequential calls",
+            len(users), exc,
+        )
+        out = []
+        for u in users:
+            try:
+                out.append((u, _retry_with_backoff(lambda x=u: fn(x).call())))
+            except Exception:  # noqa: BLE001
+                out.append((u, None))
+        return out
+
+    decoded = []
+    for user, (success, ret) in zip(users, raw):
+        if not success or not ret:
+            decoded.append((user, None))
+            continue
+        try:
+            decoded.append(
+                (user, w3.codec.decode(
+                    ["uint256", "uint256", "uint256", "uint256", "uint256", "uint256"],
+                    ret,
+                ))
+            )
+        except Exception:  # noqa: BLE001
+            decoded.append((user, None))
+    return decoded
+
+
+def _multicall_user_reserves(w3, pool, data_provider, user: str, assets: list[str]):
+    """Batch one user's eMode + per-reserve data into a single Multicall3 round trip.
+
+    Returns ``(emode_category, [(asset, decoded_or_None), ...])``.
+
+    eMode is enrichment rather than a hard requirement, so a failure there yields
+    0 (no category) instead of discarding the whole position — matching the
+    previous per-call behaviour, just without the round trips.
+    """
+    get_user_reserve = data_provider.functions.getUserReserveData
+    calls = [(pool.address, True, pool.functions.getUserEMode(user)._encode_transaction_data())]
+    calls += [
+        (data_provider.address, True, get_user_reserve(a, user)._encode_transaction_data())
+        for a in assets
+    ]
+
+    try:
+        mc = w3.eth.contract(
+            address=w3.to_checksum_address(MULTICALL3_ADDRESS), abi=MULTICALL3_ABI
+        )
+        raw = _retry_with_backoff(lambda: mc.functions.aggregate3(calls).call())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Multicall3 user-reserve batch failed for %s (%s); sequential", user, exc)
+        emode = 0
+        try:
+            emode = int(_retry_with_backoff(lambda: pool.functions.getUserEMode(user).call()))
+        except Exception:  # noqa: BLE001
+            pass
+        rows = []
+        for a in assets:
+            try:
+                rows.append((a, _retry_with_backoff(lambda x=a: get_user_reserve(x, user).call())))
+            except Exception:  # noqa: BLE001
+                rows.append((a, None))
+        return emode, rows
+
+    emode = 0
+    ok, ret = raw[0]
+    if ok and ret:
+        try:
+            emode = int(w3.codec.decode(["uint256"], ret)[0])
+        except Exception:  # noqa: BLE001
+            emode = 0
+
+    # getUserReserveData returns 9 values; only [0] (aToken bal) and [4]
+    # (scaled variable debt) are consumed, but the full shape must be decoded.
+    types = [
+        "uint256", "uint256", "uint256", "uint256", "uint256",
+        "uint256", "uint256", "uint40", "bool",
+    ]
+    rows = []
+    for asset, (success, data) in zip(assets, raw[1:]):
+        if not success or not data:
+            rows.append((asset, None))
+            continue
+        try:
+            rows.append((asset, w3.codec.decode(types, data)))
+        except Exception:  # noqa: BLE001
+            rows.append((asset, None))
+    return emode, rows
+
+
 class RPCError(Exception):
     """Custom exception for RPC call failures."""
 
@@ -708,11 +856,78 @@ def _resolve_symbol(w3: Web3, token_address: str) -> str:
 # ---------------------------------------------------------------------------
 # User position fetching
 # ---------------------------------------------------------------------------
+# Block at which the Aave V3 Pool proxy was deployed, per chain. Verified by
+# binary-searching `eth_getCode` (Base: block 2357134, 2023-08-08T14:06:55Z).
+# The floor for a deep backfill — scanning below this only wastes getLogs calls.
+POOL_DEPLOYMENT_BLOCK: dict[str, int] = {
+    "base": 2_357_134,
+    # Arbitrum's Aave V3 predates Base; verify before enabling a backfill there.
+    "arbitrum": 7_742_429,
+}
+
+
+def _load_borrower_cache(path: Path, chain: str, pool_address: str) -> tuple[set[str], int]:
+    """Load the persisted borrower set. Returns ``(borrowers, last_scanned_block)``.
+
+    A cache recorded against a different chain or Pool address is discarded
+    rather than merged — silently mixing borrower sets across markets would
+    produce candidates that cannot exist on this chain.
+    """
+    if not path.exists():
+        return set(), 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Borrower cache %s unreadable (%s); starting fresh", path, exc)
+        return set(), 0
+
+    if data.get("chain") != chain or (
+        data.get("pool", "").lower() != pool_address.lower()
+    ):
+        logger.warning(
+            "Borrower cache %s is for a different chain/pool (%s/%s); ignoring it",
+            path, data.get("chain"), data.get("pool"),
+        )
+        return set(), 0
+
+    borrowers = {b for b in data.get("borrowers", []) if isinstance(b, str)}
+    last = int(data.get("last_scanned_block", 0) or 0)
+    logger.info(
+        "Loaded %d cached borrowers from %s (scanned through block %d)",
+        len(borrowers), path, last,
+    )
+    return borrowers, last
+
+
+def _save_borrower_cache(
+    path: Path, chain: str, pool_address: str, borrowers: set[str], last_block: int
+) -> None:
+    """Persist the borrower set atomically (temp file + replace)."""
+    payload = {
+        "chain": chain,
+        "pool": pool_address,
+        "last_scanned_block": last_block,
+        "borrower_count": len(borrowers),
+        "borrowers": sorted(borrowers),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+        logger.info(
+            "Persisted %d borrowers to %s (through block %d)", len(borrowers), path, last_block
+        )
+    except OSError as exc:
+        logger.warning("Failed to persist borrower cache to %s: %s", path, exc)
+
+
 def _scan_borrowers(
     pool: Any,
     latest: int,
     scan_blocks: int,
     log_chunk: int,
+    from_block_override: int | None = None,
 ) -> set[str]:
     """Collect unique borrower addresses from recent Borrow events.
 
@@ -728,14 +943,34 @@ def _scan_borrowers(
         logger.warning("log_chunk %d < 1; clamping to 1 to keep the scan progressing", log_chunk)
         log_chunk = 1
 
-    from_block = max(latest - scan_blocks + 1, 0)
+    from_block = (
+        max(from_block_override, 0)
+        if from_block_override is not None
+        else max(latest - scan_blocks + 1, 0)
+    )
     borrowers: set[str] = set()
     chunks = 0
     failed = 0
     start = from_block
+    # A deep backfill is ~5,200 chunks and tens of minutes. Logging only on
+    # completion makes that indistinguishable from a hang, so emit periodic
+    # progress with an ETA derived from observed throughput.
+    total_chunks = max(1, (latest - from_block) // log_chunk + 1)
+    progress_every = max(1, total_chunks // 20)
+    scan_started = time.monotonic()
     while start <= latest:
         end = min(start + log_chunk - 1, latest)
         chunks += 1
+        if chunks % progress_every == 0:
+            elapsed = time.monotonic() - scan_started
+            rate = chunks / elapsed if elapsed > 0 else 0
+            remaining = (total_chunks - chunks) / rate if rate > 0 else 0
+            logger.info(
+                "  scan progress: %d/%d chunks (%.0f%%), %d borrowers so far, "
+                "%.1f chunks/s, ETA %.0f min",
+                chunks, total_chunks, 100.0 * chunks / total_chunks,
+                len(borrowers), rate, remaining / 60.0,
+            )
         try:
             entries = _retry_with_backoff(
                 lambda s=start, e=end: pool.events.Borrow().get_logs(from_block=s, to_block=e)
@@ -778,6 +1013,10 @@ def fetch_user_positions(
     hf_max: float = 1.10,
     max_candidates: int = 1500,
     max_users: int = 300,
+    chain: str = "base",
+    borrower_cache: Path | None = None,
+    backfill: bool = False,
+    deployment_block: int | None = None,
 ) -> dict[str, UserPosition]:
     """Discover at-risk Aave V3 positions and serialize them as scaled balances.
 
@@ -820,7 +1059,48 @@ def fetch_user_positions(
         abi=POOL_ABI,
     )
     latest = scan_w3.eth.block_number
-    borrowers = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk)
+
+    # Borrower discovery, persistent by default.
+    #
+    # A rolling window only ever surfaces borrowers who were ACTIVE in that
+    # window, but the positions that actually get liquidated are typically aged —
+    # opened long ago and left to drift toward the threshold. Rebuilding from a
+    # short window each run therefore discards exactly the cohort worth watching.
+    #
+    # Instead the borrower set is persisted and only extended: a one-time deep
+    # backfill from the Pool's deployment block, then cheap incremental scans of
+    # the blocks added since. Passing no cache path preserves the old
+    # rolling-window behaviour for ad-hoc runs.
+    cached: set[str] = set()
+    last_scanned = 0
+    if borrower_cache is not None:
+        cached, last_scanned = _load_borrower_cache(borrower_cache, chain, pool_address)
+
+    if borrower_cache is not None and last_scanned > 0 and not backfill:
+        # Incremental: re-scan from the last covered block. Overlap by one block
+        # rather than starting at last+1, so a reorg at the boundary cannot drop
+        # a borrower permanently from the persisted set.
+        scan_from = max(last_scanned, 0)
+        logger.info("Incremental borrow scan from block %d to %d", scan_from, latest)
+        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk, from_block_override=scan_from)
+    elif borrower_cache is not None:
+        floor = deployment_block or POOL_DEPLOYMENT_BLOCK.get(chain, 0)
+        logger.info(
+            "DEEP BACKFILL from Pool deployment block %d to %d (%d blocks, ~%d chunks) — "
+            "one-time; subsequent runs scan only new blocks",
+            floor, latest, latest - floor, max(1, (latest - floor) // max(log_chunk, 1)),
+        )
+        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk, from_block_override=floor)
+    else:
+        found = _scan_borrowers(logs_pool, latest, scan_blocks, log_chunk)
+
+    borrowers = cached | found
+    if borrower_cache is not None:
+        logger.info(
+            "Borrower set: %d cached + %d found this scan = %d total (%d new)",
+            len(cached), len(found), len(borrowers), len(borrowers) - len(cached),
+        )
+        _save_borrower_cache(borrower_cache, chain, pool_address, borrowers, latest)
 
     candidates = sorted(borrowers)
     if len(candidates) > max_candidates:
@@ -831,42 +1111,67 @@ def fetch_user_positions(
         candidates = candidates[:max_candidates]
 
     # Triage: getUserAccountData health factor (1e18-scaled; uint256 max = no debt).
+    #
+    # Batched through Multicall3. One call per borrower made discovery width the
+    # binding constraint — 2,807 borrowers took ~13 minutes of sequential RPC,
+    # which is why the watched universe stayed small. Liquidation is a rare-event
+    # business, so width IS the edge; batching turns a 10k-borrower scan from
+    # hours into seconds at a fraction of the compute-unit cost.
+    #
+    # `getUserAccountData` is Aave's own accounting, so the health factor here is
+    # authoritative — it already accounts for eMode (including v3.2 liquid
+    # eModes), isolation mode and every LT nuance, with no model to drift.
     hf_max_wad = int(hf_max * 10**18)
     at_risk: list[str] = []
-    for user in candidates:
-        try:
-            acct = _retry_with_backoff(lambda u=user: pool.functions.getUserAccountData(u).call())
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("getUserAccountData failed for %s: %s", user, exc)
-            continue
-        total_debt_base = int(acct[1])
-        health_factor = int(acct[5])
-        if total_debt_base > 0 and health_factor <= hf_max_wad:
-            at_risk.append(user)
-            if len(at_risk) >= max_users:
-                logger.warning(
-                    "Reached max_users (%d); stopping triage early (more at-risk users may exist)",
-                    max_users,
-                )
-                break
+    truncated = False
+
+    batches = [
+        candidates[i : i + MULTICALL_BATCH]
+        for i in range(0, len(candidates), MULTICALL_BATCH)
+    ]
+    logger.info(
+        "Triaging %d borrowers via Multicall3 in %d batch(es) of %d",
+        len(candidates), len(batches), MULTICALL_BATCH,
+    )
+
+    for batch_no, batch in enumerate(batches, start=1):
+        results = _multicall_user_account_data(w3, pool, batch)
+        for user, acct in results:
+            if acct is None:
+                continue
+            total_debt_base = int(acct[1])
+            health_factor = int(acct[5])
+            if total_debt_base > 0 and health_factor <= hf_max_wad:
+                at_risk.append(user)
+                if len(at_risk) >= max_users:
+                    truncated = True
+                    break
+        if truncated:
+            logger.warning(
+                "Reached max_users (%d) at batch %d/%d; more at-risk users may exist",
+                max_users, batch_no, len(batches),
+            )
+            break
 
     logger.info("Triaged %d candidates → %d at-risk (HF ≤ %.3f)", len(candidates), len(at_risk), hf_max)
 
+    # Position enrichment, batched. This is (users x reserves) reads — 160 users
+    # over 15 reserves is 2,400 calls, which took ~13 minutes sequentially and
+    # became the bottleneck the moment triage was batched. One multicall per user
+    # collapses it to one round trip each, and eMode rides along in the same batch.
+    logger.info("Resolving balances for %d at-risk users (batched per user)", len(at_risk))
     positions: dict[str, UserPosition] = {}
     for user in at_risk:
         try:
-            emode = 0
-            try:
-                emode = int(_retry_with_backoff(lambda u=user: pool.functions.getUserEMode(u).call()))
-            except Exception as exc:  # noqa: BLE001 - emode is enrichment, not critical
-                logger.debug("getUserEMode failed for %s: %s", user, exc)
+            emode, user_reserve_rows = _multicall_user_reserves(
+                w3, pool, data_provider, user, reserve_addresses
+            )
 
             collateral: dict[str, str] = {}
             debt: dict[str, str] = {}
-            for asset in reserve_addresses:
-                user_data = _retry_with_backoff(
-                    lambda a=asset, u=user: data_provider.functions.getUserReserveData(a, u).call()
-                )
+            for asset, user_data in user_reserve_rows:
+                if user_data is None:
+                    continue
                 current_atoken = int(user_data[0])   # current (indexed) aToken balance
                 scaled_variable_debt = int(user_data[4])  # already scaled on-chain
 
@@ -1214,6 +1519,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cap on at-risk positions written to the snapshot (default 300).",
     )
     parser.add_argument(
+        "--borrower-cache",
+        default="config/borrowers.{chain}.json",
+        help="Persisted borrower set. Discovery becomes incremental: only blocks "
+             "added since the last run are scanned, and the set only grows. "
+             "'{chain}' is substituted. Pass '' to disable and use the legacy "
+             "rolling --scan-blocks window.",
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="Force a one-time deep scan from the Pool's deployment block instead "
+             "of an incremental scan. Needed once to seed the borrower cache; "
+             "aged positions are the ones that actually get liquidated, and a "
+             "rolling window never sees them.",
+    )
+    parser.add_argument(
+        "--deployment-block",
+        type=int,
+        default=None,
+        help="Override the Pool deployment block used as the --backfill floor.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1225,6 +1552,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     logger.setLevel(getattr(logging, args.log_level))
+    if args.borrower_cache:
+        args.borrower_cache = args.borrower_cache.replace("{chain}", args.chain)
 
     if args.mock:
         logger.info("MOCK mode enabled - skipping RPC calls")
@@ -1292,6 +1621,10 @@ def main() -> int:
             hf_max=args.hf_max,
             max_candidates=args.max_candidates,
             max_users=args.max_users,
+            chain=args.chain,
+            borrower_cache=(Path(args.borrower_cache) if args.borrower_cache else None),
+            backfill=args.backfill,
+            deployment_block=args.deployment_block,
         )
 
         # Validate live snapshot before writing.

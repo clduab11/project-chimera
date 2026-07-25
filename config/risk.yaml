@@ -17,5 +17,8 @@ audit_max_contracts_per_day: 50
 bounty_min_severity: "MEDIUM"
 
 # Live detection refresh (serde defaults apply when omitted)
-price_refresh_secs: 8        # Min seconds between live reserve-price refreshes (1 batched eth_call each)
+price_refresh_secs: 2        # Min seconds between live reserve-price refreshes (1 batched eth_call each).
+                             # 2s = every Base block. Prices are what push HF across 1.0, so a slower
+                             # cadence means learning about a crossing up to 3 blocks late. Cost is ~1
+                             # batched getAssetsPrices per block (~26 CU) — negligible against a 10k CU/s cap.
 price_max_stale_secs: 300    # Price age past which detection is degraded (warn in shadow, skip scans in live)

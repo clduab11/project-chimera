@@ -11,6 +11,13 @@ use alloy::primitives::{Address, U256};
 use std::str::FromStr;
 use tracing::{info, warn};
 
+/// Venue label for the synthetic no-swap route used when collateral == debt.
+///
+/// A same-asset liquidation touches no DEX at all, so it carries no real venue.
+/// The pacing engine treats this label as exempt from the venue rotation gate:
+/// rotation exists to spread flow across trading venues, and this path uses none.
+pub const NO_SWAP_VENUE: &str = "none:same-asset";
+
 /// A resolved V2 DEX route for a collateral/debt pair.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedV2Route {
@@ -27,6 +34,24 @@ pub struct ResolvedV2Route {
     pub amount_out_min: U256,
     /// Name of the DEX venue that resolved the route.
     pub venue_name: String,
+}
+
+impl ResolvedV2Route {
+    /// Route for a liquidation whose seized collateral *is* the debt asset.
+    ///
+    /// No swap is required: the collateral seized from the Aave position repays
+    /// the flash-loaned debt directly. `Executor.yul` already implements exactly
+    /// this — both the router validation and the entire swap leg sit behind
+    /// `if iszero(eq(collateralAsset, asset))` — so a zero router and zero
+    /// `amountOutMin` are the contract-supported encoding, not placeholders.
+    pub fn no_swap(asset: Address) -> Self {
+        Self {
+            router: Address::ZERO,
+            path: vec![asset, asset],
+            amount_out_min: U256::ZERO,
+            venue_name: NO_SWAP_VENUE.to_string(),
+        }
+    }
 }
 
 /// Resolves collateral/debt pairs to V2 DEX routes from the routing configuration.
@@ -563,5 +588,33 @@ mod tests {
         let collateral = address!("0x3333333333333333333333333333333333333333");
         let result = resolver.resolve_v2(collateral, debt, "base", U256::from(1000));
         assert!(result.is_none(), "custom venue should be skipped");
+    }
+
+    #[test]
+    fn test_no_swap_route_encodes_zero_router_and_min_out() {
+        let asset = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+        let route = ResolvedV2Route::no_swap(asset);
+
+        // Executor.yul skips router validation and the swap leg entirely when
+        // collateralAsset == asset, so both fields are correctly zero here.
+        assert_eq!(route.router, Address::ZERO);
+        assert_eq!(route.amount_out_min, U256::ZERO);
+        assert_eq!(route.path, vec![asset, asset]);
+        assert_eq!(route.venue_name, NO_SWAP_VENUE);
+    }
+
+    #[test]
+    fn test_no_swap_venue_is_not_a_configurable_venue_name() {
+        // The sentinel must never collide with a real venue from routing.yaml,
+        // otherwise a config entry could silently inherit the rotation exemption.
+        let routing = test_routing_config();
+        assert!(
+            !routing.venues.iter().any(|v| v.name == NO_SWAP_VENUE),
+            "NO_SWAP_VENUE must not be a real configured venue"
+        );
+        assert!(
+            NO_SWAP_VENUE.contains(':'),
+            "sentinel should stay syntactically distinct from venue names"
+        );
     }
 }

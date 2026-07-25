@@ -10,13 +10,14 @@
 
 pub mod golden;
 pub mod prewarm;
+pub mod seeding;
 
 use crate::{ChimeraError, PacingConfig};
 use alloy::eips::BlockId;
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::{SolCall, SolEvent};
+use alloy::sol_types::{SolCall, SolEvent, SolValue};
 use revm::context::result::ExecResultAndState;
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, TxEnv};
@@ -28,7 +29,7 @@ use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default liquidation bonus (5%) used as fallback when on-chain reserve data is unavailable.
 const DEFAULT_LIQUIDATION_BONUS_BPS: u16 = 10500;
@@ -132,6 +133,63 @@ pub enum L2ChainType {
     Arbitrum,
 }
 
+/// Address that performs the liquidation inside the simulation.
+///
+/// Deliberately NOT `Address::ZERO`. Aave's `liquidationCall` pulls the debt via
+/// `safeTransferFrom(msg.sender, …)`, and essentially every ERC20 implementation
+/// rejects a transfer whose `from` is the zero address (`require(from != 0)` in
+/// the OpenZeppelin base). Simulating from `Address::ZERO` therefore reverts
+/// unconditionally, whatever balance or allowance it holds — which is exactly
+/// what happened for 724,496 consecutive candidates.
+///
+/// This address is simulation-only: it never signs, never holds real funds, and
+/// never appears in a submitted transaction. It is seeded inside REVM by
+/// [`seeding::seed_liquidator`].
+pub const SIM_LIQUIDATOR: Address = Address::new([
+    0xC1, 0x11, 0xE2, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01,
+]);
+
+/// Decode a raw revert payload into something a human can act on.
+///
+/// Handles the two standard Solidity shapes — `Error(string)` (`0x08c379a0`) and
+/// `Panic(uint256)` (`0x4e487b71`). Aave V3 reverts with `Error(string)` carrying
+/// a numeric code (e.g. `"45"`), so this turns an opaque hex blob into that code.
+pub fn decode_revert_reason(raw_hex: &str) -> String {
+    let hex_body = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
+    if hex_body.is_empty() {
+        return "<no revert data — out of gas, invalid opcode, or bare revert>".to_string();
+    }
+    let Ok(bytes) = hex::decode(hex_body) else {
+        return "<undecodable revert payload>".to_string();
+    };
+    if bytes.len() < 4 {
+        return "<revert payload shorter than a selector>".to_string();
+    }
+    match &bytes[0..4] {
+        // Error(string)
+        [0x08, 0xc3, 0x79, 0xa0] => {
+            match <(String,)>::abi_decode_params(&bytes[4..]) {
+                Ok((msg,)) => {
+                    // Aave V3 packs its error catalogue as decimal strings.
+                    if !msg.is_empty() && msg.chars().all(|c| c.is_ascii_digit()) {
+                        format!("Aave error code '{msg}'")
+                    } else {
+                        msg
+                    }
+                }
+                Err(_) => "<malformed Error(string) payload>".to_string(),
+            }
+        }
+        // Panic(uint256)
+        [0x4e, 0x48, 0x7b, 0x71] => match <(U256,)>::abi_decode_params(&bytes[4..]) {
+            Ok((code,)) => format!("Solidity panic 0x{code:x}"),
+            Err(_) => "<malformed Panic(uint256) payload>".to_string(),
+        },
+        other => format!("custom error selector 0x{}", hex::encode(other)),
+    }
+}
+
 /// The production-grade simulator.
 /// Holds a warm REVM DB (pre-loaded with Aave reserves, user positions, oracles).
 type ForkDb<P> = CacheDB<WrapDatabaseAsync<AlloyDB<Ethereum, P>>>;
@@ -144,6 +202,14 @@ pub struct LiquidationSimulator<P: Provider<Ethereum> + Clone> {
     oracle: Arc<dyn crate::oracle::PriceOracle>,
     eth_oracle_asset: Address,
     l2_chain_type: L2ChainType,
+    /// Debt assets whose ERC20 storage layout could not be probed. Tracked so the
+    /// warning fires once per token instead of once per candidate — at ~4.4
+    /// candidates per block a per-candidate warning would bury the log.
+    unseedable_warned: std::collections::HashSet<Address>,
+    /// Memoised ERC20 storage layouts, so slot discovery costs one probe per
+    /// token rather than one per candidate. Survives `rebuild_db`: a layout is a
+    /// property of the token's code, not of fork state.
+    token_layouts: seeding::LayoutCache,
 }
 
 impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
@@ -166,6 +232,8 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
             oracle,
             eth_oracle_asset,
             l2_chain_type: L2ChainType::default(),
+            unseedable_warned: std::collections::HashSet::new(),
+            token_layouts: seeding::LayoutCache::new(),
         })
     }
 
@@ -218,8 +286,36 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
     ) -> Result<SimulationResult, ChimeraError> {
         let calldata = self.build_liquidation_calldata(candidate)?;
 
+        // Fund the simulated liquidator BEFORE executing. `liquidationCall` pulls
+        // the debt via `safeTransferFrom(msg.sender, …)`, so without a balance and
+        // an allowance to the Pool the call reverts no matter how good the
+        // opportunity is.
+        //
+        // Best-effort by design: a probe miss is reported but does not abort the
+        // simulation. If seeding was genuinely required the call reverts anyway,
+        // and the revert branch below logs the decoded reason — which is strictly
+        // more diagnostic than replacing it with a generic seeding error. It also
+        // keeps synthetic/non-ERC20 debt assets (test doubles) simulatable.
         // Build REVM block + tx env synced to the fork block for correct interest accrual.
+        // NOTE: built BEFORE seeding — the storage probe must execute against the
+        // same block environment as the real simulation. A default BlockEnv fails
+        // Cancun-era transaction validation, which silently defeated every probe.
         let block = self.build_block_env(current_gas_price, snapshot_block)?;
+
+        let pool = self.aave_pool;
+        if let Err(e) = seeding::seed_liquidator(
+            &mut self.db,
+            &mut self.token_layouts,
+            &block,
+            candidate.debt_asset,
+            SIM_LIQUIDATOR,
+            pool,
+            candidate.debt_to_cover,
+        ) {
+            if self.unseedable_warned.insert(candidate.debt_asset) {
+                seeding::warn_unseedable(candidate.debt_asset, &e);
+            }
+        }
         let tx = self.build_tx_env(candidate.chain_id, current_gas_price, calldata.clone())?;
 
         // Execute in REVM.
@@ -242,6 +338,21 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
                 .output()
                 .map(|b| format!("0x{}", hex::encode(b)))
                 .unwrap_or_default();
+            // Loud by design. This branch previously returned a zero-profit result
+            // with no log line at all, so a 100% revert rate was indistinguishable
+            // from "no opportunities were profitable" — it hid a total outage for
+            // five days. Every reverted simulation must leave a trace.
+            warn!(
+                target: "chimera::simulator",
+                user = %candidate.user,
+                collateral = %candidate.collateral_asset,
+                debt = %candidate.debt_asset,
+                caller = %SIM_LIQUIDATOR,
+                gas_used = gas_used,
+                revert = %decode_revert_reason(&revert),
+                revert_raw = %revert,
+                "Liquidation simulation REVERTED; candidate cannot be priced"
+            );
             return Ok(SimulationResult {
                 profitable: false,
                 expected_profit_usd: Decimal::ZERO,
@@ -325,7 +436,7 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         calldata: Vec<u8>,
     ) -> Result<TxEnv, ChimeraError> {
         Ok(TxEnv {
-            caller: Address::ZERO,
+            caller: SIM_LIQUIDATOR,
             gas_limit: 2_000_000,
             gas_price: checked_u256_to_u128(gas_price)?,
             kind: TxKind::Call(self.aave_pool),
@@ -775,6 +886,59 @@ mod tests {
             result.revert_reason
         );
         assert!(result.profitable, "heuristic profit path should mark this profitable");
+    }
+
+    #[test]
+    fn sim_liquidator_is_never_the_zero_address() {
+        // Regression guard on the defect that produced 724,496 consecutive
+        // reverts: ERC20 `transferFrom` rejects `from == address(0)`, so a
+        // zero-address caller can never complete `liquidationCall`.
+        assert_ne!(SIM_LIQUIDATOR, Address::ZERO);
+    }
+
+    #[test]
+    fn decode_revert_reason_extracts_aave_numeric_code() {
+        // Error(string) with body "45" — Aave V3's error catalogue is numeric.
+        let payload = [
+            &hex::decode("08c379a0").unwrap()[..],
+            &("45".to_string(),).abi_encode_params()[..],
+        ]
+        .concat();
+        let decoded = decode_revert_reason(&format!("0x{}", hex::encode(payload)));
+        assert!(
+            decoded.contains("45") && decoded.contains("Aave"),
+            "expected an Aave code annotation, got {decoded}"
+        );
+    }
+
+    #[test]
+    fn decode_revert_reason_passes_through_plain_messages() {
+        let payload = [
+            &hex::decode("08c379a0").unwrap()[..],
+            &("ERC20: insufficient allowance".to_string(),).abi_encode_params()[..],
+        ]
+        .concat();
+        let decoded = decode_revert_reason(&format!("0x{}", hex::encode(payload)));
+        assert_eq!(decoded, "ERC20: insufficient allowance");
+    }
+
+    #[test]
+    fn decode_revert_reason_handles_empty_and_custom_selectors() {
+        assert!(decode_revert_reason("0x").contains("no revert data"));
+        assert!(decode_revert_reason("").contains("no revert data"));
+        // An unknown 4-byte selector must be reported verbatim, not swallowed.
+        let decoded = decode_revert_reason("0xdeadbeef");
+        assert!(
+            decoded.contains("deadbeef"),
+            "unknown selector must be surfaced, got {decoded}"
+        );
+    }
+
+    #[test]
+    fn decode_revert_reason_never_panics_on_garbage() {
+        for input in ["0xzz", "0x08c379a0", "0x4e487b71", "abc", "0x0102"] {
+            let _ = decode_revert_reason(input);
+        }
     }
 
     /// Test-only harness: a simulator over an unreachable provider with a mock

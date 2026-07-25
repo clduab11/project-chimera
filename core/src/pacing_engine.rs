@@ -8,9 +8,10 @@
 //! - The engine uses an internal `parking_lot::RwLock` for thread-safe access.
 //! - State is persisted to JSONL on every `record_outcome` for crash-safe recovery.
 use crate::state::{CrashRecovery, OutcomeRecord, StatePersistence};
-use crate::{ChimeraError, PacingConfig, PriceOracle};
+use crate::{ChimeraError, PacingConfig, PriceOracle, NO_SWAP_VENUE};
 use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::RwLock;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -24,7 +25,14 @@ use tracing::{debug, info, warn};
 pub struct Opportunity {
     pub id: String,
     pub expected_net_usd: Decimal,
-    pub gas_estimate_gwei: u64,
+    /// Gas price in **wei**, not gwei.
+    ///
+    /// Base routinely prices gas in the single-digit *milligwei* range. Carrying
+    /// this as integer gwei (the previous shape) rounded every real price up to a
+    /// 1 gwei floor — roughly 200x the true cost — which inflated the modelled gas
+    /// cost to ~$0.28 and turned the 2.5x profit multiplier into an effective
+    /// ~$0.70 profit floor on a chain where execution costs a fraction of a cent.
+    pub gas_price_wei: u128,
     pub venue: String,
     pub eoa: String,
     pub timestamp: DateTime<Utc>,
@@ -34,7 +42,7 @@ impl Default for Opportunity {
         Self {
             id: "default".into(),
             expected_net_usd: Decimal::ZERO,
-            gas_estimate_gwei: 0,
+            gas_price_wei: 0,
             venue: "unknown".into(),
             eoa: "0x0000000000000000000000000000000000000000".into(),
             timestamp: Utc::now(),
@@ -103,7 +111,11 @@ impl PacingEngineInner {
             };
         }
         // Venue rotation gate: deny if the same venue was used within the rotation window.
-        if self.venue_rotation.contains(&opp.venue) {
+        // The no-swap route is exempt — a same-asset liquidation touches no DEX, so
+        // there is no venue concentration to spread out. Without this exemption a
+        // single same-asset execution would block every subsequent one until four
+        // other venues had executed, which the current venue set cannot supply.
+        if opp.venue != NO_SWAP_VENUE && self.venue_rotation.contains(&opp.venue) {
             return PacingDecision::Deny {
                 reason: format!("Venue {} recently used; rotation required", opp.venue),
             };
@@ -155,7 +167,7 @@ impl PacingEngineInner {
             }
         }
         // 5. Profit multiplier enforcement ΓÇö direct Decimal field, no conversion needed
-        let gas_cost_usd = self.estimate_gas_cost_usd(opp.gas_estimate_gwei);
+        let gas_cost_usd = self.estimate_gas_cost_usd(opp.gas_price_wei);
         if gas_cost_usd > Decimal::ZERO {
             let ratio = opp.expected_net_usd / gas_cost_usd;
             if ratio < self.config.min_profit_multiplier {
@@ -180,10 +192,14 @@ impl PacingEngineInner {
     /// Conservative gas cost estimate in USD.
     /// Uses a fixed liquidation gas budget and configured fallback ETH price.
     /// Both fields are now native Decimal ΓÇö no f64 conversion needed.
-    fn estimate_gas_cost_usd(&self, gas_estimate_gwei: u64) -> Decimal {
+    fn estimate_gas_cost_usd(&self, gas_price_wei: u128) -> Decimal {
         const ESTIMATED_GAS_UNITS: u64 = 150_000;
-        let gas_cost_eth = Decimal::from(gas_estimate_gwei) * Decimal::from(ESTIMATED_GAS_UNITS)
-            / Decimal::from(1_000_000_000u64);
+        const WEI_PER_ETH: u64 = 1_000_000_000_000_000_000;
+        // Sub-gwei precision is preserved end-to-end: wei -> ETH directly, with no
+        // intermediate rounding to whole gwei.
+        let gas_cost_eth = Decimal::from_u128(gas_price_wei).unwrap_or_default()
+            * Decimal::from(ESTIMATED_GAS_UNITS)
+            / Decimal::from(WEI_PER_ETH);
         let eth_price = self
             .cached_eth_price
             .unwrap_or(self.config.eth_price_usd_fallback);
@@ -241,8 +257,10 @@ impl PacingEngineInner {
             self.consecutive_reverts = 0;
             self.last_release = Some(now);
         }
-        // Update venue rotation: track recently used venues.
-        if self.config.venue_rotation_count > 0 {
+        // Update venue rotation: track recently used venues. The no-swap route is
+        // never recorded — it is exempt from the gate above, so admitting it here
+        // would only evict real venues from the window.
+        if self.config.venue_rotation_count > 0 && opp.venue != NO_SWAP_VENUE {
             self.venue_rotation.push_back(opp.venue.clone());
             while self.venue_rotation.len() >= self.config.venue_rotation_count as usize {
                 self.venue_rotation.pop_front();
@@ -256,8 +274,14 @@ impl PacingEngineInner {
                 "BREAKER: Too many consecutive reverts ({})",
                 self.consecutive_reverts
             );
-        } else if opp.gas_estimate_gwei > self.config.max_gas_gwei {
-            self.breaker_tripped = Some(BreakerReason::GasPriceTooHigh(opp.gas_estimate_gwei));
+        } else if opp.gas_price_wei > u128::from(self.config.max_gas_gwei) * 1_000_000_000 {
+            // The breaker ceiling stays denominated in whole gwei (it is a coarse
+            // runaway guard, not a pricing input), so compare in wei and report in
+            // gwei — rounding up so a price just over the line is never reported
+            // as exactly at it.
+            self.breaker_tripped = Some(BreakerReason::GasPriceTooHigh(
+                opp.gas_price_wei.div_ceil(1_000_000_000) as u64,
+            ));
         } else if self.daily_loss_eth > self.config.max_daily_loss_eth {
             self.breaker_tripped = Some(BreakerReason::DailyLossLimitExceeded);
         } else if self.weekly_net_usd > self.config.max_weekly_net_usd {
@@ -1051,7 +1075,7 @@ mod tests {
         let opp = Opportunity {
             id: "test-1".into(),
             expected_net_usd: Decimal::from(120),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "aerodrome".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1061,12 +1085,111 @@ mod tests {
     }
 
     #[test]
+    fn test_no_swap_venue_exempt_from_rotation_gate() {
+        // Isolate the rotation gate: the min-interval gate would otherwise deny
+        // the second opportunity for an unrelated reason (same approach as
+        // test_venue_rotation_* below).
+        let mut config = make_test_config();
+        config.min_interval_hours = 0;
+        let engine = PacingEngine::new(config);
+
+        let make = |id: &str| Opportunity {
+            id: id.into(),
+            expected_net_usd: Decimal::from(120),
+            gas_price_wei: 50_000_000_000,
+            venue: NO_SWAP_VENUE.into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+
+        // A same-asset liquidation records an outcome, then a second one must
+        // still be allowed — rotation must not lock out the no-swap path.
+        let first = make("same-asset-1");
+        assert!(matches!(
+            engine.check(&first).unwrap(),
+            PacingDecision::Allow { .. }
+        ));
+        engine.record_outcome(&first, Decimal::from(120), Decimal::ZERO, false);
+
+        let second = make("same-asset-2");
+        assert!(
+            matches!(engine.check(&second).unwrap(), PacingDecision::Allow { .. }),
+            "no-swap route must stay allowed after a prior no-swap execution"
+        );
+    }
+
+    #[test]
+    fn test_real_venue_still_blocked_by_rotation() {
+        // Guard against the exemption leaking: a genuine venue must keep its
+        // rotation denial exactly as before.
+        let mut config = make_test_config();
+        config.min_interval_hours = 0;
+        let engine = PacingEngine::new(config);
+
+        let opp = Opportunity {
+            id: "real-1".into(),
+            expected_net_usd: Decimal::from(120),
+            gas_price_wei: 50_000_000_000,
+            venue: "aerodrome".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        engine.record_outcome(&opp, Decimal::from(120), Decimal::ZERO, false);
+
+        let again = Opportunity {
+            id: "real-2".into(),
+            ..opp.clone()
+        };
+        assert!(
+            matches!(
+                engine.check(&again).unwrap(),
+                PacingDecision::Deny { ref reason } if reason.contains("rotation")
+            ),
+            "a real venue must still be denied by the rotation gate"
+        );
+    }
+
+    #[test]
+    fn test_no_swap_execution_does_not_evict_real_venues() {
+        let engine = PacingEngine::new(make_test_config());
+        let real = Opportunity {
+            id: "real-1".into(),
+            expected_net_usd: Decimal::from(120),
+            gas_price_wei: 50_000_000_000,
+            venue: "aerodrome".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        engine.record_outcome(&real, Decimal::from(120), Decimal::ZERO, false);
+
+        let no_swap = Opportunity {
+            id: "same-asset-1".into(),
+            expected_net_usd: Decimal::from(120),
+            gas_price_wei: 50_000_000_000,
+            venue: NO_SWAP_VENUE.into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        engine.record_outcome(&no_swap, Decimal::from(120), Decimal::ZERO, false);
+
+        // The real venue must still occupy the rotation window.
+        assert!(
+            engine.recent_venues().iter().any(|v| v == "aerodrome"),
+            "no-swap execution must not push a real venue out of the window"
+        );
+        assert!(
+            !engine.recent_venues().iter().any(|v| v == NO_SWAP_VENUE),
+            "no-swap route must never enter the rotation window"
+        );
+    }
+
+    #[test]
     fn test_denies_over_single_cap() {
         let engine = PacingEngine::new(make_test_config());
         let opp = Opportunity {
             id: "test-2".into(),
             expected_net_usd: Decimal::from(1100),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "test".into(),
             eoa: "0x0000".into(),
             timestamp: Utc::now(),
@@ -1083,7 +1206,7 @@ mod tests {
         let opp = Opportunity {
             id: "test-1".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "aerodrome".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1094,7 +1217,7 @@ mod tests {
         let opp2 = Opportunity {
             id: "test-2".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "aerodrome".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1120,7 +1243,7 @@ mod tests {
         let opp = Opportunity {
             id: "test-1".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "sushi-base".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1172,7 +1295,7 @@ mod tests {
             let opp = Opportunity {
                 id: format!("test-{}", i),
                 expected_net_usd: Decimal::from(10),
-                gas_estimate_gwei: 1,
+                gas_price_wei: 1_000_000_000,
                 venue: venue.to_string(),
                 eoa: "0xClean1".into(),
                 timestamp: Utc::now(),
@@ -1198,7 +1321,7 @@ mod tests {
             let opp = Opportunity {
                 id: format!("test-{}", i),
                 expected_net_usd: Decimal::from(10),
-                gas_estimate_gwei: 1,
+                gas_price_wei: 1_000_000_000,
                 venue: venue.to_string(),
                 eoa: "0xClean1".into(),
                 timestamp: Utc::now(),
@@ -1214,7 +1337,7 @@ mod tests {
         let opp_a = Opportunity {
             id: "test-a2".into(),
             expected_net_usd: Decimal::from(10),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1255,7 +1378,7 @@ mod tests {
         let opp = Opportunity {
             id: "test".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "new-venue".into(),
             eoa: "0xUNKNOWN".into(),
             timestamp: Utc::now(),
@@ -1290,7 +1413,7 @@ mod tests {
         let opp = Opportunity {
             id: "test-eip55".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "test-dex".into(),
             eoa: selected,
             timestamp: Utc::now(),
@@ -1315,7 +1438,7 @@ mod tests {
         let opp = Opportunity {
             id: "test".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 1,
+            gas_price_wei: 1_000_000_000,
             venue: "new-venue".into(),
             eoa: "0xA".into(),
             timestamp: Utc::now(),
@@ -1330,7 +1453,7 @@ mod tests {
         let opp = Opportunity {
             id: "test".into(),
             expected_net_usd: Decimal::from(10),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "new-venue".into(),
             eoa: "0x0000".into(),
             timestamp: Utc::now(),
@@ -1349,7 +1472,7 @@ mod tests {
         let opp = Opportunity {
             id: "test".into(),
             expected_net_usd: Decimal::from(700),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "new-venue".into(),
             eoa: "0x0000".into(),
             timestamp: Utc::now(),
@@ -1371,7 +1494,7 @@ mod tests {
             let opp = Opportunity {
                 id: format!("test-{}", i),
                 expected_net_usd: Decimal::from(10),
-                gas_estimate_gwei: 1,
+                gas_price_wei: 1_000_000_000,
                 venue: format!("venue-{}", i),
                 eoa: "0x0000".into(),
                 timestamp: Utc::now(),
@@ -1480,7 +1603,7 @@ mod tests {
             let opp = Opportunity {
                 id: format!("loss-{i}"),
                 expected_net_usd: Decimal::from(10),
-                gas_estimate_gwei: 1,
+                gas_price_wei: 1_000_000_000,
                 venue: "v".into(),
                 eoa: "0x0000".into(),
                 timestamp: Utc::now(),
@@ -1511,7 +1634,7 @@ mod tests {
             let opp = Opportunity {
                 id: "prop-test".into(),
                 expected_net_usd: net_dec,
-                gas_estimate_gwei: 0, // bypass profit multiplier gate
+                gas_price_wei: 0, // bypass profit multiplier gate
                 venue: "test".into(),
                 eoa: "0x0000".into(),
                 timestamp: Utc::now(),
@@ -1527,20 +1650,97 @@ mod tests {
     }
 
     #[test]
+    fn sub_gwei_gas_prices_are_not_rounded_up_to_one_gwei() {
+        // The defect this pins: Base prices gas around 0.005 gwei. Rounding that
+        // up to a 1 gwei floor overstated modelled gas cost by ~200x and turned
+        // the 2.5x multiplier into a ~$0.70 profit floor, denying every candidate.
+        let engine = PacingEngine::new(make_test_config());
+        let inner = engine.inner.read();
+
+        let realistic_base = inner.estimate_gas_cost_usd(5_000_000); // 0.005 gwei
+        let one_gwei = inner.estimate_gas_cost_usd(1_000_000_000); // 1 gwei
+
+        assert!(
+            realistic_base > Decimal::ZERO,
+            "a sub-gwei price must produce a real, nonzero cost — not zero"
+        );
+        assert!(
+            realistic_base < one_gwei,
+            "sub-gwei price must cost strictly less than 1 gwei; got {realistic_base} vs {one_gwei}"
+        );
+
+        // 0.005 gwei is 1/200th of 1 gwei, so the cost must scale accordingly.
+        let ratio = one_gwei / realistic_base;
+        assert_eq!(
+            ratio,
+            Decimal::from(200),
+            "cost must scale linearly with wei; got ratio {ratio}"
+        );
+    }
+
+    #[test]
+    fn realistic_base_liquidation_clears_the_profit_multiplier() {
+        // End-to-end economics: a $2 profit on a real Base gas price must pass.
+        // Under the old integer-gwei model this same opportunity was denied,
+        // because the hurdle sat at ~$0.70 instead of ~$0.0035.
+        let mut config = make_test_config();
+        config.min_interval_hours = 0;
+        let engine = PacingEngine::new(config);
+
+        let opp = Opportunity {
+            id: "realistic-base".into(),
+            expected_net_usd: Decimal::from(2),
+            gas_price_wei: 5_000_000, // 0.005 gwei, typical Base
+            venue: "sushi-base".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+
+        assert!(
+            matches!(engine.check(&opp).unwrap(), PacingDecision::Allow { .. }),
+            "a $2 profit at realistic Base gas must clear the 2.5x multiplier"
+        );
+    }
+
+    #[test]
+    fn gas_breaker_ceiling_still_trips_in_gwei_terms() {
+        // The breaker ceiling stays denominated in whole gwei; confirm the wei
+        // comparison did not shift where it fires. max_gas_gwei is 300 here.
+        let engine = PacingEngine::new(make_test_config());
+        let over = Opportunity {
+            id: "gas-spike".into(),
+            expected_net_usd: Decimal::from(500),
+            gas_price_wei: 301_000_000_000, // 301 gwei
+            venue: "sushi-base".into(),
+            eoa: "0xClean1".into(),
+            timestamp: Utc::now(),
+        };
+        engine.record_outcome(&over, Decimal::from(500), Decimal::ZERO, false);
+
+        assert!(
+            matches!(
+                engine.check(&over).unwrap(),
+                PacingDecision::Deny { ref reason } if reason.contains("Breaker")
+            ),
+            "301 gwei must still trip the 300 gwei ceiling"
+        );
+    }
+
+    #[test]
     fn estimate_gas_cost_uses_cached_eth_price() {
         let engine = PacingEngine::new(make_test_config());
-        let gas_gwei = 50u64;
-        let cost_fallback = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
+        let gas_wei = 50_000_000_000u128; // 50 gwei
+        let cost_fallback = engine.inner.read().estimate_gas_cost_usd(gas_wei);
         assert!(cost_fallback > Decimal::ZERO);
         let cached_price = Decimal::from(3000);
         engine.inner.write().cached_eth_price = Some(cached_price);
-        let cost_cached = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
+        let cost_cached = engine.inner.read().estimate_gas_cost_usd(gas_wei);
         assert!(
             cost_cached > cost_fallback,
             "cached price 3000 should produce higher cost than fallback 1800"
         );
         engine.inner.write().cached_eth_price = None;
-        let cost_after_clear = engine.inner.read().estimate_gas_cost_usd(gas_gwei);
+        let cost_after_clear = engine.inner.read().estimate_gas_cost_usd(gas_wei);
         assert_eq!(
             cost_after_clear, cost_fallback,
             "after clearing cache, should fall back to config"
@@ -1562,7 +1762,7 @@ mod tests {
         let opp = Opportunity {
             id: "opp-1".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "aerodrome".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1594,7 +1794,7 @@ mod tests {
         let opp1 = Opportunity {
             id: "opp-big".into(),
             expected_net_usd: Decimal::from(1900),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1605,7 +1805,7 @@ mod tests {
         let opp2 = Opportunity {
             id: "opp-over".into(),
             expected_net_usd: Decimal::from(200),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "b".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1629,7 +1829,7 @@ mod tests {
         let opp = Opportunity {
             id: "opp-expire".into(),
             expected_net_usd: Decimal::from(500),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1670,7 +1870,7 @@ mod tests {
         let opp1 = Opportunity {
             id: "p1-opp".into(),
             expected_net_usd: Decimal::from(1200),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1680,7 +1880,7 @@ mod tests {
         let opp2 = Opportunity {
             id: "p2-opp".into(),
             expected_net_usd: Decimal::from(900),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "b".into(),
             eoa: "0xClean2".into(),
             timestamp: Utc::now(),
@@ -1696,7 +1896,7 @@ mod tests {
         let opp3 = Opportunity {
             id: "p2-opp-small".into(),
             expected_net_usd: Decimal::from(500),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "c".into(),
             eoa: "0xClean2".into(),
             timestamp: Utc::now(),
@@ -1716,7 +1916,7 @@ mod tests {
         let opp1 = Opportunity {
             id: "opp-1".into(),
             expected_net_usd: Decimal::from(1500),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1727,7 +1927,7 @@ mod tests {
         let opp2 = Opportunity {
             id: "opp-2".into(),
             expected_net_usd: Decimal::from(1500),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "b".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1804,7 +2004,7 @@ NOT_VALID_JSON
         let opp = Opportunity {
             id: "opp-1".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1832,7 +2032,7 @@ NOT_VALID_JSON
         let opp1 = Opportunity {
             id: "base-opp".into(),
             expected_net_usd: Decimal::from(500),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1843,7 +2043,7 @@ NOT_VALID_JSON
         let opp2 = Opportunity {
             id: "arb-opp".into(),
             expected_net_usd: Decimal::from(1600),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "b".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1859,7 +2059,7 @@ NOT_VALID_JSON
         let opp3 = Opportunity {
             id: "arb-opp-small".into(),
             expected_net_usd: Decimal::from(1000),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "c".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1912,7 +2112,7 @@ NOT_VALID_JSON
         let opp = Opportunity {
             id: "tokio-test".into(),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1947,7 +2147,7 @@ NOT_VALID_JSON
         let opp1 = Opportunity {
             id: "realized-1".into(),
             expected_net_usd: Decimal::from(500),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "a".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1970,7 +2170,7 @@ NOT_VALID_JSON
         let opp2 = Opportunity {
             id: "reserve-after-realized".into(),
             expected_net_usd: Decimal::from(1700),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "b".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -1986,7 +2186,7 @@ NOT_VALID_JSON
         let opp3 = Opportunity {
             id: "would-exceed".into(),
             expected_net_usd: Decimal::from(2000),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "c".into(),
             eoa: "0xClean1".into(),
             timestamp: Utc::now(),
@@ -2012,7 +2212,7 @@ NOT_VALID_JSON
         let opp1 = Opportunity {
             id: format!("liq-{}-{}-{}", 8453, "0xBorrower1", ts1.timestamp_millis()),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "test-dex".into(),
             eoa: "0xClean1".into(),
             timestamp: ts1,
@@ -2021,7 +2221,7 @@ NOT_VALID_JSON
         let opp2 = Opportunity {
             id: format!("liq-{}-{}-{}", 8453, "0xBorrower1", ts2.timestamp_millis()),
             expected_net_usd: Decimal::from(100),
-            gas_estimate_gwei: 50,
+            gas_price_wei: 50_000_000_000,
             venue: "test-dex-2".into(),
             eoa: "0xClean1".into(),
             timestamp: ts2,

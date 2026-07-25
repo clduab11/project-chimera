@@ -5,4 +5,4 @@
 
 pub mod resolver;
 
-pub use resolver::{ResolvedV2Route, RoutingResolver};
+pub use resolver::{ResolvedV2Route, RoutingResolver, NO_SWAP_VENUE};

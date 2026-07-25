@@ -35,7 +35,7 @@ pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use pacing_engine::{
     BreakerReason, CrossProcessPacing, Opportunity, PacingDecision, PacingEngine,
 };
-pub use routing::{ResolvedV2Route, RoutingResolver};
+pub use routing::{ResolvedV2Route, RoutingResolver, NO_SWAP_VENUE};
 pub use signer_registry::{ManagedSigner, SignerRegistry};
 pub use simulator::{L2ChainType, LiquidationCandidate, LiquidationSimulator, SimulationResult};
 pub use snapshot_refresh::{RefreshOutcome, ReservePriceSource, SharedSnapshot, SnapshotRefresher};

@@ -327,7 +327,9 @@ pub struct UserPosition {
 /// High-performance liquidation detector (pre-filter only).
 pub struct LiquidationDetector {
     snapshot: MarketSnapshot,
-    hf_liquidation_threshold: U256, // RAY scale: 1.05e27 = 1.05x HF threshold
+    /// RAY scale. Flag threshold, deliberately just ABOVE Aave's hard 1.0 cutoff
+    /// so a position is seen shortly before it becomes liquidatable.
+    hf_liquidation_threshold: U256,
     chain_id: u64,
 }
 
@@ -339,9 +341,21 @@ impl Default for LiquidationDetector {
 
 impl LiquidationDetector {
     pub fn new(snapshot: MarketSnapshot, chain_id: u64) -> Self {
-        // Default: HF < 1.05 triggers liquidation (Aave default: HEALTH_FACTOR_LIQUIDATION_THRESHOLD = 1.05e18)
-        // In RAY scale this is 1.05 * 1e27 = 1050000000000000000000000000
-        let hf_liquidation_threshold = U256::from(105) * U256::from(10).pow(U256::from(25)); // 1.05e27
+        // Aave's `HEALTH_FACTOR_LIQUIDATION_THRESHOLD` is **1.0e18**, not 1.05e18 —
+        // `validateLiquidationCall` refuses anything at or above 1.0 with
+        // `HealthFactorNotBelowThreshold()` (selector 0x930bb771). A 1.05 flag
+        // threshold therefore emitted candidates the Pool could never accept, and
+        // every one of them burned a full REVM simulation per block, forever.
+        //
+        // Observed live 2026-07-25: with a 1.05 threshold and a snapshot whose
+        // median HF was 1.0550, the dead band between 1.0 and 1.05 produced a
+        // continuous stream of 0x930bb771 reverts.
+        //
+        // 1.01 keeps a thin staleness margin so a position can be seen just
+        // *before* it crosses — affordable now that live prices refresh every
+        // block (`price_refresh_secs: 2`) instead of every fourth.
+        // In RAY scale: 1.01 * 1e27 = 1010000000000000000000000000
+        let hf_liquidation_threshold = U256::from(101) * U256::from(10).pow(U256::from(25)); // 1.01e27
         Self {
             snapshot,
             hf_liquidation_threshold,
@@ -832,7 +846,7 @@ mod tests {
         let detector = LiquidationDetector::new(snap, 8453);
         let candidates = detector.find_at_risk_positions();
 
-        // True HF = (5000 * 0.825) / 4500 = 0.9167 → below the 1.05 threshold → flagged.
+        // True HF = (5000 * 0.825) / 4500 = 0.9167 → below the 1.01 threshold → flagged.
         assert_eq!(
             candidates.len(),
             1,
@@ -898,6 +912,32 @@ mod tests {
         let detector = LiquidationDetector::new(snapshot.clone(), 1);
         assert_eq!(detector.chain_id, 1);
         assert_eq!(detector.snapshot.chain_id, 1);
+    }
+
+    #[test]
+    fn flag_threshold_sits_just_above_aaves_hard_cutoff() {
+        // Aave's HEALTH_FACTOR_LIQUIDATION_THRESHOLD is 1.0 (1e18 WAD / 1e27 RAY).
+        // `validateLiquidationCall` rejects anything >= 1.0 with
+        // HealthFactorNotBelowThreshold() — selector 0x930bb771, observed live.
+        //
+        // The flag threshold must stay ABOVE 1.0 (so positions are seen shortly
+        // before they cross) but close to it (so we do not simulate a wide band
+        // of positions the Pool will always refuse). 1.05 cost a continuous
+        // stream of guaranteed-revert simulations; the ceiling here is the
+        // regression guard against drifting back.
+        let detector = LiquidationDetector::default();
+        let ray = U256::from(10).pow(U256::from(27));
+        let ceiling = U256::from(102) * U256::from(10).pow(U256::from(25)); // 1.02e27
+
+        assert!(
+            detector.hf_liquidation_threshold > ray,
+            "threshold must exceed 1.0 or positions are only seen after they cross"
+        );
+        assert!(
+            detector.hf_liquidation_threshold <= ceiling,
+            "threshold must stay near 1.0; a wide band simulates positions Aave \
+             refuses with HealthFactorNotBelowThreshold()"
+        );
     }
 
     #[test]

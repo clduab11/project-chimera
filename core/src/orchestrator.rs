@@ -15,12 +15,12 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use hex;
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Baseline OP-stack / Arbitrum L1 fee scalar (scalar / 1e6 == 1.0). The simulator's
 /// chain-specific fee model refines this; a neutral baseline is used per scan.
@@ -469,14 +469,17 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
                 .map_err(|e| ChimeraError::RpcError(format!("get_gas_price failed: {e}")))?
         };
         let gas_price_u256 = U256::from(gas_price_wei);
-        let gas_estimate_gwei = gas_price_wei.div_ceil(1_000_000_000u128) as u64;
 
-        // Reject zero gas estimate (degenerate / unsynced node) — never simulate or act on it.
-        if gas_estimate_gwei == 0 {
+        // Reject a genuinely zero gas price (degenerate / unsynced node) — never
+        // simulate or act on it. This checks WEI, not gwei: the previous
+        // `div_ceil` to whole gwei both hid sub-gwei prices from the cost model
+        // and made this guard unreachable, since any nonzero wei price rounded up
+        // to at least 1.
+        if gas_price_wei == 0 {
             warn!(
                 target = "chimera::orchestrator",
                 user = %candidate.user,
-                "Skipping candidate: gas estimate is 0 gwei"
+                "Skipping candidate: gas price is 0 wei"
             );
             return Ok(());
         }
@@ -518,7 +521,13 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
         };
 
         // Metrics boundary: Decimal -> f64 only for the histogram observation.
-        let result_label = if sim_result.profitable {
+        // "reverted" is distinct from "unprofitable": the first means the
+        // simulation produced no usable number, the second means it produced a
+        // number we did not like. Collapsing them hid a total outage behind a
+        // label that read as normal market conditions.
+        let result_label = if sim_result.revert_reason.is_some() {
+            "reverted"
+        } else if sim_result.profitable {
             "success"
         } else {
             "unprofitable"
@@ -531,30 +540,53 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             sim_result.expected_profit_usd.to_f64().unwrap_or(0.0),
         );
 
+        // A reverted simulation carries no price information. Previously such a
+        // candidate flowed onward with expected_profit_usd = $0.00 and was denied
+        // downstream as "InsufficientProfit", which reported a broken simulation
+        // as a merely unattractive trade. Stop here instead — the simulator has
+        // already logged the decoded revert reason.
+        if sim_result.revert_reason.is_some() {
+            return Ok(());
+        }
+
         // 2.5 — Route resolution: find a V2 DEX route for this collateral/debt pair.
         // Must happen BEFORE Opportunity construction so the venue field is accurate.
         // Rotation-aware: venues inside the pacing rotation window are skipped
         // here so resolution falls through to the next eligible venue instead
         // of resolving one the rotation gate would deny (candidate drop).
-        let chain_label = self.chain_label_str();
-        let resolver = RoutingResolver::new(&self.routing_config, &self.risk_config);
-        let recent_venues = self.pacing.engine().recent_venues();
-        let route = resolver.resolve_v2_eligible(
-            candidate.collateral_asset,
-            candidate.debt_asset,
-            chain_label,
-            candidate.debt_to_cover,
-            |venue| !recent_venues.iter().any(|recent| recent == venue),
-        );
-
-        let Some(route) = route else {
-            warn!(
+        let route = if candidate.collateral_asset == candidate.debt_asset {
+            // Same-asset liquidation: the seized collateral IS the debt asset, so
+            // there is no swap leg to route. Requiring a DEX route here would drop
+            // a candidate the Executor can already settle (it skips both the router
+            // validation and the swap when `collateralAsset == asset`).
+            debug!(
                 target = "chimera::orchestrator",
-                collateral = %candidate.collateral_asset,
-                debt = %candidate.debt_asset,
-                "No eligible V2 route found; skipping candidate"
+                asset = %candidate.debt_asset,
+                "Same-asset liquidation; no swap leg required"
             );
-            return Ok(());
+            ResolvedV2Route::no_swap(candidate.debt_asset)
+        } else {
+            let chain_label = self.chain_label_str();
+            let resolver = RoutingResolver::new(&self.routing_config, &self.risk_config);
+            let recent_venues = self.pacing.engine().recent_venues();
+            let resolved = resolver.resolve_v2_eligible(
+                candidate.collateral_asset,
+                candidate.debt_asset,
+                chain_label,
+                candidate.debt_to_cover,
+                |venue| !recent_venues.iter().any(|recent| recent == venue),
+            );
+
+            let Some(resolved) = resolved else {
+                warn!(
+                    target = "chimera::orchestrator",
+                    collateral = %candidate.collateral_asset,
+                    debt = %candidate.debt_asset,
+                    "No eligible V2 route found; skipping candidate"
+                );
+                return Ok(());
+            };
+            resolved
         };
 
         // 3. Build the opportunity from REAL candidate + simulation fields + resolved route.
@@ -593,7 +625,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
                 chrono::Utc::now().timestamp_millis()
             ),
             expected_net_usd: sim_result.expected_profit_usd,
-            gas_estimate_gwei,
+            gas_price_wei,
             venue: route.venue_name.clone(),
             eoa,
             timestamp: chrono::Utc::now(),
@@ -648,8 +680,12 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
         };
 
         // Gas actually attributable to this liquidation (Decimal, never f64).
-        let gas_spent_eth = Decimal::from(sim_result.gas_used) * Decimal::from(gas_estimate_gwei)
-            / Decimal::from(1_000_000_000u64);
+        // Computed from wei: rounding the price up to whole gwei here overstated
+        // realized spend on Base by ~200x, which inflates `daily_loss_eth` and
+        // would trip the max-loss breaker long before real losses justified it.
+        let gas_spent_eth = Decimal::from(sim_result.gas_used)
+            * Decimal::from_u128(gas_price_wei).unwrap_or_default()
+            / Decimal::from(1_000_000_000_000_000_000u64);
 
         // 6.5 — Strategy assembly: build the same Executor-target request in all modes.
         let worker_eoa: Address = match opp.eoa.parse() {

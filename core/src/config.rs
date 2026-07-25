@@ -97,7 +97,7 @@ fn default_pools_toml_path() -> String {
     "config/pools.toml".into()
 }
 fn default_sweep_interval_secs() -> u64 {
-    300
+    900
 }
 fn default_refund_interval_secs() -> u64 {
     3600
@@ -146,7 +146,7 @@ impl Default for PacingConfig {
             treasury_address: String::new(),
             treasury_keystore: String::new(),
             worker_keystore_dir: String::new(),
-            sweep_interval_secs: 300,
+            sweep_interval_secs: 900,
             refund_interval_secs: 3600,
             min_worker_balance_eth: Decimal::from_str("0.002").expect("valid literal"),
             refund_topup_eth: Decimal::from_str("0.01").expect("valid literal"),
@@ -558,7 +558,7 @@ executor_address: \"\"
 treasury_address: \"\"
 treasury_keystore: \"\"
 worker_keystore_dir: \"\"
-sweep_interval_secs: 300
+sweep_interval_secs: 900
 refund_interval_secs: 3600
 min_worker_balance_eth: 0.002
 refund_topup_eth: 0.01

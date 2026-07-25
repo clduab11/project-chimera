@@ -248,9 +248,16 @@ fn make_multi_user_snapshot() -> MarketSnapshot {
         (
             USER2,
             user_position(
-                // 2 WETH ($6800) vs 5500 USDT (6-decimal) debt → HF ≈ 1.02.
+                // 2 WETH ($6800) vs 5700 USDT (6-decimal) debt → HF ≈ 0.98.
+                //
+                // Was 5500 (HF ≈ 1.02). That sat inside the old 1.05 flag band but
+                // ABOVE Aave's hard 1.0 cutoff, so the Pool would have refused it
+                // with HealthFactorNotBelowThreshold(). Both users must be genuinely
+                // liquidatable for this test to mean anything — it proves
+                // `candidates_seen` counts per candidate rather than per scan, which
+                // requires two real candidates in a single scan.
                 vec![(*COLL_WETH.as_ref(), 2_000_000_000_000_000_000u128)],
-                vec![(*DEBT_USDT.as_ref(), 5_500_000_000u128)],
+                vec![(*DEBT_USDT.as_ref(), 5_700_000_000u128)],
                 0,
                 false,
             ),
@@ -458,7 +465,7 @@ fn test_locally_denied_does_not_consume_caps() {
     let opp = Opportunity {
         id: "denied-no-consumption".into(),
         expected_net_usd: dec!(1500),
-        gas_estimate_gwei: 10,
+        gas_price_wei: 10_000_000_000,
         venue: "venue-denied".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -513,7 +520,7 @@ fn test_breaker_stays_untripped_under_normal_ops() {
         let opp = Opportunity {
             id: format!("breaker-test-{}", i),
             expected_net_usd: dec!(80),
-            gas_estimate_gwei: 25,
+            gas_price_wei: 25_000_000_000,
             venue: format!("venue-{}", i),
             eoa: format!("0x{:x}", WORKER_EOA),
             timestamp: Utc::now(),
@@ -558,7 +565,7 @@ fn test_cross_process_reservation_lifecycle() {
     let opp = Opportunity {
         id: "reserve-settle-001".into(),
         expected_net_usd: dec!(150),
-        gas_estimate_gwei: 25,
+        gas_price_wei: 25_000_000_000,
         venue: "test-dex".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -583,7 +590,7 @@ fn test_cross_process_reservation_lifecycle() {
     let opp2 = Opportunity {
         id: "expire-002".into(),
         expected_net_usd: dec!(50),
-        gas_estimate_gwei: 25,
+        gas_price_wei: 25_000_000_000,
         venue: "test-dex".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -644,7 +651,7 @@ fn test_emergency_halt_trips_breaker_and_blocks() {
     let opp = Opportunity {
         id: "blocked-001".into(),
         expected_net_usd: dec!(100),
-        gas_estimate_gwei: 10,
+        gas_price_wei: 10_000_000_000,
         venue: "test".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -764,7 +771,7 @@ fn test_pacing_insufficient_profit_denied() {
     let opp = Opportunity {
         id: "low-profit".into(),
         expected_net_usd: dec!(10),
-        gas_estimate_gwei: 50,
+        gas_price_wei: 50_000_000_000,
         venue: "test".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -791,7 +798,7 @@ fn test_pacing_over_single_cap_denied() {
     let opp = Opportunity {
         id: "over-cap".into(),
         expected_net_usd: dec!(1500),
-        gas_estimate_gwei: 10,
+        gas_price_wei: 10_000_000_000,
         venue: "test".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -818,7 +825,7 @@ fn test_record_outcome_updates_risk_state() {
     let opp = Opportunity {
         id: "risk-001".into(),
         expected_net_usd: dec!(120),
-        gas_estimate_gwei: 30,
+        gas_price_wei: 30_000_000_000,
         venue: "venue-1".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -834,7 +841,7 @@ fn test_record_outcome_updates_risk_state() {
     let opp2 = Opportunity {
         id: "risk-002".into(),
         expected_net_usd: dec!(80),
-        gas_estimate_gwei: 30,
+        gas_price_wei: 30_000_000_000,
         venue: "venue-2".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),
@@ -848,7 +855,7 @@ fn test_record_outcome_updates_risk_state() {
     let opp3 = Opportunity {
         id: "risk-003".into(),
         expected_net_usd: dec!(100),
-        gas_estimate_gwei: 30,
+        gas_price_wei: 30_000_000_000,
         venue: "venue-3".into(),
         eoa: format!("0x{:x}", WORKER_EOA),
         timestamp: Utc::now(),

@@ -46,7 +46,8 @@ executor_address: ""
 treasury_address: ""
 treasury_keystore: ""
 worker_keystore_dir: ""
-sweep_interval_secs: 300
+sweep_interval_secs: 900        # eth_getBalance is the single largest RPC method by volume;
+                                # between trades this is pure overhead.
 refund_interval_secs: 3600
 min_worker_balance_eth: 0.002
 refund_topup_eth: 0.01

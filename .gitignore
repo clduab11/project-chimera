@@ -103,3 +103,15 @@ chimera-expansion-*.md
 tests/fixtures/golden_replays.json
 keystores/
 rustup-init.exe
+
+# Timestamped snapshot backups taken before a regeneration (*.bak alone does not
+# match the `.bak-<timestamp>` suffix).
+config/snapshot.json.bak-*
+
+# Persisted borrower discovery cache: regenerable, grows to hundreds of
+# thousands of addresses, and changes on every incremental scan.
+config/borrowers.*.json
+
+# Local live launcher — holds operator-specific paths, intentionally untracked.
+tmp_run_live.sh
+tmp_run_live.sh.orig

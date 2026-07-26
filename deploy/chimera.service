@@ -1,0 +1,28 @@
+[Unit]
+Description=Project Chimera — Sequential Capital Reallocation Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chimera
+WorkingDirectory=/opt/chimera
+EnvironmentFile=/opt/chimera/.env.live
+ExecStart=/opt/chimera/target/release/chimera
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chimera
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/chimera/logs /opt/chimera/core/state
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

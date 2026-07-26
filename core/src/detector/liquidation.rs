@@ -170,13 +170,22 @@ fn parse_balance_map(raw: HashMap<String, String>) -> Result<HashMap<Address, U2
     Ok(out)
 }
 
+/// Aave's RAY (1e27), the fixed-point scale for indices and health factors.
+///
+/// Single definition on purpose: this constant divides collateral and debt in
+/// every profitability path, so independent copies that drift apart would
+/// mis-scale liquidations rather than fail loudly.
+fn ray() -> U256 {
+    U256::from(1_000_000_000_000_000_000_000_000_000u128)
+}
+
 /// Parse an optional u128 index string from JSON. "" or absent → RAY (1e27).
 fn parse_index_or_ray(s: &str) -> U256 {
     if s.is_empty() {
         // Default RAY value for backward compatibility with older snapshots.
-        U256::from(1_000_000_000_000_000_000_000_000_000u128)
+        ray()
     } else {
-        U256::from_str(s).unwrap_or(U256::from(1_000_000_000_000_000_000_000_000_000u128))
+        U256::from_str(s).unwrap_or_else(|_| ray())
     }
 }
 
@@ -367,6 +376,7 @@ impl LiquidationDetector {
     /// This is the cheap path that runs on every block / sequencer event.
     pub fn find_at_risk_positions(&self) -> Vec<LiquidationCandidate> {
         let mut candidates = Vec::new();
+        let ray = ray();
 
         for (user, position) in &self.snapshot.users {
             let (total_collateral, total_debt, _avg_liq_threshold, hf) =
@@ -395,10 +405,6 @@ impl LiquidationDetector {
                     continue;
                 }
 
-                // Apply close factor to determine debt_to_cover (Aave GenericLogic).
-                let debt_to_cover =
-                    self.apply_close_factor(total_collateral, total_debt, hf, &position.debt);
-
                 // Edge case 1 (frozen/paused/inactive): only seizable collateral can be the
                 // liquidation target. `select_best_collateral` filters to seizable reserves;
                 // a candidate whose only collateral is non-seizable is NOT emitted.
@@ -413,22 +419,40 @@ impl LiquidationDetector {
                         .get(&collateral_asset)
                         .map(|r| (r.decimals, r.price_usd))
                         .unwrap_or((18, U256::ZERO));
-                    for debt_asset in position.debt.keys() {
+                    for (debt_asset, scaled_debt) in &position.debt {
                         // Debt reserve metadata for the simulator's USD profit
                         // conversion. A debt asset missing from the reserves map
                         // gets price 0 = "unknown" (sim falls back with a warn).
-                        let (debt_decimals, debt_price_usd) = self
-                            .snapshot
-                            .reserves
-                            .get(debt_asset)
+                        let debt_reserve = self.snapshot.reserves.get(debt_asset);
+                        let (debt_decimals, debt_price_usd) = debt_reserve
                             .map(|r| (r.decimals, r.price_usd))
                             .unwrap_or((18, U256::ZERO));
+
+                        // Aave applies the close factor to THIS reserve's debt in the
+                        // debt token's own native units. `scaled_debt` is pre-index, so
+                        // it must be brought forward by the borrow index first — the same
+                        // conversion calculate_user_account_data does before pricing. A
+                        // reserve missing from the snapshot has no index; RAY (a no-op)
+                        // is the parser's own default for an absent index.
+                        // `saturating_mul`: snapshot balances are parsed from a
+                        // JSON file, so an absurd value reaches this multiply
+                        // without ever touching a chain. Honest supplies leave
+                        // ~17 orders of magnitude of headroom under U256::MAX/1e27,
+                        // but saturating here fails toward a capped size rather
+                        // than a wrapped one.
+                        let current_debt = match debt_reserve {
+                            Some(r) => scaled_debt.saturating_mul(r.variable_borrow_index) / ray,
+                            None => *scaled_debt,
+                        };
+                        let debt_to_cover = self.apply_close_factor(hf, current_debt);
+                        if debt_to_cover.is_zero() {
+                            continue;
+                        }
                         let candidate = LiquidationCandidate {
                             user: *user,
                             collateral_asset,
                             debt_asset: *debt_asset,
-                            debt_to_cover: debt_to_cover
-                                .min(*position.debt.get(debt_asset).unwrap_or(&U256::ZERO)),
+                            debt_to_cover,
                             receive_a_token: false,
                             current_hf: hf,
                             chain_id: self.chain_id,
@@ -456,44 +480,70 @@ impl LiquidationDetector {
 
     /// Aave V3 close factor logic (LiquidationLogic `_calculateDebt`).
     ///
-    /// Aave V3 uses a two-tier close factor keyed off `CLOSE_FACTOR_HF_THRESHOLD = 0.95`:
-    /// - HF >= 1.0: not liquidatable (close factor = 0)
-    /// - 0.95 < HF < 1.0: `DEFAULT_LIQUIDATION_CLOSE_FACTOR` = 50% of the debt
-    /// - HF <= 0.95: `MAX_LIQUIDATION_CLOSE_FACTOR` = 100% of the debt
+    /// Aave V3 uses a **linear interpolation** between
+    /// `CLOSE_FACTOR_HF_THRESHOLD` (0.95 RAY) and
+    /// `HEALTH_FACTOR_LIQUIDATION_THRESHOLD` (1.0 RAY):
     ///
-    /// This is a pre-filter estimate against `total_debt`; the caller caps the
-    /// result to the specific debt-asset position, and the REVM simulator computes
-    /// the exact `actualDebtToLiquidate` (including `MIN_LEFTOVER_BASE` and protocol fee).
+    /// ```text
+    /// closeFactor = DEFAULT + (MAX - DEFAULT) * (1.0 - HF) / (1.0 - 0.95)
+    ///            = 0.5 + 10 * (1.0 - HF)          (all in RAY = 1e27)
+    /// ```
+    ///
+    /// - HF >= 1.0: not liquidatable (close factor = 0)
+    /// - HF <= 0.95: `MAX_LIQUIDATION_CLOSE_FACTOR` = 100% of the debt
+    /// - 0.95 < HF < 1.0: linear from 50%→0% as HF approaches 1.0
+    ///
+    /// This replaces the original binary 50% approximation, ensuring that
+    /// micro-liquidation positions receive proportionally correct debt coverage
+    /// rather than being rounded to zero or a fixed half. The eight-decimal USD
+    /// values are scaled through RAY (1e27) before the close factor is computed,
+    /// preventing precision collapse for small positions.
+    ///
+    /// `user_reserve_debt` is a SINGLE reserve's current debt in that debt token's
+    /// native units (post-index), and the return value is in those same units —
+    /// which is what Aave's `liquidationCall(.., debtToCover, ..)` expects. Aave
+    /// applies the close factor per reserve (`_calculateDebt` reads
+    /// `userReserveDebt`), never to the position's aggregate USD value: mixing the
+    /// two silently truncates `debtToCover` to dust whenever the USD figure is
+    /// numerically smaller than the native one, which is every 18-decimal debt
+    /// asset above roughly $1. The REVM simulator still computes the exact
+    /// `actualDebtToLiquidate` (including `MIN_LEFTOVER_BASE` and protocol fee).
     /// Verify constants against the deployed Aave V3 Origin commit before live mode
     /// (see `docs/research/aave-v3-liquidation-compendium.md`).
-    fn apply_close_factor(
-        &self,
-        _total_collateral: U256,
-        total_debt: U256,
-        hf: U256,
-        debt_positions: &HashMap<Address, U256>,
-    ) -> U256 {
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
-                                                                         // CLOSE_FACTOR_HF_THRESHOLD = 0.95 in RAY scale.
-        let close_factor_hf_threshold = U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
+    fn apply_close_factor(&self, hf: U256, user_reserve_debt: U256) -> U256 {
+        let ray = ray();
+        // CLOSE_FACTOR_HF_THRESHOLD = 0.95 in RAY scale.
+        let close_factor_hf_threshold =
+            U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
 
+        // HF >= 1.0: not liquidatable.
         if hf >= ray {
             return U256::ZERO;
         }
 
-        let close_factor = if hf <= close_factor_hf_threshold {
-            // HF <= 0.95: MAX_LIQUIDATION_CLOSE_FACTOR = 100% of debt.
-            total_debt
-        } else {
-            // 0.95 < HF < 1.0: DEFAULT_LIQUIDATION_CLOSE_FACTOR = 50% of debt.
-            total_debt / U256::from(2)
-        };
+        // HF <= 0.95: MAX_LIQUIDATION_CLOSE_FACTOR = 100%.
+        if hf <= close_factor_hf_threshold {
+            return user_reserve_debt;
+        }
 
-        // Cap by the largest single debt position (one liquidationCall covers one debt asset).
-        // NOTE: exact `MIN_LEFTOVER_BASE` dust handling, collateral seizure limits, and the
-        // liquidation protocol fee are enforced by the REVM simulator, not this pre-filter.
-        let max_position_debt = debt_positions.values().copied().max().unwrap_or(U256::ZERO);
-        close_factor.min(max_position_debt)
+        // 0.95 < HF < 1.0: linear interpolation.
+        // closeFactor_ray = 0.5e27 + 10 * (1.0e27 - hf)
+        // (because 0.5e27 / 0.05e27 = 10)
+        let default_close = ray / U256::from(2); // 0.5e27 (50%)
+        let hf_above_threshold = ray - hf; // (1.0 - HF) in RAY
+        // Extra close factor = 10 * (1.0 - HF) in RAY, clamped to [0, 0.5e27]
+        let extra_factor = hf_above_threshold * U256::from(10);
+        let close_factor_ray = default_close + extra_factor;
+
+        // Apply close factor to native-unit debt:
+        //   debt_to_cover = user_reserve_debt * close_factor_ray / ray
+        // For safety, cap at the full user reserve debt (close_factor_ray ≤ ray).
+        let debt_to_cover = user_reserve_debt * close_factor_ray / ray;
+        if debt_to_cover > user_reserve_debt {
+            user_reserve_debt
+        } else {
+            debt_to_cover
+        }
     }
 
     /// Select the collateral asset with the highest USD-weighted liquidation
@@ -503,7 +553,7 @@ impl LiquidationDetector {
         &self,
         collateral: &HashMap<Address, U256>,
     ) -> Option<(Address, U256)> {
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+        let ray = ray();
         collateral
             .iter()
             // Edge case 1: only seizable reserves (active && !frozen && !paused) are
@@ -545,7 +595,7 @@ impl LiquidationDetector {
         position: &UserPosition,
     ) -> (U256, U256, U256, U256) {
         let _ = user; // retained for symmetry/logging; not used in the math itself
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
+        let ray = ray();
 
         let mut total_collateral_usd: U256 = U256::ZERO; // RAY scaled collateral value
         let mut total_debt_usd: U256 = U256::ZERO; // RAY scaled debt value
@@ -796,8 +846,11 @@ mod tests {
                     // $5000 of USDC: 5000e6 raw units.
                     (usdc, U256::from(5_000_000_000u128)),
                 ]),
-                // 1.6 WETH debt ($4000) → HF ≈ 0.99: liquidatable, not bad debt.
-                debt: HashMap::from([(weth, U256::from(1_600_000_000_000_000_000u128))]),
+                // 1.7 WETH debt ($4250) → HF ≈ 0.943: liquidatable, not bad debt.
+                // (1.6 WETH here gave HF 1.002 — above Aave's cutoff. It only
+                // produced a candidate because the close factor returned 0 and the
+                // old code emitted the position anyway with debt_to_cover = 0.)
+                debt: HashMap::from([(weth, U256::from(1_700_000_000_000_000_000u128))]),
                 emode_category: 0,
                 is_in_isolation: false,
             },
@@ -940,15 +993,16 @@ mod tests {
         );
     }
 
+    /// 1 WETH in native units — deliberately NOT the same magnitude as any USD
+    /// figure in these tests, so a units mix-up cannot pass by coincidence.
+    const ONE_WETH: u128 = 1_000_000_000_000_000_000;
+
     #[test]
     fn test_close_factor_hf_above_one() {
         let detector = LiquidationDetector::new(make_snapshot(), 8453);
-        let debt = HashMap::from([(Address::ZERO, U256::from(1_000_000u64))]);
         let result = detector.apply_close_factor(
-            U256::from(1_000_000u64),
-            U256::from(1_000_000u64),
             U256::from(1_050_000_000_000_000_000_000_000_000_000u128), // 1.05e27
-            &debt,
+            U256::from(ONE_WETH),
         );
         assert_eq!(result, U256::ZERO);
     }
@@ -956,65 +1010,244 @@ mod tests {
     #[test]
     fn test_close_factor_hf_below_95_is_full() {
         let detector = LiquidationDetector::new(make_snapshot(), 8453);
-        let debt = HashMap::from([(Address::ZERO, U256::from(1_000_000u64))]);
         let result = detector.apply_close_factor(
-            U256::from(10_000_000u64),
-            U256::from(1_000_000u64),
             U256::from(940_000_000_000_000_000_000_000_000u128), // 0.94e27
-            &debt,
+            U256::from(ONE_WETH),
         );
-        // HF <= 0.95 => MAX close factor = 100% of total_debt = 1_000_000
-        assert_eq!(result, U256::from(1_000_000u64));
+        // HF <= 0.95 => MAX close factor = 100% of this reserve's debt.
+        assert_eq!(result, U256::from(ONE_WETH));
     }
 
     #[test]
     fn test_close_factor_hf_at_95_boundary_is_full() {
         let detector = LiquidationDetector::new(make_snapshot(), 8453);
-        let debt = HashMap::from([(Address::ZERO, U256::from(1_000_000u64))]);
         let result = detector.apply_close_factor(
-            U256::from(10_000_000u64),
-            U256::from(1_000_000u64),
             U256::from(950_000_000_000_000_000_000_000_000u128), // exactly 0.95e27
-            &debt,
+            U256::from(ONE_WETH),
         );
-        // HF == 0.95 => still MAX close factor = 100%
-        assert_eq!(result, U256::from(1_000_000u64));
+        assert_eq!(result, U256::from(ONE_WETH));
     }
 
     #[test]
     fn test_close_factor_default_50_above_95() {
         let detector = LiquidationDetector::new(make_snapshot(), 8453);
-        let debt = HashMap::from([(Address::ZERO, U256::from(1_000_000u64))]);
-        for hf in [
+        // HF=0.96: close factor = 0.5 + 10*(1.0-0.96) = 0.5 + 0.4 = 0.9 => 90%
+        let result = detector.apply_close_factor(
             U256::from(960_000_000_000_000_000_000_000_000u128), // 0.96e27
+            U256::from(ONE_WETH),
+        );
+        assert_eq!(result, U256::from(ONE_WETH * 9 / 10));
+
+        // HF=0.99: close factor = 0.5 + 10*(1.0-0.99) = 0.5 + 0.1 = 0.6 => 60%
+        let result = detector.apply_close_factor(
             U256::from(990_000_000_000_000_000_000_000_000u128), // 0.99e27
-        ] {
-            let result = detector.apply_close_factor(
-                U256::from(10_000_000u64),
-                U256::from(1_000_000u64),
-                hf,
-                &debt,
-            );
-            // 0.95 < HF < 1.0 => DEFAULT close factor = 50% of total_debt = 500_000
-            assert_eq!(result, U256::from(500_000u64));
-        }
+            U256::from(ONE_WETH),
+        );
+        assert_eq!(result, U256::from(ONE_WETH * 6 / 10));
     }
 
+    /// Regression: `debt_to_cover` must come out in the debt token's NATIVE units.
+    ///
+    /// It was previously derived from the position's aggregate 8-decimal USD debt
+    /// and then `min`'d against the native balance. For any 18-decimal debt asset
+    /// worth more than ~$1 the USD number is the smaller of the two, so the `min`
+    /// silently returned it — here 2000e8, i.e. 0.0000002 WETH instead of 1 WETH,
+    /// a 5-billion-fold under-liquidation that would burn gas for dust. USDC debt
+    /// masked the bug because 6-decimal native units exceed the USD figure, so the
+    /// `min` happened to pick the correct side.
+    ///
+    /// Position: 2100 USDC collateral (LT 8250) against 1 WETH debt at $2000.
+    /// HF = 2100 × 0.825 / 2000 = 0.866 => below 0.95 => full close factor.
     #[test]
-    fn test_close_factor_caps_by_position_debt() {
-        let detector = LiquidationDetector::new(make_snapshot(), 8453);
-        // total_debt is 150_000 (HF<=0.95 => 100%) but largest single position is only 100_000
-        let debt = HashMap::from([
-            (Address::ZERO, U256::from(100_000u64)),
-            (Address::from([1u8; 20]), U256::from(50_000u64)),
-        ]);
-        let result = detector.apply_close_factor(
-            U256::from(10_000_000u64),
-            U256::from(150_000u64),
-            U256::from(940_000_000_000_000_000_000_000_000u128), // 0.94e27
-            &debt,
+    fn test_debt_to_cover_is_native_units_not_usd_for_18_decimal_debt() {
+        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7c").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray, ray, 8250)); // $1.00, 6-dec
+        snap.reserves
+            .insert(weth, test_reserve(18, 200_000_000_000, ray, ray, 8250)); // $2000, 18-dec
+        snap.users.insert(
+            user,
+            UserPosition {
+                collateral: HashMap::from([(usdc, U256::from(2_100_000_000u128))]), // 2100 USDC
+                debt: HashMap::from([(weth, U256::from(ONE_WETH))]),                // 1 WETH
+                ..UserPosition::default()
+            },
         );
-        // 100% of total_debt = 150_000, capped by max single position 100_000
-        assert_eq!(result, U256::from(100_000u64));
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let candidates = detector.find_at_risk_positions();
+
+        let c = candidates
+            .iter()
+            .find(|c| c.debt_asset == weth)
+            .expect("position must be flagged at HF 0.866");
+
+        assert_eq!(
+            c.debt_to_cover,
+            U256::from(ONE_WETH),
+            "full close factor on 1 WETH of debt must be 1 WETH in native units"
+        );
+        // The exact value the old USD-vs-native `min` produced. Pinned so a
+        // regression cannot pass by landing on a merely plausible number.
+        assert_ne!(
+            c.debt_to_cover,
+            U256::from(200_000_000_000u128),
+            "debt_to_cover collapsed to the 8-decimal USD debt figure"
+        );
+    }
+
+    /// The close factor applies to debt brought forward by the borrow index, not
+    /// to the raw scaled balance. Index 1.2 on 1 WETH scaled => 1.2 WETH owed.
+    #[test]
+    fn test_debt_to_cover_applies_variable_borrow_index() {
+        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+        let index_1_2 = U256::from(1_200_000_000_000_000_000_000_000_000u128); // 1.2e27
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7d").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray, ray, 8250));
+        snap.reserves.insert(
+            weth,
+            test_reserve(18, 200_000_000_000, ray, index_1_2, 8250),
+        );
+        snap.users.insert(
+            user,
+            UserPosition {
+                // 2500 USDC collateral vs 1.2 WETH ($2400) owed => HF 0.859, full tier.
+                collateral: HashMap::from([(usdc, U256::from(2_500_000_000u128))]),
+                debt: HashMap::from([(weth, U256::from(ONE_WETH))]),
+                ..UserPosition::default()
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let c = detector
+            .find_at_risk_positions()
+            .into_iter()
+            .find(|c| c.debt_asset == weth)
+            .expect("position must be flagged at HF 0.859");
+
+        assert_eq!(
+            c.debt_to_cover,
+            U256::from(ONE_WETH * 12 / 10),
+            "debt_to_cover must be index-adjusted (1 WETH scaled x 1.2 = 1.2 WETH)"
+        );
+    }
+
+    /// Regression at the `find_at_risk_positions` level for the pre-flag band.
+    ///
+    /// The detector's flag threshold is 1.01 RAY, deliberately above Aave's 1.0
+    /// cutoff, but the close factor is zero at HF >= 1.0. Such positions used to
+    /// be emitted as candidates carrying `debt_to_cover = 0` — liquidations Aave
+    /// rejects outright, burning a simulation slot each. `test_close_factor_hf_
+    /// above_one` covers `apply_close_factor` in isolation; only a pipeline-level
+    /// test proves the outer `hf < hf_liquidation_threshold` filter and the inner
+    /// zero-close-factor skip compose correctly.
+    ///
+    /// The fixture is tuned so HF lands inside (1.0, 1.01), and asserts that
+    /// placement explicitly before asserting the emptiness — otherwise a future
+    /// drift in the threshold would turn this into a vacuous pass.
+    #[test]
+    fn test_no_candidate_emitted_in_pre_flag_band_above_hf_one() {
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7f").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray(), ray(), 8250));
+        snap.reserves
+            .insert(weth, test_reserve(18, 200_000_000_000, ray(), ray(), 8250));
+        // 2000 USDC collateral x LT 0.825 = 1650; debt 0.8235 WETH @ $2000 = $1647.
+        // HF = 1650 / 1647 = 1.0018 — inside the 1.0..1.01 pre-flag band, so the
+        // outer filter admits it while Aave would refuse to liquidate it.
+        snap.users.insert(
+            user,
+            UserPosition {
+                collateral: HashMap::from([(usdc, U256::from(2_000_000_000u128))]),
+                debt: HashMap::from([(weth, U256::from(823_500_000_000_000_000u128))]),
+                ..UserPosition::default()
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let (_, _, _, hf) = detector.calculate_user_account_data(
+            &user,
+            detector.snapshot.users.get(&user).unwrap(),
+        );
+        assert!(
+            hf > ray() && hf < detector.hf_liquidation_threshold,
+            "fixture must sit in the pre-flag band (1.0 < HF < 1.01); got {hf}"
+        );
+
+        assert!(
+            detector.find_at_risk_positions().is_empty(),
+            "HF >= 1.0 means a zero close factor; emitting a candidate here \
+             produces debt_to_cover = 0, which Aave rejects outright"
+        );
+    }
+
+    /// A debt asset absent from the snapshot has no borrow index and no price, so
+    /// `current_debt` falls back to the raw scaled balance (index defaults to RAY,
+    /// matching `parse_index_or_ray`) and the candidate carries `debt_price_usd = 0`.
+    /// Zero is the simulator's "unknown" sentinel, not "free": both
+    /// `simulator::mod.rs` price guards fall back to a bonus-portion estimate rather
+    /// than valuing the leg at $0. The position needs a second, priced debt asset —
+    /// an unpriced one contributes nothing to `total_debt`, so on its own it would
+    /// never reach the health-factor check at all.
+    #[test]
+    fn test_debt_asset_missing_from_snapshot_falls_back_to_scaled_balance() {
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let unknown = Address::from_str("0x000000000000000000000000000000000000bbbb").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7e").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray(), ray(), 8250));
+        snap.reserves
+            .insert(weth, test_reserve(18, 200_000_000_000, ray(), ray(), 8250));
+        // `unknown` is deliberately NOT inserted into reserves.
+        snap.users.insert(
+            user,
+            UserPosition {
+                collateral: HashMap::from([(usdc, U256::from(2_100_000_000u128))]),
+                debt: HashMap::from([
+                    (weth, U256::from(ONE_WETH)),
+                    (unknown, U256::from(12_345u64)),
+                ]),
+                ..UserPosition::default()
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let candidates = detector.find_at_risk_positions();
+
+        let c = candidates
+            .iter()
+            .find(|c| c.debt_asset == unknown)
+            .expect("unpriced debt asset must still yield a candidate");
+        assert_eq!(
+            c.debt_to_cover,
+            U256::from(12_345u64),
+            "no reserve => no index => raw scaled balance, un-adjusted"
+        );
+        assert_eq!(
+            c.debt_price_usd,
+            U256::ZERO,
+            "unknown price must stay 0 so the simulator takes its fallback path"
+        );
+        assert_eq!(
+            c.debt_decimals, 18,
+            "absent reserve defaults to 18 decimals"
+        );
     }
 }

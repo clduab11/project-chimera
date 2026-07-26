@@ -71,6 +71,26 @@ pub struct PacingConfig {
     /// Form: "ws://host:port" or "wss://host:port".
     #[serde(default)]
     pub ws_endpoint: String,
+
+    // --- Bespoke Tranche Opportunity configuration ---
+    /// Flashbots Protect relay URL for private mempool bundle submission.
+    #[serde(default = "default_flashbots_relay")]
+    pub flashbots_relay: String,
+    /// Master enable flag for Bespoke Tranche Operation (default: false).
+    #[serde(default)]
+    pub tranche_enabled: bool,
+    /// Maximum gas price (gwei) for tranche bundle transactions.
+    #[serde(default = "default_tranche_max_gas_gwei")]
+    pub tranche_max_gas_gwei: u64,
+    /// Minimum expected profit in USD to submit a tranche bundle.
+    #[serde(default = "default_tranche_min_profit_usd")]
+    pub tranche_min_profit_usd: Decimal,
+    /// Maximum slippage in basis points for pre/post trades.
+    #[serde(default = "default_tranche_max_slippage_bps")]
+    pub tranche_max_slippage_bps: u32,
+    /// Maximum seconds to wait for bundle inclusion.
+    #[serde(default = "default_tranche_bundle_timeout_secs")]
+    pub tranche_bundle_timeout_secs: u64,
 }
 
 fn default_chain_id() -> u64 {
@@ -117,6 +137,21 @@ fn default_router_compatibility() -> String {
 fn default_min_profit_fraction() -> Decimal {
     Decimal::from_str("0.8").expect("valid literal")
 }
+fn default_flashbots_relay() -> String {
+    "https://rpc.flashbots.net".into()
+}
+fn default_tranche_max_gas_gwei() -> u64 {
+    50
+}
+fn default_tranche_min_profit_usd() -> Decimal {
+    Decimal::from_str("1.00").expect("valid literal")
+}
+fn default_tranche_max_slippage_bps() -> u32 {
+    100
+}
+fn default_tranche_bundle_timeout_secs() -> u64 {
+    60
+}
 
 impl Default for PacingConfig {
     fn default() -> Self {
@@ -153,6 +188,12 @@ impl Default for PacingConfig {
             sweep_tokens: Vec::new(),
             sweep_min_keep_eth: Decimal::from_str("0.001").expect("valid literal"),
             ws_endpoint: String::new(),
+            flashbots_relay: default_flashbots_relay(),
+            tranche_enabled: false,
+            tranche_max_gas_gwei: default_tranche_max_gas_gwei(),
+            tranche_min_profit_usd: default_tranche_min_profit_usd(),
+            tranche_max_slippage_bps: default_tranche_max_slippage_bps(),
+            tranche_bundle_timeout_secs: default_tranche_bundle_timeout_secs(),
         }
     }
 }
@@ -448,6 +489,18 @@ impl PacingConfig {
             self.ws_endpoint = v;
         }
 
+        // Tranche overrides
+        if let Ok(v) = std::env::var("CHIMERA_FLASHBOTS_RELAY") {
+            self.flashbots_relay = v;
+        }
+        if let Ok(v) = std::env::var("CHIMERA_TRANCHE_ENABLED") {
+            self.tranche_enabled = v.parse::<bool>().unwrap_or(false);
+        }
+        override_parse!("CHIMERA_TRANCHE_MAX_GAS_GWEI", self.tranche_max_gas_gwei, u64);
+        override_decimal!("CHIMERA_TRANCHE_MIN_PROFIT_USD", self.tranche_min_profit_usd);
+        override_parse!("CHIMERA_TRANCHE_MAX_SLIPPAGE_BPS", self.tranche_max_slippage_bps, u32);
+        override_parse!("CHIMERA_TRANCHE_BUNDLE_TIMEOUT_SECS", self.tranche_bundle_timeout_secs, u64);
+
         Ok(())
     }
 }
@@ -494,8 +547,14 @@ mod tests {
         "CHIMERA_RECENT_OUTCOMES_CAPACITY",
         "CHIMERA_SWEEP_MIN_KEEP_ETH",
         "CHIMERA_SWEEP_TOKENS",
-        "CHIMERA_WS_ENDPOINT",
-    ];
+    "CHIMERA_WS_ENDPOINT",
+    "CHIMERA_FLASHBOTS_RELAY",
+    "CHIMERA_TRANCHE_ENABLED",
+    "CHIMERA_TRANCHE_MAX_GAS_GWEI",
+    "CHIMERA_TRANCHE_MIN_PROFIT_USD",
+    "CHIMERA_TRANCHE_MAX_SLIPPAGE_BPS",
+    "CHIMERA_TRANCHE_BUNDLE_TIMEOUT_SECS",
+];
 
     struct PacingEnvGuard {
         _lock: MutexGuard<'static, ()>,
@@ -565,6 +624,12 @@ refund_topup_eth: 0.01
 sweep_tokens: []
 sweep_min_keep_eth: 0.001
 ws_endpoint: \"\"
+flashbots_relay: \"https://rpc.flashbots.net\"
+tranche_enabled: false
+tranche_max_gas_gwei: 50
+tranche_min_profit_usd: 1.00
+tranche_max_slippage_bps: 100
+tranche_bundle_timeout_secs: 60
 "
         .to_string()
     }

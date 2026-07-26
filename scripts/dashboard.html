@@ -187,6 +187,11 @@
     <div class="kv" id="fin-kv"></div>
   </section>
 
+  <section class="panel">
+    <h2>BESPOKE TRANCHE OPPORTUNITY</h2>
+    <div class="kv" id="tranche-kv"></div>
+  </section>
+
   <section class="panel wide">
     <h2>ACTIVITY — SCAN CYCLES (1 NEW BASE BLOCK = 1 SCAN)</h2>
     <div class="stats" id="activity-stats"></div>
@@ -323,6 +328,23 @@ function renderFin(s) {
   $('fin-kv').innerHTML = rows.join('');
 }
 
+function renderTranche(s) {
+  const t = s.tranche || {};
+  const kv = (k, v, cls='') =>
+    `<div class="k">${k}</div><div class="v ${cls}">${esc(v)}</div>`;
+  const rows = [
+    kv('Bundles Submitted', fmtNum(t.bundles_total), 'pos'),
+    kv('Bundles Confirmed', fmtNum(t.bundles_confirmed), t.bundles_confirmed > 0 ? 'pos' : ''),
+    kv('Bundles Reverted', fmtNum(t.bundles_reverted), t.bundles_reverted > 0 ? 'neg' : ''),
+    kv('Last Profit', t.profit_wei != null ? (t.profit_wei / 1e18).toFixed(6) + ' ETH' : '—',
+       t.profit_wei > 0 ? 'pos' : (t.profit_wei < 0 ? 'neg' : '')),
+    kv('Last Gas Spent', t.gas_wei != null ? (t.gas_wei / 1e18).toFixed(6) + ' ETH' : '—', 'dim'),
+    kv('Status', t.enabled ? 'LIVE' : 'shadow', t.enabled ? 'breaker-trip' : 'dim'),
+    kv('Relay', t.relay || '—', 'dim'),
+  ];
+  $('tranche-kv').innerHTML = rows.join('');
+}
+
 function renderActivity(s) {
   const a = s.activity || {};
   const stat = (lbl, val, cls='', id='') =>
@@ -439,6 +461,7 @@ async function refresh() {
     renderTicker(s.ticker);
     renderStatus(s);
     renderFin(s);
+    renderTranche(s);
     renderActivity(s);
     renderSwap(s);
     renderEvents(s);

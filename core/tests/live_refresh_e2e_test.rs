@@ -141,6 +141,12 @@ fn test_pacing_config(eoa_pool_path: &str) -> PacingConfig {
         sweep_tokens: vec![],
         sweep_min_keep_eth: dec!(0.001),
         ws_endpoint: String::new(),
+        flashbots_relay: "https://rpc.flashbots.net".to_string(),
+        tranche_enabled: false,
+        tranche_max_gas_gwei: 50,
+        tranche_min_profit_usd: Decimal::new(1, 0),
+        tranche_max_slippage_bps: 100,
+        tranche_bundle_timeout_secs: 60,
     }
 }
 

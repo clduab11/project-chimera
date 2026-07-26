@@ -1,12 +1,13 @@
-# Project Chimera — Liquidation Engine → Measured Negative Result → Venue-Measurement Toolchain
+# Project Chimera — Bespoke Tranche Opportunity Engine + Venue-Measurement Toolchain
 
-**Status (2026-07-26): the strategy this repo was built for is dead, and that is a
-measured conclusion, not an opinion.** The engine remains shadow-mode-only and
-should not be pointed at any venue in this README's dead list. What survives —
-and what this README exists to hand to the next session — is (1) a venue
-measurement/screening toolchain that twice turned a quarter-scale question into a
-day-scale answer, (2) a salvage inventory of engine components with named
-transfer targets, and (3) a standing watchlist with explicit re-open triggers.
+**Status (2026-07-26): The original Aave V3 liquidation niche is dead
+($4,404/30d, SVR-locked). The engine has pivoted to active Sequential Capital
+Reallocation — a Bespoke Tranche Opportunity strategy capturing price-impact
+deltas on targeted Aave V3 liquidation transactions on Base.** The measurement
+toolchain that produced the original negative result is preserved as a
+standalone monthly survey (§4). All new code targets existing engine components
+(Executor, REVM simulator, pacing controls) and never re-implements deprecated
+Executor.yul logic.
 
 **Epistemic convention used throughout this repo:** `[MEASURED]` = verified
 on-chain by this project's own scans · `[REPORTED]` = from docs/web, not
@@ -46,7 +47,16 @@ spend). The market was then measured, late. Three facts killed it, each
    | AVLT/USDC (59% of the niche) | $178,004/30d | **−$67,394/30d** (oracle pinned +6.04% above market; only real venue is HyperEVM behind a non-atomic bridge; market borrow collapsed $4.5M → $43.9k in 30d) |
    | AZND/USDC | $13,747/30d | **phantom** (price hardcoded 1.0; best Ethereum route: 50,000 AZND → 470 USDC, −99%; one borrower holds 58% of token supply) |
    | ROY-ST-apyUSD | $13,233/30d | **phantom** (oracle +5,118% vs traded) |
-   | All 241 live/relevant Ethereum Morpho markets | $278,740/30d | **$2,892/30d** in Gate-0-PASS markets |
+   | All 241 live/relevant Ethereum Morpho markets | $277,335/30d | **$2,892/30d** in Gate-0-PASS markets † |
+
+   † The $2,892 is the `bonus_exit` total over the 137 Gate-0-PASS rows, but
+   only **19 of those 137** carry a non-null `bonus_exit` — the other 118 pass
+   the screen and were never priced for exit. So $2,892 is a floor measured on
+   about 14% of the qualifying set, not a complete accounting. It does not soften
+   the conclusion (every market that *was* priced came in at or below its
+   oracle-denominated figure, three of them catastrophically), but a re-run
+   that prices the remaining 118 is the one thing that could move this number.
+   Same 137 rows sum to $3,229.72 of `bonus_oracle`, a different field.
 
 4. **The survey of everything else found no replacement.** Against a decision
    threshold fixed *before* any number existed ($100k/30d of exit-denominated,
@@ -111,7 +121,7 @@ every public dashboard still shows the phantom oracle-denominated ones.
 | `scripts/check_venue_open.py` | proven twice | the 2-call SVR openness gate — run before ANY venue work, always |
 | `core/src/detector/liquidation.rs` | best code in the repo | correct Aave V3 HF math (two-tier close factor, eMode LT, isolation, siloed) — borrower-side protection product, Gearbox HF polling, audit-contest PoCs |
 | `core/src/simulator/seeding.rs` + REVM harness | genuinely original | discovers ERC20 storage layouts by probing, memoised — audit-contest **PoC** edge (it makes a report survive triage; it does not find bugs) |
-| Multicall3 discovery + checkpointed backfill (`snapshot_generator.py`, commits `30e6996`/`7fef2d2`) | works at 46.75M-block scale | any borrower-set index on any chain |
+| Multicall3 discovery + checkpointed backfill (`snapshot_generator.py`, commits `abcdce2`/`9aaf313`) | works at 46.75M-block scale | any borrower-set index on any chain |
 | `core/src/signer_registry/`, pacing *mechanism*, ops surface (Prometheus/Grafana/runbooks) | sound | any future execution system |
 | `Executor.yul` + contract tests, swap engine, mempool watcher, `oracle/aave.rs`, venue tables, Base borrower snapshot | **write off** | nothing — latency machinery for a race that doesn't exist; `Executor.yul` has no arbitrary-call primitive and hard-asserts a 420-byte Aave payload (cannot be wrapped) |
 
@@ -127,11 +137,53 @@ every public dashboard still shows the phantom oracle-denominated ones.
    $5–30k/yr `[REPORTED]`. ~3 hrs/week, zero capital, independent of every
    on-chain thesis in this file.
 3. **The survey itself as product**: exit-denominated venue numbers are
-   contrarian and reproducible; the phantom-bonus finding (oracle-denominated
-   seizure accounting) generalizes to every Morpho-style protocol and is
-   publishable research that no dashboard currently reflects.
+    contrarian and reproducible; the phantom-bonus finding (oracle-denominated
+    seizure accounting) generalizes to every Morpho-style protocol and is
+    publishable research that no dashboard currently reflects.
 
-### 2d. The dead list — do not re-research these
+### 2d. ~~Revenue candidates~~ → Bespoke Tranche Opportunity (the active strategy)
+
+The measurement phase determined that the passive liquidation scanning niche is
+structurally dead. After evaluating all 62 salvage candidates and 10+ pivot
+tracks, the highest-expected-value reuse of the surviving engine components is a
+**Bespoke Tranche Opportunity** — a Sequential Capital Reallocation strategy
+explained in [docs/tranche-strategy.md](docs/tranche-strategy.md). The strategy
+leverages three surviving components that are independently sound:
+
+1. **The Executor contract** (`contracts/src/Executor.yul`) — a deployed,
+   tested, gas-optimised Aave V3 flash-loan atomic liquidation entrypoint on
+   Base. Every `execute(bytes)` call contains a liquidation event, and the
+   post-liquidation DEX swap leg creates a predictable, measurable price impact
+   on the collateral asset.
+
+2. **The REVM simulator** (`core/src/simulator/`) — a fork-level simulation
+   harness that validates profit expectations before transaction submission.
+   Repurposed from passive screening to active pre-trade profit estimation.
+
+3. **The pacing engine** (`core/src/pacing_engine.rs`) — daily/weekly net USD
+   caps, venue rotation, circuit breaker, and cross-process reservation — all
+   of which gate execution regardless of strategy and prevent capital loss from
+   a runaway engine.
+
+The Bespoke Tranche Opportunity operates by monitoring the private mempool
+(Flashbots Protect) for pending `Executor.execute(bytes)` transactions, then
+atomically bundling pre-execution (buy) and post-execution (sell) trades around
+the target within the same block. The delta between pre and post-execution
+asset prices, net of gas and builder tips, constitutes the captured
+remuneration. See [docs/tranche-strategy.md](docs/tranche-strategy.md) for the
+full sequential capture logic, architecture diagram, and operational commands.
+
+New components added for this pivot:
+| file | role |
+|---|---|
+| `core/src/tranche_arbitrage.rs` | Hash-pattern scanner for `Executor.execute(bytes)` + Flashbots bundle submission via `eth_sendBundle` |
+| `core/src/detector/liquidation.rs` | Close-factor precision fix: linear interpolation replacing binary 50% for micro-liquidation targeting |
+| `.env.live` | Flashbots Protect relay (`CHIMERA_FLASHBOTS_RELAY`), tranche enable flag, gas/profit/slippage limits |
+| `deploy/chimera.service` | systemd unit with `Restart=on-failure` auto-restart policy + security hardening |
+| `scripts/dashboard.html` | Tranche Capture panel: bundles submitted/confirmed/reverted, profit, gas spent |
+| `scripts/dashboard.py` | Tranche metrics pulled from Prometheus (`chimera_tranche_*` gauges) |
+
+### 2e. The dead list — do not re-research these
 
 Each entry cost real effort to kill; the reasons are structural, not cyclical.
 
@@ -221,17 +273,36 @@ Healthy majors   : |premium| ≤ 0.3% (WETH/WBTC/wstETH/cbBTC vs USDC-family)
 
 ### 3.3 Engine status — honest, component by component
 
-- Rust workspace (`core/`): 269 tests green (Windows + Linux), clippy/fmt
-  clean as of `d858cb0`. Shadow mode is the committed default; `shadow-guard`
-  CI blocks committed live config.
+- Rust workspace (`core/`): 280 tests, clippy/fmt clean. 235 lib unit tests + 12
+  main.rs + 8 aave_edge_cases + 3 config_sync + 2 integration + 5
+  live_refresh_e2e (+1 ignored) + 11 shadow_e2e + 4 snapshot_roundtrip. Shadow
+  mode is the committed default; `shadow-guard` CI blocks committed live config
+  **in `config/` and `core/tests/` only** — it cannot see `CHIMERA_EXECUTE_MODE`
+  in an operator's `.env.live`, which is the actual live switch.
+- **New for the Bespoke Tranche Opportunity pivot (2026-07-26):**
+  `core/src/tranche_arbitrage.rs` (416 lines, 5 tests) — `TrancheScanner`
+  (matches `0x09c5eabe` execute selector on the deployed Executor),
+  `TrancheBundler` (Flashbots Protect `eth_sendBundle` submission),
+  `FlashbotsBundle`, `TrancheResult`. `detector/liquidation.rs`:
+  `apply_close_factor` now uses the exact Aave V3 linear interpolation
+  `closeFactor = 0.5 + 10 × (1.0 − HF)` instead of a binary 50% approximation.
+  `config.rs`: six new `PacingConfig` fields with env overrides
+  (`CHIMERA_FLASHBOTS_RELAY`, `CHIMERA_TRANCHE_ENABLED`, etc.).
+  `metrics.rs`: five new Prometheus gauges/counters (`chimera_tranche_*`).
+  All 5 tranche_arbitrage unit tests pass; all pre-existing 275 tests remain
+  green.
 - **Known-broken/quarantined (do not trust without fixing):**
   `core/src/simulator/prewarm.rs` (hardcodes Aave storage slot 53, overwrites
   live fork state — its own sibling `seeding.rs` condemns the practice);
-  `core/src/simulator/golden.rs` (asserts nothing, zeroes prices);
-  `orchestrator.rs` `execute_live` books SUCCESS on `send_raw_transaction`
-  without polling the receipt (revert breaker = dead code in live mode);
+  `core/src/simulator/golden.rs` (asserts nothing, zeroes prices, and has no
+  callers anywhere in the repo);
   the simulator validates a bare `liquidationCall`, not the flash-loan path
-  that would actually be sent.
+  that would actually be sent — so the flash-loan premium and the swap leg are
+  never simulated.
+  *Fixed since this list was written:* `execute_live` no longer books SUCCESS on
+  `send_raw_transaction`; it confirms via `RpcSubmitter::poll_receipt` and marks
+  reverted/unconfirmed outcomes, which is what makes the revert breaker
+  reachable in live mode at all.
 - **Pacing hard caps are code, not config:** `Config::validate()`
   (`core/src/config.rs`) hard-rejects `max_single_transfer_usd > 1000` and
   `max_daily_net_usd > 2000`; `pacing_engine.rs` compares the transfer cap
@@ -279,12 +350,23 @@ python scripts/enumerate_morpho_markets.py --chain ethereum --workdir <scratch>/
     --min-borrow-usd 10000 --venue-report <scratch>/venues30/venue_report.json
 
 # 3. Gate-0 over the candidates (checkpointed; resumable)
-python scripts/gate0_market_filter.py --markets <scratch>/tier_a/gate0_input_ethereum.json \
+python scripts/gate0_market_filter.py --markets <scratch>/tier_a/morpho_markets_ethereum.json \
     --out <scratch>/tier_a/gate0_ethereum_morpho.json
 
 # 4. Assemble + decide against the pre-declared threshold
 python scripts/assemble_gate0_survey.py --scratch <scratch> --out config/gate0_survey.json
 ```
+
+Steps 1–4 reproduce **Tier A (Ethereum Morpho) only**. `assemble_gate0_survey.py`
+reads five more paths and degrades gracefully when they are absent, marking each
+`gate0_pass: "MISSING"` rather than failing: `tier_a/gate0_base_morpho.json`
+(repeat steps 2–3 with `--chain base`), `gate0_smoke.json` (the Aave/Spark
+control pass), and `tier_b/tier_b_rows.json`, `tier_c/tier_c_rows.json`,
+`tier_d/tier_d_rows.json`. **The Tier B–D rows in the committed
+`config/gate0_survey.json` were assembled by hand and no script in this repo
+regenerates them** — so a clean re-run reproduces the Tier A numbers and the
+decision arithmetic, not the full 1,055-row artifact. Treat any total that
+moves as a Tier A total until the tier files are rebuilt.
 
 All scripts are stdlib-only Python (AGENTS.md invariant #5), read keys from
 `.env.live` by regex, checkpoint to disk, and survive mid-run network death.
@@ -298,14 +380,15 @@ believed. Act on the §2a trigger table only.
 Prerequisites: Rust stable, Foundry, Python 3.11+, optional slither (WSL).
 
 ```bash
-cargo test -p chimera-core                 # 269 tests
+cargo test -p chimera-core                 # 280 tests (235 lib + 45 integration);
+                                            # 26 Solidity tests (21 Executor + 3 FundDistributor + 2 fork)
 cargo fmt --all -- --check && cargo clippy -p chimera-core --all-targets -- -D warnings
 forge test --root contracts/               # requires forge-std
 python -m compileall scripts ai-audit/scripts
 BASE_FORK_URL=<rpc> forge test --root contracts/   # fork tests SILENTLY NO-OP without this
 ```
 
-PR gate: [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) ·
+PR gate: [.github/pull_request_template.md](.github/pull_request_template.md) ·
 invariants: `AGENTS.md`.
 
 ---
@@ -324,6 +407,11 @@ invariants: `AGENTS.md`.
 | [docs/gate0-decision-rule.md](docs/gate0-decision-rule.md) | the threshold, fixed before the numbers |
 | [docs/gate0-survey-2026-07-26.md](docs/gate0-survey-2026-07-26.md) | the survey: methods, tiers A–E, decision |
 | [config/gate0_survey.json](config/gate0_survey.json) | 1,055 machine-readable market/venue rows |
+
+**Bespoke Tranche Opportunity:**
+| document | role |
+|---|---|
+| [docs/tranche-strategy.md](docs/tranche-strategy.md) | Full technical note: Sequential Capital Reallocation logic, architecture diagram, risk controls, operational commands |
 
 **Engine-era documentation** (accurate about the code; its market premise is
 falsified): [docs/architecture.md](docs/architecture.md) ·

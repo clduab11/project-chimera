@@ -34,6 +34,12 @@ pub struct Metrics {
     pub snapshot_block_number: GaugeVec,
     pub snapshot_reload_total: IntCounterVec,
     pub scans_skipped_stale_price: IntCounterVec,
+    // --- Bespoke Tranche Opportunity metrics ---
+    pub tranche_bundles_total: IntCounterVec,
+    pub tranche_bundles_confirmed: IntCounterVec,
+    pub tranche_bundles_reverted: IntCounterVec,
+    pub tranche_profit_wei: Gauge,
+    pub tranche_gas_spent_wei: Gauge,
 }
 
 impl Metrics {
@@ -188,6 +194,27 @@ impl Metrics {
         r.register(Box::new(snapshot_reload_total.clone())).ok();
         r.register(Box::new(scans_skipped_stale_price.clone())).ok();
 
+        let tranche_bundles_total = IntCounterVec::new(
+            Opts::new("chimera_tranche_bundles_total", "Total tranche bundles submitted"),
+            &["chain"],
+        ).unwrap();
+        let tranche_bundles_confirmed = IntCounterVec::new(
+            Opts::new("chimera_tranche_bundles_confirmed_total", "Confirmed tranche bundles"),
+            &["chain"],
+        ).unwrap();
+        let tranche_bundles_reverted = IntCounterVec::new(
+            Opts::new("chimera_tranche_bundles_reverted_total", "Reverted tranche bundles"),
+            &["chain"],
+        ).unwrap();
+        let tranche_profit_wei = Gauge::new("chimera_tranche_profit_wei", "Last tranche profit in wei").unwrap();
+        let tranche_gas_spent_wei = Gauge::new("chimera_tranche_gas_spent_wei", "Last tranche gas spent in wei").unwrap();
+
+        r.register(Box::new(tranche_bundles_total.clone())).ok();
+        r.register(Box::new(tranche_bundles_confirmed.clone())).ok();
+        r.register(Box::new(tranche_bundles_reverted.clone())).ok();
+        r.register(Box::new(tranche_profit_wei.clone())).ok();
+        r.register(Box::new(tranche_gas_spent_wei.clone())).ok();
+
         Self {
             candidates_seen,
             sims_run,
@@ -208,6 +235,11 @@ impl Metrics {
             snapshot_block_number,
             snapshot_reload_total,
             scans_skipped_stale_price,
+            tranche_bundles_total,
+            tranche_bundles_confirmed,
+            tranche_bundles_reverted,
+            tranche_profit_wei,
+            tranche_gas_spent_wei,
         }
     }
 
@@ -303,6 +335,31 @@ impl Metrics {
         self.sweep_skipped_breaker
             .with_label_values(&[sweep_type])
             .inc();
+    }
+
+    /// Record a tranche bundle submission.
+    pub fn observe_tranche_bundle(&self, chain: &str) {
+        self.tranche_bundles_total.with_label_values(&[chain]).inc();
+    }
+
+    /// Record a confirmed tranche bundle.
+    pub fn observe_tranche_confirmed(&self, chain: &str) {
+        self.tranche_bundles_confirmed.with_label_values(&[chain]).inc();
+    }
+
+    /// Record a reverted tranche bundle.
+    pub fn observe_tranche_reverted(&self, chain: &str) {
+        self.tranche_bundles_reverted.with_label_values(&[chain]).inc();
+    }
+
+    /// Set the last tranche profit in wei.
+    pub fn set_tranche_profit_wei(&self, wei: u128) {
+        self.tranche_profit_wei.set(wei as f64);
+    }
+
+    /// Set the last tranche gas spent in wei.
+    pub fn set_tranche_gas_spent_wei(&self, wei: u128) {
+        self.tranche_gas_spent_wei.set(wei as f64);
     }
 }
 

@@ -1,317 +1,347 @@
-# Project Chimera - Sovereign L2 MEV + AI Audit System
+# Project Chimera — Liquidation Engine → Measured Negative Result → Venue-Measurement Toolchain
 
-**Status**: Standalone-Executor liquidation engine implemented; shadow-first and never auto-flips to live.
+**Status (2026-07-26): the strategy this repo was built for is dead, and that is a
+measured conclusion, not an opinion.** The engine remains shadow-mode-only and
+should not be pointed at any venue in this README's dead list. What survives —
+and what this README exists to hand to the next session — is (1) a venue
+measurement/screening toolchain that twice turned a quarter-scale question into a
+day-scale answer, (2) a salvage inventory of engine components with named
+transfer targets, and (3) a standing watchlist with explicit re-open triggers.
 
-> Validation gate: the core remediation has NOT been validated end-to-end in this environment — `cargo` and `forge` have not been run here and MUST be verified on a developer workstation with the full toolchain before any output is trusted. The toolchains (`cargo`, `forge`, `slither`) are not installed in every environment. Run the commands in [Build & Test](#build--test) on a machine with the Rust toolchain, Foundry, and Slither before trusting any simulation output. The 7-day shadow-soak gate was de-listed by operator decision on 2026-07-20; live mode additionally requires an encrypted keystore and a multisig-owned deployment. Live execution remains gated until the full validation gate in `.kilo/plans/comprehensive-refactor-validation-security-research.md` passes.
-
----
-
-## Documentation Index
-
-All documentation files in the repository, with brief descriptions:
-
-| Document | Description |
-|----------|-------------|
-| [docs/architecture.md](docs/architecture.md) | Component diagram, data flow, trait boundaries, deployment topology |
-| [docs/threat-model.md](docs/threat-model.md) | Threat model and attack surface analysis |
-| [docs/snapshot-schema.md](docs/snapshot-schema.md) | `ReserveData` struct schema — must stay in sync with `core/src/simulator/prewarm.rs` |
-| [docs/first-run-onboarding.md](docs/first-run-onboarding.md) | Click-by-click beginner guide grounded in recursive code analysis |
-| [docs/operator-manual.md](docs/operator-manual.md) | Deploy, config tuning, emergency pause, log triage, EOA rotation |
-| [docs/deployment-checklist.md](docs/deployment-checklist.md) | Pre-deployment checklist for shadow and live modes |
-| [docs/emergency-procedures.md](docs/emergency-procedures.md) | Incident response playbook |
-| [docs/incident-log.md](docs/incident-log.md) | Incident tracking template (new in 0.1.4) |
-| [docs/runbook-7day-soak.md](docs/runbook-7day-soak.md) | 7-day shadow-soak runbook |
-| [docs/runbook-keystore-multisig-go-live.md](docs/runbook-keystore-multisig-go-live.md) | Keystore and multisig go-live runbook |
-| [docs/operator-go-live-pack.md](docs/operator-go-live-pack.md) | Single sequential operator go-live pack: readiness audit + runbook (new in 0.2.0) |
-| [docs/runbook-testnet-deploy.md](docs/runbook-testnet-deploy.md) | Testnet deployment runbook |
-| [docs/runbook-wallet-provisioning.md](docs/runbook-wallet-provisioning.md) | Testnet wallet provisioning runbook |
-| [docs/testing-strategy-liquidations.md](docs/testing-strategy-liquidations.md) | Test pyramid: unit, integration, proptest, golden replay, Foundry fork tests |
-| [docs/security-research.md](docs/security-research.md) | CVE/advisory workflow and curated Aave/Solidity/Slither references |
-| [docs/research/aave-v3-liquidation-compendium.md](docs/research/aave-v3-liquidation-compendium.md) | Aave V3 liquidation logic source map and regression scenarios |
-| [docs/research/dependency-cve-triage.md](docs/research/dependency-cve-triage.md) | CVE triage for pinned dependencies |
-| [docs/gate-report-2026-06-16.md](docs/gate-report-2026-06-16.md) | Validation gate run record |
-| [docs/gate-report-2026-06-16-t2.md](docs/gate-report-2026-06-16-t2.md) | Validation gate run record (t2) |
-| [docs/monetization.md](docs/monetization.md) | Lawful revenue paths, rejected approaches, compliance checklist (new in 0.2.0) |
-| [docs/release-readiness.md](docs/release-readiness.md) | v0.2.0 first-release readiness plan and gap register (new in 0.2.0) |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup and validation gate instructions (new in 0.1.4) |
-| [SECURITY.md](SECURITY.md) | Vulnerability reporting and security model (new in 0.1.4) |
-| [CHANGELOG.md](CHANGELOG.md) | Release history in Keep a Changelog format |
-
-Note: `PHASE6_VALIDATION_GATE.md` was revoked during the Wave 0 re-audit and
-removed; current gate status lives in [docs/release-readiness.md](docs/release-readiness.md).
-
-The `ai-audit/` directory is optional/auxiliary — it contains Slither + local Ollama contract scanning tooling that is independent of the engine and not part of the liquidation funds path.
+**Epistemic convention used throughout this repo:** `[MEASURED]` = verified
+on-chain by this project's own scans · `[REPORTED]` = from docs/web, not
+independently confirmed · `[UNMEASURED]` = explicitly unknown. In this project's
+history, web-sourced claims failed on-chain verification roughly 3 times out
+of 4. Trust the tags.
 
 ---
 
-## How It Earns
+## 1. Findings — why the original business does not exist
 
-Chimera is a sovereign liquidation engine running on L2s (Base, Arbitrum). It exists to capture one specific on-chain inefficiency: Aave V3 pays liquidators a bonus spread when they close underwater positions. The protocol hands that bonus to whoever does the work. Chimera submits permissionless liquidations, while operators remain responsible for monitoring, emergency actions, gas operations, and multisig withdrawals of Executor-held profit. Current transactions use the configured standard RPC; private/protected submission is not wired.
+Chimera was built as a Rust + Yul flash-loan liquidation engine for Aave V3 on
+Base (~30k tracked lines, 22 design docs, 7 runbooks, ~$300 of measurement API
+spend). The market was then measured, late. Three facts killed it, each
+`[MEASURED]`:
 
-The revenue loop is atomic and capital-light:
+1. **The market is tiny.** Base Aave V3's *entire* 30-day liquidation bonus pool
+   was **$4,404** across 22 liquidators (top-1: 85.4%).
+2. **It is structurally closed.** 99.5% of that value routes through a Chainlink
+   SVR sealed-bid oracle auction (FastLane Atlas): the price update that makes a
+   position liquidatable arrives *inside the winning solver's own bundle*. A
+   public-RPC bot sees the opportunity only after it is gone. Not a latency
+   problem; unfixable with a faster node. Ethereum Aave, Arbitrum Aave, BNB
+   Aave, Compound and Venus are closed the same way (`DualAggregator` /
+   MEV-Share).
+3. **The escape hatch was an accounting artifact.** The "interest-accrual niche"
+   (liquidations triggered by debt accrual, not price moves — no oracle update,
+   no auction, no race) measured $283.6k/30d. But Morpho's `seizedAssets` is
+   **denominated at the market oracle price by construction**
+   (`Morpho.sol::liquidate`: `seizedAssets = repaid × LIF × SCALE /
+   oracle.price()`), so any oracle-above-market premium reads as bonus while
+   actually *reducing* what an exit realises. Re-denominated at achievable exit
+   prices (the 2026-07-26 Gate-0 survey, PR #22):
 
-1. **Surveillance** — the detector scans Aave V3 pools across Base and Arbitrum every scan cycle, looking for user positions whose Health Factor has dropped below 1.0. It filters out frozen, paused, and inactive reserves, detects bad-debt positions it must not touch, and applies Aave V3's eMode / isolation-mode / siloed-borrowing rules correctly — all of it enforced at the candidate-selection layer, not after a wasted flash-loan attempt.
+   | claim | oracle-denominated | exit-denominated |
+   |---|---:|---:|
+   | AVLT/USDC (59% of the niche) | $178,004/30d | **−$67,394/30d** (oracle pinned +6.04% above market; only real venue is HyperEVM behind a non-atomic bridge; market borrow collapsed $4.5M → $43.9k in 30d) |
+   | AZND/USDC | $13,747/30d | **phantom** (price hardcoded 1.0; best Ethereum route: 50,000 AZND → 470 USDC, −99%; one borrower holds 58% of token supply) |
+   | ROY-ST-apyUSD | $13,233/30d | **phantom** (oracle +5,118% vs traded) |
+   | All 241 live/relevant Ethereum Morpho markets | $278,740/30d | **$2,892/30d** in Gate-0-PASS markets |
 
-2. **Fork simulation** — every candidate is replayed inside a REVM fork of the exact chain, using Aave V3's own math. The simulator reads the real Aave config bitmap (close-factor, eMode LT/bonus override, liquidation protocol fee, isolation debt ceiling, siloed flags) and computes the net yield after the protocol takes its cut and after the DEX slippage is honored. If the simulation does not clear a 2.5x profit-over-gas hurdle, the candidate is discarded. No broadcast.
+4. **The survey of everything else found no replacement.** Against a decision
+   threshold fixed *before* any number existed ($100k/30d of exit-denominated,
+   Gate-0-surviving bonus — [docs/gate0-decision-rule.md](docs/gate0-decision-rule.md)),
+   the whole landscape yields **≈$69–79k/30d**, of which $50.2k is Base Morpho
+   price-push flow — a latency race this operator already lost. The pollable
+   remainder is ≈$19–29k/30d fragmented across ~8 venues, each with an
+   85–99.7% incumbent. Every non-SVR Aave chain (Optimism, Polygon, Avalanche,
+   Gnosis, Linea, Scroll, Metis, Sonic, Celo) is oracle-OPEN and collectively
+   worth ~$10.9k/30d — open only because not worth auctioning. Morpho outside
+   Ethereum/Base: ~$300/30d. Other lending protocols: nothing simultaneously
+   open, non-trivial, and Gate-0-passing. Adjacent classes (Pendle PT, Liquity
+   V2, crvUSD, Ajna, LlamaLend, perp-DEX liquidator roles, Gearbox): all dead,
+   gated, or latency races.
 
-3. **Atomic flash-loan execution** — an authorized worker signs an ordinary EIP-1559 transaction to the configured standalone Executor's `execute(bytes)` entrypoint. There is no EIP-7702 or delegation path. Executor calls the configured Aave Pool's `flashLoanSimple` with itself as receiver, validates that the callback caller is that Pool and the initiator is Executor, liquidates the user, swaps collateral back to debt, and repays atomically. If any step fails, the transaction reverts. Aave supplies the liquidation capital; operator funds cover gas only.
+Full evidence chain, in reading order:
+[docs/gate0-work-order.md](docs/gate0-work-order.md) →
+[docs/executive-brief-2026-07-25.md](docs/executive-brief-2026-07-25.md) (§9
+corrections log is the calibration section) →
+[docs/pivot-matrix-2026-07-25.md](docs/pivot-matrix-2026-07-25.md) →
+[docs/gate0-survey-2026-07-26.md](docs/gate0-survey-2026-07-26.md) →
+[config/gate0_survey.json](config/gate0_survey.json) (1,055 machine-readable rows).
 
-4. **Sovereign custody** — successful debt-token profit remains in Executor. The multisig owner consolidates it with `withdraw(token, amount)`. Worker EOAs normally retain only gas ETH. The Rust `SweepScheduler` sweeps excess native worker ETH to the treasury signer and refunds underfunded workers; it does not sweep ERC20s, and `sweep_tokens` is currently unused.
+---
 
-5. **Guardrails that cannot be bypassed** — the pacing engine enforces $2,000 net daily, $7,500 net weekly, $1,000 per liquidation, 6–18h jitter between ops, auto-halt on 3 consecutive reverts, auto-halt on >300 gwei gas, auto-halt on 0.005 ETH daily loss. `emergency_pause.py` trips the breaker; `clear_breaker` requires `CHIMERA_OPERATOR_TOKEN`. Executor ownership is fixed at construction to the multisig. Only the owner or workers explicitly authorized with `setWorker(worker, true)` may call `execute(bytes)`; `setPool`, `setWorker`, `withdraw`, and `transferOwnership` remain owner-only. Live startup verifies deployed Executor bytecode, `pool()` equality, every active worker's `isWorker` status, treasury signer/address parity, EOA-pool/signer parity, and gas funding. `execute_mode` defaults to `shadow`, and `shadow-guard` refuses committed live config.
+## 2. The pivot — how sunk cost becomes revenue
 
-The engine runs in shadow mode by default; `toggle_shadow.py` manages the live-transition state in `core/state/mode.json` (the mandatory 7-day soak was de-listed by operator decision on 2026-07-20). After all go-live checks pass, it can execute profitable opportunities and maintain worker gas automatically. Debt-token profit remains in Executor until the multisig withdraws it. Private/protected submission is not wired: current execution broadcasts raw transactions to the configured standard RPC, so protected submission is strongly recommended before real-money operation.
+The money spent building the engine is sunk and carries zero weight. The assets
+that remain have three monetizable shapes, ranked by expected value per unit of
+additional effort:
 
-```mermaid
-flowchart LR
-    subgraph find["find: 24/7 Aave V3 surveillance"]
-      D[detector] --> O[oracles: Aave + Chainlink]
-    end
-    find --> validate{"simulate: REVM fork\nexact Aave v3 math\neMode · isolation · bad-debt · protocol-fee"}
-    validate -->|profitable \+ pacing OK| fire["fire: flash-loan → liquidate → swap → repay\n(all-or-nothing in one tx)"]
-    validate -->|not profitable| find
-    fire --> P[(debt-token profit in Executor)]
-    P -->|multisig withdraw(token, amount)| M[(multisig custody)]
-    T[(gas treasury signer)] -->|Rust refund scheduler| W[authorized worker EOAs]
-    W -->|excess native ETH sweep| T
-    W --> find
+### 2a. The standing survey (highest EV, near-zero cost) — run it monthly
+
+The landscape is not static: **SVR coverage expands** (each expansion closes a
+venue — but governance schedules are public), **Morpho markets open
+continuously** (a new exotic-collateral market with an honest oracle and real
+DEX depth is exactly the accrual shape that was hunted), and **incumbents
+leave** (Optimism Aave went from a 2-year deployment to zero events). The
+toolchain reduces "is anything open now?" to four commands (§4). This is the
+repo's genuine moat: nobody else has published exit-denominated numbers, and
+every public dashboard still shows the phantom oracle-denominated ones.
+
+**Re-open triggers (check monthly, act only if one fires):**
+
+| trigger | threshold | rationale |
+|---|---|---|
+| Gate-0 survey total | any single OPEN venue with **≥$10k/30d `bonus_exit`** and top-1 <50%, or aggregate ≥$100k/30d | the pre-declared rule stands |
+| New Morpho market | Gate-0 PASS + accrual-shaped (pinned/slow oracle, honest premium <1%, DEX-routable) + borrow >$1M | the AVLT shape with an honest exit |
+| Gearbox TVL | recovers toward 2024 levels (≥$100M) | only protocol where the repo transfers unchanged onto a permissionless, polling-native mechanism ([tier E](docs/gate0-survey-2026-07-26.md)) |
+| SVR governance | an ARFC *removing* or failing to renew SVR on a chain | would re-open an Aave venue overnight |
+| Vault-redemption events | a second ynETHx-style event (REVIEW_VAULT, NAV premium ~0) | one $79.8k event occurred in 30d; the exit path (queue/lockup) is `[UNMEASURED]` — verify before caring |
+
+### 2b. Salvage inventory — component → transfer target
+
+~62% of the engine survives *some* pivot; the point is to name which one.
+
+| component | state | transfers to |
+|---|---|---|
+| `scripts/scan_liquidation_venues.py` | fixed 2026-07-26, three-number output, validated | the monthly survey; any venue-sizing question |
+| `scripts/gate0_market_filter.py` | new, validated against AVLT/AZND/majors | screening any market on any EVM chain in ~5–9 network calls |
+| `scripts/enumerate_morpho_markets.py` | new | full-universe Morpho enumeration (CreateMarket + Multicall3) |
+| `scripts/check_venue_open.py` | proven twice | the 2-call SVR openness gate — run before ANY venue work, always |
+| `core/src/detector/liquidation.rs` | best code in the repo | correct Aave V3 HF math (two-tier close factor, eMode LT, isolation, siloed) — borrower-side protection product, Gearbox HF polling, audit-contest PoCs |
+| `core/src/simulator/seeding.rs` + REVM harness | genuinely original | discovers ERC20 storage layouts by probing, memoised — audit-contest **PoC** edge (it makes a report survive triage; it does not find bugs) |
+| Multicall3 discovery + checkpointed backfill (`snapshot_generator.py`, commits `30e6996`/`7fef2d2`) | works at 46.75M-block scale | any borrower-set index on any chain |
+| `core/src/signer_registry/`, pacing *mechanism*, ops surface (Prometheus/Grafana/runbooks) | sound | any future execution system |
+| `Executor.yul` + contract tests, swap engine, mempool watcher, `oracle/aave.rs`, venue tables, Base borrower snapshot | **write off** | nothing — latency machinery for a race that doesn't exist; `Executor.yul` has no arbitrary-call primitive and hard-asserts a 420-byte Aave payload (cannot be wrapped) |
+
+### 2c. Revenue candidates that do NOT depend on winning a race
+
+1. **Borrower-side liquidation protection** (the DeFi Saver model): the only
+   idea where the existing code *is* the product — the detector's HF math plus
+   the poller watching *your own* positions and repaying before liquidation.
+   The hard problem is distribution, not technology. `[UNMEASURED]` as a
+   business; parked, not dead.
+2. **Audit contests (PoC-mandatory platforms)**: the REVM fork-simulation
+   harness is a proof-of-concept edge. Ordinary active participants earn
+   $5–30k/yr `[REPORTED]`. ~3 hrs/week, zero capital, independent of every
+   on-chain thesis in this file.
+3. **The survey itself as product**: exit-denominated venue numbers are
+   contrarian and reproducible; the phantom-bonus finding (oracle-denominated
+   seizure accounting) generalizes to every Morpho-style protocol and is
+   publishable research that no dashboard currently reflects.
+
+### 2d. The dead list — do not re-research these
+
+Each entry cost real effort to kill; the reasons are structural, not cyclical.
+
+| venue/idea | killed by | date |
+|---|---|---|
+| Aave V3 Base/Ethereum/Arbitrum/BNB, Compound III, Venus | SVR sealed-bid auction (`DualAggregator`) | 2026-07-25/26 |
+| Interest-accrual niche (AVLT/AZND/ROY) | oracle-premium phantom + no exit + market exhausted | 2026-07-26 |
+| Base Morpho (latency framing) | 98.8% price-push race, already lost | 2026-07-25 |
+| Dutch auctions (Euler v2, Ajna, LlamaLend, Liquity, Sky) | with flash loans a descending auction IS a latency race | 2026-07-25 |
+| Compound III `buyCollateral` | measured $1.16/30d | 2026-07-25 |
+| Keeper networks (Chainlink Automation, Gelato, Defender) | fixed permissioned sets; fee = gas × premium and gas ≈ $0.08 | 2026-07-25 |
+| Protocol fixed-fee roles (Sky `bark`, Liquity V1) | fired once/never per month | 2026-07-25 |
+| Atlas/SVR solver seat | first-price auction bids ~100% of bonus back; reputation-reserved slot | 2026-07-25 |
+| Risk-data-to-DAOs | Chaos Labs exited Aave at a loss after 3 years | 2026-07-25 |
+| Perp-DEX liquidator roles | gated/unpaid, or (Drift) a sub-65ms Solana race | 2026-07-26 |
+| Non-SVR Aave chains as a business | all OPEN, all tiny (~$10.9k/30d combined), all owned (85–99.7% top-1) | 2026-07-26 |
+
+---
+
+## 3. Technical map for future LLM sessions
+
+### 3.1 Invariants that must not be re-derived (each was expensive)
+
+1. **Never value an oracle-denominated seizure at oracle prices.** Morpho
+   `seizedAssets` is priced by `IOracle.price()` at liquidation time; real PnL
+   per event is `repaid_usd × (LIF/(1+premium) − 1)` where
+   `premium = oraclePrice/tradedPrice − 1`. `LIF = min(1.15, 1/(1 − 0.3×(1 −
+   lltv)))` — ceiling **13.04%** of seized, not 15%.
+2. **Never value a 30-day bonus at current prices** (inflated Base Morpho 63%).
+   The scanner's `bonus_exit` derivation confines drift to the loan token.
+3. **Run the openness gate before any venue work** (2 RPC calls):
+   `Pool → ADDRESSES_PROVIDER() → getPriceOracle() → getSourceOfAsset(asset) →
+   typeAndVersion()`. `DualAggregator`/`SVR` anywhere in the walk ⇒ CLOSED.
+   Check `description()` too — SVR proxies can lack `typeAndVersion`.
+4. **Aggregator quotes, never factory enumeration, for exit depth** — and apply
+   the **junk-route guard**: if the quote-implied price diverges >30% from
+   DefiLlama, the "route" is a 90–99.99%-fee-pool artifact (AVLT has 9 such V4
+   pools); treat as unroutable. KyberSwap and ParaSwap answer keyless; Odos
+   rate-limits; 1inch/0x/CowSwap need keys.
+5. **No `roundId`-never-increments filter**: `roundId = 1` is structural for
+   RedStone `PriceFeedWithoutRoundsForMultiFeedAdapter`. The AVLT feed was
+   *live* (146 updates/12d) with a *pinned value*.
+6. **Transfer restrictions are not the discriminator** — AVLT is a plain OFT
+   with no allowlist/pause/hook and still fails Gate-0 on premium + exit.
+7. **The canonical Morpho address `0xBBBB…FFCb` has code only on
+   Ethereum + Base.** Arbitrum `0x6c247b1F6182318877311737BaC0844bAa518F5e`,
+   Optimism `0xce95AfbB8EA029495c66020883F87aaE8864AF92`, Polygon
+   `0x1bF0c2541F820E775182832f06c0B7Fc27A25f67` `[MEASURED]`. Resolve per-chain
+   deployments via `blue-api.morpho.org` and verify with `eth_getCode`.
+8. **Morpho Bundler3 (`0x6566194141eefa99af43bb5aa71460ca2dc90245`) is a public
+   router with ≥12 EOA callers, not a competitor** — never count it as one
+   entity in concentration numbers.
+9. **RPC discipline:** keys live in `.env.live` (gitignored) and are read ONLY
+   by regex (`alchemy\.com/v2/([A-Za-z0-9_-]{20,})`,
+   `infura\.io/(?:v3|ws/v3)/([A-Za-z0-9]{20,})`) — never printed, never
+   committed. Alchemy key is scoped to Ethereum+Base; Infura reaches
+   arbitrum/optimism/polygon/avalanche/bsc/linea and **caps `eth_getLogs` at
+   10,000 blocks on L2 endpoints** — parse the stated limit from the error and
+   latch to it; never rediscover by halving. Public RPCs are largely
+   403-blocked from this sandbox; zkSync Era and Cronos remain unreachable.
+10. **Toolchain quirks:** `forge`/`slither`/Linux `cargo` run via WSL — pass
+    scripts on **stdin** with `wsl bash -s <<'EOF' … EOF` (Git Bash mangles
+    absolute paths given as args). Linux file mtimes are coarse-clock granular
+    — tests that rewrite files microseconds apart must stamp explicit
+    increasing mtimes (see `snapshot_refresh.rs::write_atomically`).
+
+### 3.2 The measurement toolchain (the part that earns its keep)
+
+| script | role |
+|---|---|
+| `scripts/scan_liquidation_venues.py` | 30d flow + concentration per venue; emits `bonus_oracle` / `bonus_exit` / `oracle_premium_pct` side by side, per-market clips; checkpointed, span-latching; `--validate` reproduces frozen controls |
+| `scripts/gate0_market_filter.py` | the 3-check market screen: routable exit (3 sizes, same chain), oracle premium (>1% fails), exit-type classification (`DEX` / `PT_REDEEMABLE` / `VAULT_REDEEMABLE` / `BRIDGE_ONLY` / `NONE`); PT markets judged on discount-vs-maturity, never on depth |
+| `scripts/enumerate_morpho_markets.py` | every market ever created on a chain (CreateMarket topic `0xac4b2400…83ac`) + live state via Multicall3 → Gate-0 input rows |
+| `scripts/assemble_gate0_survey.py` | merges tier outputs → `config/gate0_survey.json` + decision summary vs the pre-declared threshold |
+| `scripts/check_venue_open.py` | the SVR openness gate (+`--ext` families: Comet, Moonwell, Morpho, Aave forks) |
+| `scripts/measure_liquidation_flow.py` | single-venue deep flow scanner (the original tool that produced the controls) |
+
+**Frozen control values — any scanner change must reproduce these before its
+output is trusted:**
+
+```
+Base Aave V3 30d : 116 events · ~$79,790 seized · ~$4,404 naive bonus · top-1 85.4%
+AVLT/USDC        : bonus_oracle ≈ $178k must collapse to NEGATIVE bonus_exit,
+                   exit_type=BRIDGE_ONLY, premium ≥ +4%
+Healthy majors   : |premium| ≤ 0.3% (WETH/WBTC/wstETH/cbBTC vs USDC-family)
 ```
 
-## Architecture Overview
+### 3.3 Engine status — honest, component by component
 
-Chimera is a sovereign liquidation MEV system built for L2s (Base, Arbitrum, Optimism). At its core it combines a Rust execution engine with Yul flash-loan contracts and hard financial guardrails. A `$50 seed` is only an illustrative native-gas reserve for worker transactions, not liquidation or trading capital; Aave flash loans supply the liquidation capital. A separate, optional `ai-audit/` tooling component (Slither + a local Ollama model) ships alongside it for experimental contract scanning; it is auxiliary and independent of the MEV engine, not part of the liquidation funds path.
+- Rust workspace (`core/`): 269 tests green (Windows + Linux), clippy/fmt
+  clean as of `d858cb0`. Shadow mode is the committed default; `shadow-guard`
+  CI blocks committed live config.
+- **Known-broken/quarantined (do not trust without fixing):**
+  `core/src/simulator/prewarm.rs` (hardcodes Aave storage slot 53, overwrites
+  live fork state — its own sibling `seeding.rs` condemns the practice);
+  `core/src/simulator/golden.rs` (asserts nothing, zeroes prices);
+  `orchestrator.rs` `execute_live` books SUCCESS on `send_raw_transaction`
+  without polling the receipt (revert breaker = dead code in live mode);
+  the simulator validates a bare `liquidationCall`, not the flash-loan path
+  that would actually be sent.
+- **Pacing hard caps are code, not config:** `Config::validate()`
+  (`core/src/config.rs`) hard-rejects `max_single_transfer_usd > 1000` and
+  `max_daily_net_usd > 2000`; `pacing_engine.rs` compares the transfer cap
+  against *net profit* (an anti-selection filter). Any future execution use
+  needs a code change here, by design decision not accident.
+- **CI blind spots:** slither never parses `Executor.yul` (moved aside in CI);
+  `ExecutorBaseFork.t.sol` silently no-ops without `BASE_FORK_URL`.
+- The pre-existing engine docs (architecture, operator manual, runbooks,
+  threat model) remain accurate *about the code* — read them knowing the
+  market conclusion above; the "How It Earns" story they assume is falsified.
 
-The data flow is simple: the **Detector** spots unhealthy positions, the **Simulator** replays them in a forked REVM with exact Aave v3 math, the **Pacing Engine** governs whether execution is financially safe, and an authorized worker signs an EIP-1559 call to the standalone **Executor**.
+### 3.4 Key reference data
 
-```mermaid
-flowchart TB
-    subgraph SCAN["① SOVEREIGN SURVEILLANCE  ·  24/7 on Base + Arbitrum"]
-        direction LR
-        D[Liquidation Detector] ~~~ O[Aave + Chainlink Oracles]
-    end
-    SCAN --> CANDIDATE{unhealthy position found?}
+Full tables (addresses, event topics, selectors, tx hashes) live in
+[docs/executive-brief-2026-07-25.md](docs/executive-brief-2026-07-25.md)
+Appendix A and [docs/gate0-work-order.md](docs/gate0-work-order.md). The
+load-bearing subset:
 
-    subgraph SIM["② FORK-SIMULATION  ·  exact Aave v3 math in REVM"]
-        direction LR
-        S[REVM Simulator] ~~~ CB[close-factor / eMode / isolation / bad-debt / protocol-fee]
-    end
-    CANDIDATE -->|yes| SIM
-    CANDIDATE -->|no| SCAN
-
-    SIM --> PROFIT{expected_net_usd > pacing gate?}
-
-    subgraph FIRE["③ ATOMIC FLASH-LOAN EXECUTION"]
-        direction TB
-        FL["borrow from Aave (zero upfront capital)"] --> LIQ["liquidate user (protocol awards bonus)"]
-        LIQ --> SWAP["swap collateral ↔ debt via DEX"]
-        SWAP --> REPAY["repay flash-loan in same tx"]
-    end
-    PROFIT -->|profitable + pacing approved| FIRE
-    PROFIT -->|not profitable| SCAN
-
-    subgraph KEEP["④ CUSTODY + GAS OPERATIONS"]
-        direction LR
-        EX[(Executor profit)] -->|multisig withdraw| MSIG[(MULTISIG)]
-        T[(GAS TREASURY)] -->|refund underfunded workers| EOA[authorized worker EOA]
-        EOA -->|sweep excess native ETH| T
-    end
-    FIRE -->|debt-token profit remains in Executor| KEEP
-
-    subgraph GUARDRAILS["⑤ HARD FINANCIAL GUARDRAILS  (code-enforced, no overrides)"]
-        direction LR
-        PE[Pacing Engine] --- BK[Breaker] --- EF[Emergency Flag] --- MS[Multisig-owned Executor]
-    end
-    FIRE -.GUARDRAILS.- PROFIT
-
-    classDef money fill:#1a3a1a,stroke:#4ade80,stroke-width:2px,color:#d1fae5
-    classDef guard fill:#3a1a1a,stroke:#f87171,stroke-width:2px,color:#fee2e2
-    classDef brain fill:#1e293b,stroke:#60a5fa,stroke-width:2px,color:#dbeafe
-    class FIRE,KEEP,EOA,T,EX,MSIG money
-    class GUARDRAILS,PE,BK,EF,MS guard
-    class SIM,S,CB brain
+```
+Morpho Blue (Ethereum & Base ONLY)  0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb
+Aave V3 Pool (Base / Ethereum)      0xA238Dd80C259a72e81d7e4664a9801593F98d1c5 / 0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2
+Multicall3 (all chains)             0xcA11bde05977b3631167028862bE2a173976CA11
+Aave LiquidationCall topic          0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286
+Morpho Liquidate topic              0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41
+Morpho CreateMarket topic           0xac4b2400f169220b0c0afdde7a0b32e775ba727ea1cb30b35f935cdaab8683ac
+Morpho Liquidate data words: 0=repaidAssets 1=repaidShares 2=seizedAssets 3=badDebtAssets
+  indexed: 1=marketId 2=caller 3=borrower
+selectors: idToMarketParams 0x2c3c9157 · market 0x5c60e39a · position 0x93c52062
+           price() 0xa035b1fe · getConfiguration 0xc44b11f7 · getAssetPrice 0xb3596f07
+           getSourceOfAsset 0x92bf2be0 · typeAndVersion 0x181f5a77
+IOracle.price() scale: 1e(36 + loanDecimals − collateralDecimals)
+Aave liquidationBonus: getConfiguration bitmap bits 32–47, bps (10500 = 105%)
 ```
 
 ---
 
-## Directory Structure
-
-```
-project-chimera/
-├── core/              # Rust engine (REVM + Aave math + pacing)
-│   ├── src/
-│   │   ├── config.rs
-│   │   ├── detector/
-│   │   ├── error.rs
-│   │   ├── executor/
-│   │   ├── lib.rs
-│   │   ├── main.rs
-│   │   ├── metrics.rs
-│   │   ├── oracle/
-│   │   ├── pacing_engine.rs
-│   │   ├── simulator/
-│   │   └── state/
-├── config/           # YAML/TOML configs (pacing, risk, routing, pools, EOA pool)
-├── contracts/        # Yul Executor + Solidity interfaces + Foundry tests
-├── ai-audit/         # OPTIONAL auxiliary tooling: Slither + local Ollama contract scanner (independent of the engine)
-├── scripts/          # Python utilities (snapshot, rotation, venues, emergency)
-├── tests/fixtures/   # Golden replay data
-└── docs/             # Architecture, operator manual, emergency procedures, schemas, security research
-```
-
----
-
-## Quick Start (Windows 11 + WSL2)
-
-### Prerequisites
-
-- Rust (latest stable)
-- Foundry (`forge`, `cast`, `anvil`)
-- Python 3.11+
-
-### Build & Validate
+## 4. Running the monthly survey (the whole loop)
 
 ```bash
-# Build the core engine
-cargo build -p chimera-core --release
+# 1. Flow + three-number bonus per venue (reuses cached raw logs when present)
+python scripts/scan_liquidation_venues.py --days 30 --workdir <scratch>/venues30 --validate
 
-# Run contract tests
-cd contracts/
-forge test
+# 2. Enumerate every Ethereum Morpho market with live borrow
+python scripts/enumerate_morpho_markets.py --chain ethereum --workdir <scratch>/tier_a \
+    --min-borrow-usd 10000 --venue-report <scratch>/venues30/venue_report.json
 
-# Generate a mock snapshot for testing
-cd ..
-python scripts/snapshot_generator.py --chain base --mock
+# 3. Gate-0 over the candidates (checkpointed; resumable)
+python scripts/gate0_market_filter.py --markets <scratch>/tier_a/gate0_input_ethereum.json \
+    --out <scratch>/tier_a/gate0_ethereum_morpho.json
+
+# 4. Assemble + decide against the pre-declared threshold
+python scripts/assemble_gate0_survey.py --scratch <scratch> --out config/gate0_survey.json
 ```
 
----
-
-## Core Modules
-
-| Module | Description |
-|--------|-------------|
-| **Pacing Engine** | Financial governor. Enforces daily/weekly caps, jitter windows, profit multipliers, and auto-halt triggers. |
-| **Liquidation Detector** | Fast health-factor pre-filter. Scans Aave v3 pools for positions eligible for liquidation. |
-| **REVM Simulator** | High-fidelity fork simulation. Replays liquidations with exact Aave v3 math, eMode, isolation mode, and bad-debt coverage. |
-| **Price Oracle** | Chainlink primary with Aave fallback. Aggregates prices for simulator and detector. |
-| **Transaction Executor** | Builds `execute(bytes)`, signs ordinary EIP-1559 transactions with authorized worker keystores, and broadcasts raw transactions to the configured standard RPC. |
-| **State Persistence** | JSONL audit trail + crash recovery. Logs every decision, simulation, and execution for post-hoc analysis. |
-| **Atomic Executor** | Standalone, multisig-owned Yul contract. Self-initiates Aave flash loans, validates callback caller/initiator, retains token profit, and exposes owner-only withdrawals. |
-
-### Auxiliary tooling (not a core capability)
-
-The `ai-audit/` directory is an **optional, experimental, best-effort** contract-scanning pipeline that is fully separate from the liquidation engine and the funds path. When run manually (`ai-audit/scripts/run_audit.py`), it monitors L2 contract-creation events, runs Slither plus a local Ollama LLM over fetched/verified sources, and emits draft bounty-report JSON into `ai-audit/queue/`. It requires Slither and a local Ollama model to be installed, has a stubbed bytecode-fetch fallback (so it degrades gracefully when no verified source is available), and is not required for — nor connected to — shadow- or live-mode operation of the MEV engine.
-
-Key supporting documents:
-
-- `docs/security-research.md` — CVE/advisory workflow and curated Aave/Solidity/Slither references.
-- `docs/research/aave-v3-liquidation-compendium.md` — Aave V3 liquidation logic source map and regression scenarios.
-- `docs/snapshot-schema.md` — JSON contract between `scripts/snapshot_generator.py` and Rust prewarming.
+All scripts are stdlib-only Python (AGENTS.md invariant #5), read keys from
+`.env.live` by regex, checkpoint to disk, and survive mid-run network death.
+Step 1's `--validate` must PASS (§3.2 controls) before any other number is
+believed. Act on the §2a trigger table only.
 
 ---
 
-## Financial Guardrails
+## 5. Build & test (engine)
 
-All guardrails are hard-coded in `core/src/pacing_engine.rs` and enforced at runtime.
-
-- **$2,000** daily net cap
-- **$7,500** weekly net cap
-- **$1,000** single transfer max
-- **6–18h** randomized jitter between transfers
-- **2.5x** profit multiplier after ALL gas + L1 fees
-- **Auto-halt** on 3+ reverts, gas >300 gwei, or 0.005 ETH daily loss
-
----
-
-## Operator Checklist (10–20 min daily)
-
-1. Open **Grafana** (`localhost:3002`) → confirm no breaker trips, inclusion >85%.  <!-- NOTE: The default Grafana port (localhost:3000) must be changed to avoid conflicts with existing Docker stacks using ports 3000/3001. -->
-2. Review `cargo run` or binary logs for pacing decisions.
-3. Update `config/pools.toml` weekly (manual for v1).
-4. Run `python scripts/update_venues.py` weekly.
-5. (Optional) If you run the auxiliary `ai-audit/` scanner, review `ai-audit/queue/` for new draft reports. This is independent of the engine and not part of daily liquidation operations.
-
----
-
-## Never (enforced in code + process)
-
-- Override simulation checks or pacing.
-- Disable breakers.
-- Reuse clean wallets without rotation.
-- Exceed daily/weekly caps.
-- Run >72h unmonitored without active breakers + alerts.
-
----
-
-## Development Status
-
-The project has undergone a security + wiring remediation pass across five waves. This reflects code that has been written and self-reviewed — **not** an independent audit, and **not** a full toolchain validation in this environment.
-
-**Done in the remediation pass (Waves 1–5):**
-
-- **Contracts hardened** — standalone `Executor.yul` uses construction-time multisig ownership, explicit worker authorization, pool/caller/initiator validation, an owner withdrawal path, and overflow guards, with corresponding Foundry tests in `contracts/test/`. Foundry targets Cancun.
-- **Runtime wired** — real snapshot loader, simulator, and oracles connected; signer loaded from keystore; `RpcSubmitter` with a `dry_run` path; JSONL persistence; a mode-transition gate; and file logging.
-- **Safety surface connected** — `emergency.flag` reader, breaker metric, daily/weekly USD gauges, and Grafana/Alertmanager wiring.
-- **Operator tooling** — the Python helper scripts under `scripts/` completed (see [Operator Tooling](#operator-tooling)).
-- **Security hardening (Wave 5)** — Foundry coverage includes construction ownership, worker authorization, `transferOwnership`, callback validation, and no lazy initialization; `contracts/script/Deploy.s.sol` enforces multisig-owned deployment; Aave V3 edge cases are implemented end-to-end; CI includes dependency/static-analysis gates plus `shadow-guard` blocking committed live config.
-
-**Honest remaining gaps (must be closed before any live transition):**
-
-- Full toolchain validation (`cargo test`, `forge test`) has **NOT** been run in the remediation environment and must be verified on a developer workstation.
-- The mandatory **7-day shadow soak** was de-listed by operator decision on 2026-07-20; shadow remains the committed default.
-- Live mode requires an **encrypted keystore** and a **multisig-owned deployment**.
-- Private/protected transaction submission is **not wired**; live calls currently use the configured standard RPC.
-
-The engine remains **shadow-mode-first and never auto-flips to live**. The shadow-to-live transition is gated in code and additionally subject to the operator preconditions above.
-
----
-
-## Operator Tooling
-
-The `scripts/` directory holds the Python operational helpers. All scripts import cleanly without `web3.py` installed (AGENTS.md invariant #5).
-
-- **Rust `SweepScheduler`** — primary automated gas path: sweeps excess native worker ETH to the treasury signer and refunds underfunded workers. It does not sweep ERC20s; `sweep_tokens` is currently unused.
-- **`fund_eoa.py`** — legacy/manual worker gas-funding helper. Primary runtime top-ups use the Rust scheduler and encrypted `SignerRegistry` keystores.
-- **`sweep_profits.py`** — implemented legacy/manual raw-key-file helper for worker balances. It is not the Executor-profit path and is not the scheduled primary workflow; consolidate Executor token profit through multisig `withdraw(token, amount)`.
-- **`emergency_pause.py`** — writes the circuit-breaker flag read by the Rust binary at sub-interval polls (≤3s detection).
-- **`check_balances.py`** — health-checks wallet balances (native + ERC20), exits non-zero if any worker is below min threshold.
-- **`health_check.py`** — end-to-end preflight: RPC reachable, metrics alive, mode.json parse, snapshot freshness.
-- **`dry_run.py`** — validates config + RPC in shadow mode, optionally boots the binary for N seconds.
-- **`toggle_shadow.py`** — manages `core/state/mode.json` (the Rust binary reads this at startup); manages the shadow→live mode state (7-day soak enforcement de-listed 2026-07-20).
-- **`recover_state.py`** — rebuilds aggregated pacing state from `core/state/outcomes.jsonl`, mirroring the Rust `CrashRecovery`.
-- **`rotate_eoa.py`** / **`rotate_wallet.py`** — round-robin wallet rotation with cooldown; `rotate_wallet.py` is a docs-compatible alias.
-- **`snapshot_generator.py`** — emits Aave V3 pool snapshots (live RPC or `--mock`).
-- **`update_venues.py`** — discovers DEX liquidity across Aerodrome/Uniswap V3/Sushi/Camelot.
-- **`status.py`** — read-only dashboard.
-- **`fetch_historical_liquidations.py`** — pulls historical LiquidationCall events for soak comparison.
-
----
-
-## Build & Test
-
-Prerequisites: Rust (stable) + `cargo`, Foundry (`forge`), Python 3.11+, and (optional) `slither`.
-The repo is a Cargo workspace; run `cargo` commands from the repo root.
+Prerequisites: Rust stable, Foundry, Python 3.11+, optional slither (WSL).
 
 ```bash
-# Rust unit + integration tests (workspace root)
-cargo test -p chimera-core
-
-# Solidity contract tests (requires forge-std: `forge install foundry-rs/forge-std` in contracts/)
-forge test --root contracts/
-
-# Python script syntax check
+cargo test -p chimera-core                 # 269 tests
+cargo fmt --all -- --check && cargo clippy -p chimera-core --all-targets -- -D warnings
+forge test --root contracts/               # requires forge-std
 python -m compileall scripts ai-audit/scripts
-
-# Static analysis (optional)
-slither contracts --config-file slither.config.json
-
-# Dependency CVE triage (optional) — see docs/research/dependency-cve-triage.md
-cargo audit && pip-audit && osv-scanner -r .
+BASE_FORK_URL=<rpc> forge test --root contracts/   # fork tests SILENTLY NO-OP without this
 ```
+
+PR gate: [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) ·
+invariants: `AGENTS.md`.
+
+---
+
+## 6. Document index
+
+**The 2026-07 measurement arc (read in this order):**
+
+| document | role |
+|---|---|
+| [docs/gate0-work-order.md](docs/gate0-work-order.md) | the survey's work order — tasks, traps, reference data |
+| [docs/executive-brief-2026-07-25.md](docs/executive-brief-2026-07-25.md) | full history, failure taxonomy, corrections log (§9), on-chain appendix |
+| [docs/pivot-matrix-2026-07-25.md](docs/pivot-matrix-2026-07-25.md) | every pivot option scored; the two judge panels |
+| [docs/flow-measurement-2026-07-25.md](docs/flow-measurement-2026-07-25.md) | accrual-niche measurement (superseded by the survey's exit denomination) |
+| [docs/venue-landscape-2026-07-25.md](docs/venue-landscape-2026-07-25.md) | cross-venue flow + concentration |
+| [docs/gate0-decision-rule.md](docs/gate0-decision-rule.md) | the threshold, fixed before the numbers |
+| [docs/gate0-survey-2026-07-26.md](docs/gate0-survey-2026-07-26.md) | the survey: methods, tiers A–E, decision |
+| [config/gate0_survey.json](config/gate0_survey.json) | 1,055 machine-readable market/venue rows |
+
+**Engine-era documentation** (accurate about the code; its market premise is
+falsified): [docs/architecture.md](docs/architecture.md) ·
+[docs/operator-manual.md](docs/operator-manual.md) ·
+[docs/threat-model.md](docs/threat-model.md) ·
+[docs/snapshot-schema.md](docs/snapshot-schema.md) ·
+[docs/testing-strategy-liquidations.md](docs/testing-strategy-liquidations.md) ·
+[docs/research/aave-v3-liquidation-compendium.md](docs/research/aave-v3-liquidation-compendium.md) ·
+runbooks under `docs/runbook-*.md` · [docs/monetization.md](docs/monetization.md) ·
+[CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) ·
+[CHANGELOG.md](CHANGELOG.md)
+
+`ai-audit/` is optional auxiliary tooling (Slither + local Ollama scanning),
+independent of everything above.
 
 ---
 
 ## License
 
-Proprietary — all rights reserved. See [LICENSE](LICENSE). Not for public
-distribution. (Versions up to 0.1.4 were distributed under the MIT license;
-the license changed at 0.2.0 — see CHANGELOG.)
+Proprietary — all rights reserved. See [LICENSE](LICENSE). (Versions up to
+0.1.4 were MIT; the license changed at 0.2.0 — see CHANGELOG.)

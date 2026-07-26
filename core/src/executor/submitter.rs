@@ -104,7 +104,12 @@ impl<P: Provider> RpcSubmitter<P> {
     /// Retries up to [`Self::max_retries`] times, doubling the wait
     /// interval after each attempt.  If no receipt is found after all
     /// retries, returns a [`ChimeraError::TimeoutError`].
-    async fn poll_receipt(&self, tx_hash: B256) -> Result<SubmissionReceipt, ChimeraError> {
+    ///
+    /// Public because the orchestrator's live path signs and broadcasts its own
+    /// raw transaction (it needs worker-signer nonce control that [`Self::submit`]
+    /// does not provide) and must still confirm inclusion through this same
+    /// backoff logic rather than a second implementation.
+    pub async fn poll_receipt(&self, tx_hash: B256) -> Result<SubmissionReceipt, ChimeraError> {
         let mut backoff = self.retry_backoff_ms;
         let mut attempts = 0u32;
 

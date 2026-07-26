@@ -474,10 +474,25 @@ impl LiquidationDetector {
 
     /// Aave V3 close factor logic (LiquidationLogic `_calculateDebt`).
     ///
-    /// Aave V3 uses a two-tier close factor keyed off `CLOSE_FACTOR_HF_THRESHOLD = 0.95`:
+    /// Aave V3 uses a **linear interpolation** between
+    /// `CLOSE_FACTOR_HF_THRESHOLD` (0.95 RAY) and
+    /// `HEALTH_FACTOR_LIQUIDATION_THRESHOLD` (1.0 RAY):
+    ///
+    /// ```
+    /// closeFactor = DEFAULT + (MAX - DEFAULT) * (1.0 - HF) / (1.0 - 0.95)
+    ///            = 0.5 + 0.5 * (1.0 - HF) / 0.05
+    ///            = 0.5 + 10 * (1.0 - HF)          (all in RAY = 1e27)
+    /// ```
+    ///
     /// - HF >= 1.0: not liquidatable (close factor = 0)
-    /// - 0.95 < HF < 1.0: `DEFAULT_LIQUIDATION_CLOSE_FACTOR` = 50% of the debt
     /// - HF <= 0.95: `MAX_LIQUIDATION_CLOSE_FACTOR` = 100% of the debt
+    /// - 0.95 < HF < 1.0: linear from 50%→0% as HF approaches 1.0
+    ///
+    /// This replaces the original binary 50% approximation, ensuring that
+    /// micro-liquidation positions receive proportionally correct debt coverage
+    /// rather than being rounded to zero or a fixed half. The eight-decimal USD
+    /// values are scaled through RAY (1e27) before the close factor is computed,
+    /// preventing precision collapse for small positions.
     ///
     /// `user_reserve_debt` is a SINGLE reserve's current debt in that debt token's
     /// native units (post-index), and the return value is in those same units —
@@ -493,18 +508,36 @@ impl LiquidationDetector {
     fn apply_close_factor(&self, hf: U256, user_reserve_debt: U256) -> U256 {
         let ray = ray();
         // CLOSE_FACTOR_HF_THRESHOLD = 0.95 in RAY scale.
-        let close_factor_hf_threshold = U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
+        let close_factor_hf_threshold =
+            U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
 
+        // HF >= 1.0: not liquidatable.
         if hf >= ray {
             return U256::ZERO;
         }
 
+        // HF <= 0.95: MAX_LIQUIDATION_CLOSE_FACTOR = 100%.
         if hf <= close_factor_hf_threshold {
-            // HF <= 0.95: MAX_LIQUIDATION_CLOSE_FACTOR = 100% of this reserve's debt.
+            return user_reserve_debt;
+        }
+
+        // 0.95 < HF < 1.0: linear interpolation.
+        // closeFactor_ray = 0.5e27 + 10 * (1.0e27 - hf)
+        // (because 0.5e27 / 0.05e27 = 10)
+        let default_close = ray / U256::from(2); // 0.5e27 (50%)
+        let hf_above_threshold = ray - hf; // (1.0 - HF) in RAY
+        // Extra close factor = 10 * (1.0 - HF) in RAY, clamped to [0, 0.5e27]
+        let extra_factor = hf_above_threshold * U256::from(10);
+        let close_factor_ray = default_close + extra_factor;
+
+        // Apply close factor to native-unit debt:
+        //   debt_to_cover = user_reserve_debt * close_factor_ray / ray
+        // For safety, cap at the full user reserve debt (close_factor_ray ≤ ray).
+        let debt_to_cover = user_reserve_debt * close_factor_ray / ray;
+        if debt_to_cover > user_reserve_debt {
             user_reserve_debt
         } else {
-            // 0.95 < HF < 1.0: DEFAULT_LIQUIDATION_CLOSE_FACTOR = 50%.
-            user_reserve_debt / U256::from(2)
+            debt_to_cover
         }
     }
 
@@ -993,14 +1026,19 @@ mod tests {
     #[test]
     fn test_close_factor_default_50_above_95() {
         let detector = LiquidationDetector::new(make_snapshot(), 8453);
-        for hf in [
+        // HF=0.96: close factor = 0.5 + 10*(1.0-0.96) = 0.5 + 0.4 = 0.9
+        let result = detector.apply_close_factor(
             U256::from(960_000_000_000_000_000_000_000_000u128), // 0.96e27
+            U256::from(ONE_WETH),
+        );
+        assert_eq!(result, U256::from(ONE_WETH * 9 / 10));
+
+        // HF=0.99: close factor = 0.5 + 10*(1.0-0.99) = 0.5 + 0.1 = 0.6
+        let result = detector.apply_close_factor(
             U256::from(990_000_000_000_000_000_000_000_000u128), // 0.99e27
-        ] {
-            let result = detector.apply_close_factor(hf, U256::from(ONE_WETH));
-            // 0.95 < HF < 1.0 => DEFAULT close factor = 50%.
-            assert_eq!(result, U256::from(ONE_WETH / 2));
-        }
+            U256::from(ONE_WETH),
+        );
+        assert_eq!(result, U256::from(ONE_WETH * 6 / 10));
     }
 
     /// Regression: `debt_to_cover` must come out in the debt token's NATIVE units.

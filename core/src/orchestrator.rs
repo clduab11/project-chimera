@@ -933,14 +933,83 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
                     target = "chimera::orchestrator",
                     id = %opp.id,
                     %tx_hash,
-                    "Liquidation submitted"
+                    "Liquidation broadcast; awaiting receipt"
                 );
-                self.pacing.engine().record_outcome(
-                    opp,
-                    opp.expected_net_usd,
-                    gas_spent_eth,
-                    false,
-                );
+
+                // A broadcast is not an outcome. Aave reverts a liquidation whose
+                // health factor recovered between simulation and inclusion, and a
+                // reverted transaction still burns gas. Booking expected profit on
+                // send would overstate realised PnL and — because `reverted` drives
+                // the pacing engine's breaker — leave the breaker unable to ever
+                // observe the failures it exists to count.
+                // Prefer the receipt's real gas over the pre-submission estimate:
+                // `gas_spent_eth` feeds `daily_loss_eth` and therefore the max-loss
+                // breaker. The price term is still the submitted `gas_price_wei`
+                // rather than the realised effective price, which `SubmissionReceipt`
+                // does not carry — actual gas units close most of the gap.
+                let receipt_gas_eth = |gas_used: Option<u64>| -> Decimal {
+                    gas_used
+                        .map(|g| {
+                            Decimal::from(g) * Decimal::from_u128(gas_price_wei).unwrap_or_default()
+                                / Decimal::from(1_000_000_000_000_000_000u64)
+                        })
+                        .unwrap_or(gas_spent_eth)
+                };
+
+                match self.submitter.poll_receipt(tx_hash).await {
+                    Ok(receipt) if receipt.status => {
+                        info!(
+                            target = "chimera::orchestrator",
+                            id = %opp.id,
+                            %tx_hash,
+                            block = ?receipt.block_number,
+                            gas_used = ?receipt.gas_used,
+                            "Liquidation confirmed"
+                        );
+                        self.pacing.engine().record_outcome(
+                            opp,
+                            opp.expected_net_usd,
+                            receipt_gas_eth(receipt.gas_used),
+                            false,
+                        );
+                    }
+                    Ok(receipt) => {
+                        warn!(
+                            target = "chimera::orchestrator",
+                            id = %opp.id,
+                            %tx_hash,
+                            block = ?receipt.block_number,
+                            gas_used = ?receipt.gas_used,
+                            "Liquidation reverted on-chain; gas spent, no profit"
+                        );
+                        self.pacing.engine().record_outcome(
+                            opp,
+                            Decimal::ZERO,
+                            receipt_gas_eth(receipt.gas_used),
+                            true,
+                        );
+                    }
+                    Err(e) => {
+                        // Inclusion unknown. Treated as a failure in the same
+                        // direction as a revert: the gas is spent either way, and
+                        // crediting an unconfirmed liquidation is the one error
+                        // that compounds silently.
+                        warn!(
+                            target = "chimera::orchestrator",
+                            id = %opp.id,
+                            %tx_hash,
+                            error = %e,
+                            "Liquidation receipt not observed; recording as unconfirmed"
+                        );
+                        self.pacing.engine().record_outcome(
+                            opp,
+                            Decimal::ZERO,
+                            gas_spent_eth,
+                            true,
+                        );
+                        return Err(e);
+                    }
+                }
             }
             Err(e) => {
                 warn!(

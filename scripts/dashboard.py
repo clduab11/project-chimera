@@ -995,6 +995,15 @@ def build_state() -> dict:
             "net_est_usd": (daily - spent_usd_est) if spent_usd_est is not None else None,
             "high_water": HW,
         },
+        "tranche": {
+            "enabled": bool(metrics.get("chimera_tranche_enabled", 0.0)),
+            "bundles_total": int(metrics.get("chimera_tranche_bundles_total", 0.0)),
+            "bundles_confirmed": int(metrics.get("chimera_tranche_bundles_confirmed_total", 0.0)),
+            "bundles_reverted": int(metrics.get("chimera_tranche_bundles_reverted_total", 0.0)),
+            "profit_wei": metrics.get("chimera_tranche_profit_wei", 0.0),
+            "gas_wei": metrics.get("chimera_tranche_gas_spent_wei", 0.0),
+            "relay": "https://rpc.flashbots.net",
+        },
         "swap": build_swap_state(
             routing_venues, routing_issues, outcome_stats, log, live_px or oracle_px
         ),

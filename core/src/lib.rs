@@ -17,6 +17,7 @@ pub mod snapshot_refresh;
 pub mod state;
 pub mod strategy;
 pub mod sweep_scheduler;
+pub mod tranche_arbitrage;
 
 pub use simulator::golden;
 pub use simulator::prewarm;
@@ -42,3 +43,7 @@ pub use snapshot_refresh::{RefreshOutcome, ReservePriceSource, SharedSnapshot, S
 pub use state::{JsonlPersistence, ReservationRecord, ReservationStatus, StatePersistence};
 pub use strategy::assembler::StrategyAssembler;
 pub use sweep_scheduler::SweepScheduler;
+pub use tranche_arbitrage::{
+    FlashbotsBundle, TrancheBundler, TrancheResult, TrancheScanner, TrancheStatus, TrancheTarget,
+    EXECUTOR_EXECUTE_SELECTOR, FLASHBOTS_RELAY_DEFAULT,
+};

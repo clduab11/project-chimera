@@ -45,6 +45,21 @@ const USDT_ARBITRUM: &str = "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9";
 
 /// Returns true if the given address is a known USD-pegged stablecoin on any
 /// supported chain. Used to bypass the ETH-price oracle for non-WETH debt.
+/// Gas cost in ETH, as `Decimal` — never `f64`.
+///
+/// Single definition on purpose: this feeds `daily_loss_eth` and therefore the
+/// max-loss breaker, and it is computed in two places (the pre-submission
+/// estimate and the post-receipt actual). Divergent copies would mis-scale loss
+/// accounting silently.
+///
+/// The price must stay in **wei**. Rounding it up to whole gwei overstated
+/// realised spend on Base by roughly 200x, which inflated `daily_loss_eth`
+/// enough to trip the breaker long before real losses justified it.
+fn gas_cost_eth(gas_used: u64, gas_price_wei: u128) -> Decimal {
+    Decimal::from(gas_used) * Decimal::from_u128(gas_price_wei).unwrap_or_default()
+        / Decimal::from(1_000_000_000_000_000_000u64)
+}
+
 fn is_stablecoin(addr: &Address) -> bool {
     let usdc_base: Address = USDC_BASE.parse().expect("valid USDC_BASE constant");
     let usdc_arb: Address = USDC_ARBITRUM.parse().expect("valid USDC_ARBITRUM constant");
@@ -679,13 +694,9 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
             }
         };
 
-        // Gas actually attributable to this liquidation (Decimal, never f64).
-        // Computed from wei: rounding the price up to whole gwei here overstated
-        // realized spend on Base by ~200x, which inflates `daily_loss_eth` and
-        // would trip the max-loss breaker long before real losses justified it.
-        let gas_spent_eth = Decimal::from(sim_result.gas_used)
-            * Decimal::from_u128(gas_price_wei).unwrap_or_default()
-            / Decimal::from(1_000_000_000_000_000_000u64);
+        // Pre-submission estimate; the live path replaces it with the receipt's
+        // real gas units once the transaction confirms.
+        let gas_spent_eth = gas_cost_eth(sim_result.gas_used, gas_price_wei);
 
         // 6.5 — Strategy assembly: build the same Executor-target request in all modes.
         let worker_eoa: Address = match opp.eoa.parse() {
@@ -949,10 +960,7 @@ impl<P: Provider<Ethereum> + Clone + Send + Sync + 'static> Orchestrator<P> {
                 // does not carry — actual gas units close most of the gap.
                 let receipt_gas_eth = |gas_used: Option<u64>| -> Decimal {
                     gas_used
-                        .map(|g| {
-                            Decimal::from(g) * Decimal::from_u128(gas_price_wei).unwrap_or_default()
-                                / Decimal::from(1_000_000_000_000_000_000u64)
-                        })
+                        .map(|g| gas_cost_eth(g, gas_price_wei))
                         .unwrap_or(gas_spent_eth)
                 };
 

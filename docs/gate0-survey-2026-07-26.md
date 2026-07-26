@@ -16,12 +16,23 @@ The $283.6k/30d accrual niche was a mark-to-oracle artifact three different ways
 2. **AZND ($13.7k attributed):** price hardcoded 1.0 passes the premium check trivially, exactly as the work order predicted — and fails on substance: the best aggregator route on Ethereum turns 1,000 AZND into **186 USDC (−81%)** and 50,000 into **470 USDC (−99%)**. Unsellable. One borrower (holding 58% of total AZND supply) at 100% utilization. `[MEASURED]`
 3. **The venue-wide residue:** Gate-0 across **all 241 live-and-relevant Ethereum Morpho markets** leaves **$2,892/30d** of exit-real bonus in PASS markets, plus ~$4.8k in the PT bucket. **~99% of Ethereum Morpho's $277.3k structural bonus evaporates under exit denomination.** `[MEASURED]`
 
-> Corrected 2026-07-26: this line read "$278.7k" and "~97%". Summing
-> `bonus_oracle` over the 241 rows in `config/gate0_survey.json`
-> (`tier == "A" && chain == "ethereum" && gate0_pass != "SKIPPED"`) gives
-> **$277,335.03**. The same filter reproduces the PASS total at $2,891.65,
-> i.e. the $2,892 quoted above, which is what confirms it selects the intended
-> set. $2,892 / $277,335 is 1.04%, so the survivorship figure is ~99%, not ~97%.
+> Corrected 2026-07-26: this line read "$278.7k" and "~97%".
+>
+> Selecting `tier == "A" && chain == "ethereum" && gate0_pass != "SKIPPED"` in
+> `config/gate0_survey.json` yields exactly 241 rows with the 137 PASS / 52 FAIL
+> / 32 REVIEW_PT / 20 REVIEW_VAULT split stated below, which is what identifies
+> it as the intended set. Summing **`bonus_oracle`** over those 241 rows gives
+> **$277,335.03**, with no null values — hence $277.3k, not $278.7k.
+>
+> The two totals come from different fields, so name them explicitly. Over the
+> 137 PASS rows: `bonus_oracle` sums to **$3,229.72**, while **`bonus_exit`**
+> sums to **$2,891.65** — the $2,892 quoted above. Note that only **19 of those
+> 137** PASS rows carry a non-null `bonus_exit` at all; the exit-denominated
+> total rests on that subset, and the remaining 118 are PASS-on-screen but
+> unpriced for exit.
+>
+> $2,892 / $277,335 = 1.04%, so the survivorship figure is ~99%, not ~97%.
+>
 > Per this repo's `[MEASURED]` convention the machine-readable artifact is
 > authoritative over prose restating it.
 

@@ -589,8 +589,7 @@ impl<P: Provider<Ethereum> + Clone> LiquidationSimulator<P> {
         _l1_fee: &U256,
         _pacing: &PacingConfig,
     ) -> Result<(U256, f64), ChimeraError> {
-        let bonus_portion_bps =
-            U256::from(DEFAULT_LIQUIDATION_BONUS_BPS.saturating_sub(10_000));
+        let bonus_portion_bps = U256::from(DEFAULT_LIQUIDATION_BONUS_BPS.saturating_sub(10_000));
         let estimated_profit = candidate.debt_to_cover * bonus_portion_bps / U256::from(10000);
 
         let profit_usd = self.debt_units_to_usd(estimated_profit, candidate).await?;
@@ -852,7 +851,8 @@ mod tests {
         sim.db.insert_account_info(pool, guard_info);
         // Caller + beneficiary (both Address::ZERO) must be cached so REVM never
         // touches the (unreachable) provider.
-        sim.db.insert_account_info(Address::ZERO, AccountInfo::default());
+        sim.db
+            .insert_account_info(Address::ZERO, AccountInfo::default());
 
         let candidate = LiquidationCandidate {
             user: Address::with_last_byte(0x01),
@@ -885,7 +885,10 @@ mod tests {
              (got revert {:?})",
             result.revert_reason
         );
-        assert!(result.profitable, "heuristic profit path should mark this profitable");
+        assert!(
+            result.profitable,
+            "heuristic profit path should mark this profitable"
+        );
     }
 
     #[test]
@@ -1006,7 +1009,7 @@ mod tests {
         let mut c = candidate_with_debt(18, U256::from(2_500u64) * U256::from(100_000_000u64));
         c.collateral_decimals = 6;
         c.collateral_price_usd = U256::from(100_000_000u64); // $1.00
-        // Repaid 0.4 WETH ($1000); seized 1050 USDC ($1050); no protocol fee.
+                                                             // Repaid 0.4 WETH ($1000); seized 1050 USDC ($1050); no protocol fee.
         let (_, usd) = event_profit_usd_known_prices(
             U256::from(1_050_000_000u64),            // 1050 USDC
             U256::from(400_000_000_000_000_000u128), // 0.4 WETH
@@ -1081,7 +1084,10 @@ mod tests {
             .debt_units_to_usd(U256::from(20_000_000_000_000_000u128), &candidate)
             .await
             .unwrap();
-        assert!((usd - 50.0).abs() < 0.001, "0.02 WETH at $2500 must be $50, got {usd}");
+        assert!(
+            (usd - 50.0).abs() < 0.001,
+            "0.02 WETH at $2500 must be $50, got {usd}"
+        );
     }
 
     /// Zero debt price = unknown (golden replays): falls back to the legacy
@@ -1094,7 +1100,10 @@ mod tests {
             .debt_units_to_usd(U256::from(1_000_000_000_000_000_000u128), &candidate)
             .await
             .unwrap();
-        assert!((usd - 3500.0).abs() < 0.001, "1e18 at ETH $3500 must be $3500, got {usd}");
+        assert!(
+            (usd - 3500.0).abs() < 0.001,
+            "1e18 at ETH $3500 must be $3500, got {usd}"
+        );
     }
 
     /// Heuristic fallback estimates the bonus PORTION (5% of debt covered), not

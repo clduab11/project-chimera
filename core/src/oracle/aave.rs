@@ -115,9 +115,7 @@ impl<P: Provider<Ethereum> + Clone> AaveOracle<P> {
             .getAssetsPrices(assets.to_vec())
             .call()
             .await
-            .map_err(|e| {
-                ChimeraError::OracleError(format!("Aave getAssetsPrices failed: {e}"))
-            })?;
+            .map_err(|e| ChimeraError::OracleError(format!("Aave getAssetsPrices failed: {e}")))?;
         if prices.len() != assets.len() {
             return Err(ChimeraError::OracleError(format!(
                 "Aave getAssetsPrices returned {} prices for {} assets",
@@ -240,7 +238,10 @@ mod tests {
             let prices = oracle.get_asset_prices_raw(&[weth, usdc]).await.unwrap();
             assert_eq!(prices[&weth], big, "raw U256 passthrough must be exact");
             assert_eq!(prices[&usdc], usdc_price);
-            assert!(asserter.read_q().is_empty(), "exactly one eth_call consumed");
+            assert!(
+                asserter.read_q().is_empty(),
+                "exactly one eth_call consumed"
+            );
         }
 
         #[tokio::test]

@@ -221,20 +221,25 @@ Healthy majors   : |premium| ≤ 0.3% (WETH/WBTC/wstETH/cbBTC vs USDC-family)
 
 ### 3.3 Engine status — honest, component by component
 
-- Rust workspace (`core/`): 274 tests, 270 pass / 4 ignored, clippy/fmt clean.
-  Three of the four ignored tests are Windows-gated fsync
-  tests, so a Linux run reports 272. Shadow mode is the committed default;
+- Rust workspace (`core/`): 274 tests, clippy/fmt clean. Counts are
+  platform-dependent — Linux CI reports **273 passed / 1 ignored**, a local
+  Windows run **270 passed / 4 ignored**, because three fsync tests are skipped
+  on Windows. Shadow mode is the committed default;
   `shadow-guard` CI blocks committed live config **in `config/` and
   `core/tests/` only** — it cannot see `CHIMERA_EXECUTE_MODE` in an operator's
   `.env.live`, which is the actual live switch.
 - **Known-broken/quarantined (do not trust without fixing):**
   `core/src/simulator/prewarm.rs` (hardcodes Aave storage slot 53, overwrites
   live fork state — its own sibling `seeding.rs` condemns the practice);
-  `core/src/simulator/golden.rs` (asserts nothing, zeroes prices);
-  `orchestrator.rs` `execute_live` books SUCCESS on `send_raw_transaction`
-  without polling the receipt (revert breaker = dead code in live mode);
+  `core/src/simulator/golden.rs` (asserts nothing, zeroes prices, and has no
+  callers anywhere in the repo);
   the simulator validates a bare `liquidationCall`, not the flash-loan path
-  that would actually be sent.
+  that would actually be sent — so the flash-loan premium and the swap leg are
+  never simulated.
+  *Fixed since this list was written:* `execute_live` no longer books SUCCESS on
+  `send_raw_transaction`; it confirms via `RpcSubmitter::poll_receipt` and marks
+  reverted/unconfirmed outcomes, which is what makes the revert breaker
+  reachable in live mode at all.
 - **Pacing hard caps are code, not config:** `Config::validate()`
   (`core/src/config.rs`) hard-rejects `max_single_transfer_usd > 1000` and
   `max_daily_net_usd > 2000`; `pacing_engine.rs` compares the transfer cap

@@ -170,13 +170,22 @@ fn parse_balance_map(raw: HashMap<String, String>) -> Result<HashMap<Address, U2
     Ok(out)
 }
 
+/// Aave's RAY (1e27), the fixed-point scale for indices and health factors.
+///
+/// Single definition on purpose: this constant divides collateral and debt in
+/// every profitability path, so independent copies that drift apart would
+/// mis-scale liquidations rather than fail loudly.
+fn ray() -> U256 {
+    U256::from(1_000_000_000_000_000_000_000_000_000u128)
+}
+
 /// Parse an optional u128 index string from JSON. "" or absent → RAY (1e27).
 fn parse_index_or_ray(s: &str) -> U256 {
     if s.is_empty() {
         // Default RAY value for backward compatibility with older snapshots.
-        U256::from(1_000_000_000_000_000_000_000_000_000u128)
+        ray()
     } else {
-        U256::from_str(s).unwrap_or(U256::from(1_000_000_000_000_000_000_000_000_000u128))
+        U256::from_str(s).unwrap_or_else(|_| ray())
     }
 }
 
@@ -367,7 +376,7 @@ impl LiquidationDetector {
     /// This is the cheap path that runs on every block / sequencer event.
     pub fn find_at_risk_positions(&self) -> Vec<LiquidationCandidate> {
         let mut candidates = Vec::new();
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
+        let ray = ray();
 
         for (user, position) in &self.snapshot.users {
             let (total_collateral, total_debt, _avg_liq_threshold, hf) =
@@ -482,8 +491,8 @@ impl LiquidationDetector {
     /// Verify constants against the deployed Aave V3 Origin commit before live mode
     /// (see `docs/research/aave-v3-liquidation-compendium.md`).
     fn apply_close_factor(&self, hf: U256, user_reserve_debt: U256) -> U256 {
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
-                                                                         // CLOSE_FACTOR_HF_THRESHOLD = 0.95 in RAY scale.
+        let ray = ray();
+        // CLOSE_FACTOR_HF_THRESHOLD = 0.95 in RAY scale.
         let close_factor_hf_threshold = U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
 
         if hf >= ray {
@@ -506,7 +515,7 @@ impl LiquidationDetector {
         &self,
         collateral: &HashMap<Address, U256>,
     ) -> Option<(Address, U256)> {
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128);
+        let ray = ray();
         collateral
             .iter()
             // Edge case 1: only seizable reserves (active && !frozen && !paused) are
@@ -548,7 +557,7 @@ impl LiquidationDetector {
         position: &UserPosition,
     ) -> (U256, U256, U256, U256) {
         let _ = user; // retained for symmetry/logging; not used in the math itself
-        let ray = U256::from(1_000_000_000_000_000_000_000_000_000u128); // 1e27
+        let ray = ray();
 
         let mut total_collateral_usd: U256 = U256::ZERO; // RAY scaled collateral value
         let mut total_debt_usd: U256 = U256::ZERO; // RAY scaled debt value
@@ -1087,6 +1096,62 @@ mod tests {
             c.debt_to_cover,
             U256::from(ONE_WETH * 12 / 10),
             "debt_to_cover must be index-adjusted (1 WETH scaled x 1.2 = 1.2 WETH)"
+        );
+    }
+
+    /// A debt asset absent from the snapshot has no borrow index and no price, so
+    /// `current_debt` falls back to the raw scaled balance (index defaults to RAY,
+    /// matching `parse_index_or_ray`) and the candidate carries `debt_price_usd = 0`.
+    /// Zero is the simulator's "unknown" sentinel, not "free": both
+    /// `simulator::mod.rs` price guards fall back to a bonus-portion estimate rather
+    /// than valuing the leg at $0. The position needs a second, priced debt asset —
+    /// an unpriced one contributes nothing to `total_debt`, so on its own it would
+    /// never reach the health-factor check at all.
+    #[test]
+    fn test_debt_asset_missing_from_snapshot_falls_back_to_scaled_balance() {
+        let usdc = Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap();
+        let weth = Address::from_str("0x4200000000000000000000000000000000000006").unwrap();
+        let unknown = Address::from_str("0x000000000000000000000000000000000000bbbb").unwrap();
+        let user = Address::from_str("0x00000000000000000000000000000000000d3b7e").unwrap();
+
+        let mut snap = make_snapshot();
+        snap.reserves
+            .insert(usdc, test_reserve(6, 100_000_000, ray(), ray(), 8250));
+        snap.reserves
+            .insert(weth, test_reserve(18, 200_000_000_000, ray(), ray(), 8250));
+        // `unknown` is deliberately NOT inserted into reserves.
+        snap.users.insert(
+            user,
+            UserPosition {
+                collateral: HashMap::from([(usdc, U256::from(2_100_000_000u128))]),
+                debt: HashMap::from([
+                    (weth, U256::from(ONE_WETH)),
+                    (unknown, U256::from(12_345u64)),
+                ]),
+                ..UserPosition::default()
+            },
+        );
+
+        let detector = LiquidationDetector::new(snap, 8453);
+        let candidates = detector.find_at_risk_positions();
+
+        let c = candidates
+            .iter()
+            .find(|c| c.debt_asset == unknown)
+            .expect("unpriced debt asset must still yield a candidate");
+        assert_eq!(
+            c.debt_to_cover,
+            U256::from(12_345u64),
+            "no reserve => no index => raw scaled balance, un-adjusted"
+        );
+        assert_eq!(
+            c.debt_price_usd,
+            U256::ZERO,
+            "unknown price must stay 0 so the simulator takes its fallback path"
+        );
+        assert_eq!(
+            c.debt_decimals, 18,
+            "absent reserve defaults to 18 decimals"
         );
     }
 }

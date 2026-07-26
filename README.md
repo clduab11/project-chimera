@@ -46,7 +46,7 @@ spend). The market was then measured, late. Three facts killed it, each
    | AVLT/USDC (59% of the niche) | $178,004/30d | **−$67,394/30d** (oracle pinned +6.04% above market; only real venue is HyperEVM behind a non-atomic bridge; market borrow collapsed $4.5M → $43.9k in 30d) |
    | AZND/USDC | $13,747/30d | **phantom** (price hardcoded 1.0; best Ethereum route: 50,000 AZND → 470 USDC, −99%; one borrower holds 58% of token supply) |
    | ROY-ST-apyUSD | $13,233/30d | **phantom** (oracle +5,118% vs traded) |
-   | All 241 live/relevant Ethereum Morpho markets | $278,740/30d | **$2,892/30d** in Gate-0-PASS markets |
+   | All 241 live/relevant Ethereum Morpho markets | $277,335/30d | **$2,892/30d** in Gate-0-PASS markets |
 
 4. **The survey of everything else found no replacement.** Against a decision
    threshold fixed *before* any number existed ($100k/30d of exit-denominated,
@@ -111,7 +111,7 @@ every public dashboard still shows the phantom oracle-denominated ones.
 | `scripts/check_venue_open.py` | proven twice | the 2-call SVR openness gate — run before ANY venue work, always |
 | `core/src/detector/liquidation.rs` | best code in the repo | correct Aave V3 HF math (two-tier close factor, eMode LT, isolation, siloed) — borrower-side protection product, Gearbox HF polling, audit-contest PoCs |
 | `core/src/simulator/seeding.rs` + REVM harness | genuinely original | discovers ERC20 storage layouts by probing, memoised — audit-contest **PoC** edge (it makes a report survive triage; it does not find bugs) |
-| Multicall3 discovery + checkpointed backfill (`snapshot_generator.py`, commits `30e6996`/`7fef2d2`) | works at 46.75M-block scale | any borrower-set index on any chain |
+| Multicall3 discovery + checkpointed backfill (`snapshot_generator.py`, commits `abcdce2`/`9aaf313`) | works at 46.75M-block scale | any borrower-set index on any chain |
 | `core/src/signer_registry/`, pacing *mechanism*, ops surface (Prometheus/Grafana/runbooks) | sound | any future execution system |
 | `Executor.yul` + contract tests, swap engine, mempool watcher, `oracle/aave.rs`, venue tables, Base borrower snapshot | **write off** | nothing — latency machinery for a race that doesn't exist; `Executor.yul` has no arbitrary-call primitive and hard-asserts a 420-byte Aave payload (cannot be wrapped) |
 
@@ -221,9 +221,12 @@ Healthy majors   : |premium| ≤ 0.3% (WETH/WBTC/wstETH/cbBTC vs USDC-family)
 
 ### 3.3 Engine status — honest, component by component
 
-- Rust workspace (`core/`): 269 tests green (Windows + Linux), clippy/fmt
-  clean as of `d858cb0`. Shadow mode is the committed default; `shadow-guard`
-  CI blocks committed live config.
+- Rust workspace (`core/`): 274 tests, 270 pass / 4 ignored, clippy/fmt clean.
+  Three of the four ignored tests are Windows-gated fsync
+  tests, so a Linux run reports 272. Shadow mode is the committed default;
+  `shadow-guard` CI blocks committed live config **in `config/` and
+  `core/tests/` only** — it cannot see `CHIMERA_EXECUTE_MODE` in an operator's
+  `.env.live`, which is the actual live switch.
 - **Known-broken/quarantined (do not trust without fixing):**
   `core/src/simulator/prewarm.rs` (hardcodes Aave storage slot 53, overwrites
   live fork state — its own sibling `seeding.rs` condemns the practice);
@@ -279,12 +282,23 @@ python scripts/enumerate_morpho_markets.py --chain ethereum --workdir <scratch>/
     --min-borrow-usd 10000 --venue-report <scratch>/venues30/venue_report.json
 
 # 3. Gate-0 over the candidates (checkpointed; resumable)
-python scripts/gate0_market_filter.py --markets <scratch>/tier_a/gate0_input_ethereum.json \
+python scripts/gate0_market_filter.py --markets <scratch>/tier_a/morpho_markets_ethereum.json \
     --out <scratch>/tier_a/gate0_ethereum_morpho.json
 
 # 4. Assemble + decide against the pre-declared threshold
 python scripts/assemble_gate0_survey.py --scratch <scratch> --out config/gate0_survey.json
 ```
+
+Steps 1–4 reproduce **Tier A (Ethereum Morpho) only**. `assemble_gate0_survey.py`
+reads five more paths and degrades gracefully when they are absent, marking each
+`gate0_pass: "MISSING"` rather than failing: `tier_a/gate0_base_morpho.json`
+(repeat steps 2–3 with `--chain base`), `gate0_smoke.json` (the Aave/Spark
+control pass), and `tier_b/tier_b_rows.json`, `tier_c/tier_c_rows.json`,
+`tier_d/tier_d_rows.json`. **The Tier B–D rows in the committed
+`config/gate0_survey.json` were assembled by hand and no script in this repo
+regenerates them** — so a clean re-run reproduces the Tier A numbers and the
+decision arithmetic, not the full 1,055-row artifact. Treat any total that
+moves as a Tier A total until the tier files are rebuilt.
 
 All scripts are stdlib-only Python (AGENTS.md invariant #5), read keys from
 `.env.live` by regex, checkpoint to disk, and survive mid-run network death.
@@ -305,7 +319,7 @@ python -m compileall scripts ai-audit/scripts
 BASE_FORK_URL=<rpc> forge test --root contracts/   # fork tests SILENTLY NO-OP without this
 ```
 
-PR gate: [.github/PULL_REQUEST_TEMPLATE.md](.github/PULL_REQUEST_TEMPLATE.md) ·
+PR gate: [.github/pull_request_template.md](.github/pull_request_template.md) ·
 invariants: `AGENTS.md`.
 
 ---

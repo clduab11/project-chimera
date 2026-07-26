@@ -554,7 +554,9 @@ def row_gate(v: dict) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--markets", help="JSON list of market rows")
+    ap.add_argument("--markets",
+                    help="market rows: a JSON list, or the enumerator's "
+                         "{'rows': [...]} object")
     ap.add_argument("--from-venue-report", help="venue_report.json from the scanner")
     ap.add_argument("--min-bonus", type=float, default=50.0,
                     help="skip markets under this 30d bonus_oracle (still listed as skipped)")
@@ -563,7 +565,8 @@ def main() -> int:
 
     rows: list[dict] = []
     if args.markets:
-        rows += json.loads(Path(args.markets).read_text(encoding="utf-8"))
+        data = json.loads(Path(args.markets).read_text(encoding="utf-8"))
+        rows += data["rows"] if isinstance(data, dict) else data
     if args.from_venue_report:
         rows += rows_from_venue_report(Path(args.from_venue_report), args.min_bonus)
     if not rows:

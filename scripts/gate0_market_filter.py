@@ -565,7 +565,11 @@ def main() -> int:
 
     rows: list[dict] = []
     if args.markets:
-        data = json.loads(Path(args.markets).read_text(encoding="utf-8"))
+        try:
+            data = json.loads(Path(args.markets).read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--markets {args.markets}: invalid JSON ({exc.msg} "
+                             f"at line {exc.lineno} col {exc.colno})") from exc
         if isinstance(data, dict):
             data = data.get("rows")
         if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):

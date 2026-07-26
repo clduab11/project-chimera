@@ -51,7 +51,7 @@ spend). The market was then measured, late. Three facts killed it, each
    † The $2,892 is the `bonus_exit` total over the 137 Gate-0-PASS rows, but
    only **19 of those 137** carry a non-null `bonus_exit` — the other 118 pass
    the screen and were never priced for exit. So $2,892 is a floor measured on
-   a fifth of the qualifying set, not a complete accounting. It does not soften
+   about 14% of the qualifying set, not a complete accounting. It does not soften
    the conclusion (every market that *was* priced came in at or below its
    oracle-denominated figure, three of them catastrophically), but a re-run
    that prices the remaining 118 is the one thing that could move this number.
@@ -326,7 +326,8 @@ believed. Act on the §2a trigger table only.
 Prerequisites: Rust stable, Foundry, Python 3.11+, optional slither (WSL).
 
 ```bash
-cargo test -p chimera-core                 # 269 tests
+cargo test -p chimera-core                 # 274 tests; 273 pass/1 ignored on Linux,
+                                           # 270 pass/4 ignored on Windows (§3.3)
 cargo fmt --all -- --check && cargo clippy -p chimera-core --all-targets -- -D warnings
 forge test --root contracts/               # requires forge-std
 python -m compileall scripts ai-audit/scripts

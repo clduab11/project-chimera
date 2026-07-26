@@ -46,7 +46,16 @@ spend). The market was then measured, late. Three facts killed it, each
    | AVLT/USDC (59% of the niche) | $178,004/30d | **−$67,394/30d** (oracle pinned +6.04% above market; only real venue is HyperEVM behind a non-atomic bridge; market borrow collapsed $4.5M → $43.9k in 30d) |
    | AZND/USDC | $13,747/30d | **phantom** (price hardcoded 1.0; best Ethereum route: 50,000 AZND → 470 USDC, −99%; one borrower holds 58% of token supply) |
    | ROY-ST-apyUSD | $13,233/30d | **phantom** (oracle +5,118% vs traded) |
-   | All 241 live/relevant Ethereum Morpho markets | $277,335/30d | **$2,892/30d** in Gate-0-PASS markets |
+   | All 241 live/relevant Ethereum Morpho markets | $277,335/30d | **$2,892/30d** in Gate-0-PASS markets † |
+
+   † The $2,892 is the `bonus_exit` total over the 137 Gate-0-PASS rows, but
+   only **19 of those 137** carry a non-null `bonus_exit` — the other 118 pass
+   the screen and were never priced for exit. So $2,892 is a floor measured on
+   a fifth of the qualifying set, not a complete accounting. It does not soften
+   the conclusion (every market that *was* priced came in at or below its
+   oracle-denominated figure, three of them catastrophically), but a re-run
+   that prices the remaining 118 is the one thing that could move this number.
+   Same 137 rows sum to $3,229.72 of `bonus_oracle`, a different field.
 
 4. **The survey of everything else found no replacement.** Against a decision
    threshold fixed *before* any number existed ($100k/30d of exit-denominated,

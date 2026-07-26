@@ -14,7 +14,16 @@ Epistemic tags as in the prior briefs: `[MEASURED]` on-chain this pass · `[REPO
 The $283.6k/30d accrual niche was a mark-to-oracle artifact three different ways:
 1. **AVLT ($165.9k attributed):** oracle premium now **+6.04%** `[MEASURED]` (was +4.18% yesterday — the pinned $1.09449 feed diverges further as market drifts). `bonus_exit` = **−$67k/30d**. And independently: the market's borrow collapsed **$4.50M → $43.9k in 30 days (−99%)** — a fixed borrower set being ground down, now nearly exhausted. `[MEASURED]`
 2. **AZND ($13.7k attributed):** price hardcoded 1.0 passes the premium check trivially, exactly as the work order predicted — and fails on substance: the best aggregator route on Ethereum turns 1,000 AZND into **186 USDC (−81%)** and 50,000 into **470 USDC (−99%)**. Unsellable. One borrower (holding 58% of total AZND supply) at 100% utilization. `[MEASURED]`
-3. **The venue-wide residue:** Gate-0 across **all 241 live-and-relevant Ethereum Morpho markets** leaves **$2,892/30d** of exit-real bonus in PASS markets, plus ~$4.8k in the PT bucket. **~97% of Ethereum Morpho's $278.7k structural bonus evaporates under exit denomination.** `[MEASURED]`
+3. **The venue-wide residue:** Gate-0 across **all 241 live-and-relevant Ethereum Morpho markets** leaves **$2,892/30d** of exit-real bonus in PASS markets, plus ~$4.8k in the PT bucket. **~99% of Ethereum Morpho's $277.3k structural bonus evaporates under exit denomination.** `[MEASURED]`
+
+> Corrected 2026-07-26: this line read "$278.7k" and "~97%". Summing
+> `bonus_oracle` over the 241 rows in `config/gate0_survey.json`
+> (`tier == "A" && chain == "ethereum" && gate0_pass != "SKIPPED"`) gives
+> **$277,335.03**. The same filter reproduces the PASS total at $2,891.65,
+> i.e. the $2,892 quoted above, which is what confirms it selects the intended
+> set. $2,892 / $277,335 is 1.04%, so the survivorship figure is ~99%, not ~97%.
+> Per this repo's `[MEASURED]` convention the machine-readable artifact is
+> authoritative over prose restating it.
 
 Cost of the answer: ~1 day of scripting and measurement, not a quarter of building.
 

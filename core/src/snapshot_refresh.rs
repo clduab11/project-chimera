@@ -225,7 +225,8 @@ impl SnapshotRefresher {
         // regress fresher live-repriced values; close that window immediately
         // instead of waiting out the pacing interval.
         if reloaded || self.reprice_due(now) {
-            self.last_reprice_attempt_epoch.store(now, Ordering::Relaxed);
+            self.last_reprice_attempt_epoch
+                .store(now, Ordering::Relaxed);
             repriced = self.reprice(metrics, chain_label).await;
         }
 
@@ -425,7 +426,9 @@ impl SnapshotRefresher {
                 if failures >= QUARANTINE_AFTER_FAILURES
                     && failures.is_multiple_of(QUARANTINE_AFTER_FAILURES)
                 {
-                    return self.isolate_and_quarantine(&assets, metrics, chain_label).await;
+                    return self
+                        .isolate_and_quarantine(&assets, metrics, chain_label)
+                        .await;
                 }
                 false
             }
@@ -446,8 +449,8 @@ impl SnapshotRefresher {
         metrics: &Metrics,
         chain_label: &str,
     ) -> bool {
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(ISOLATION_BUDGET_SECS);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(ISOLATION_BUDGET_SECS);
         let mut healthy: HashMap<Address, U256> = HashMap::new();
         let mut dead: Vec<Address> = Vec::new();
         for asset in assets {
@@ -461,7 +464,8 @@ impl SnapshotRefresher {
             }
             let probe = tokio::time::timeout(
                 std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
-                self.price_source.get_prices_raw(std::slice::from_ref(asset)),
+                self.price_source
+                    .get_prices_raw(std::slice::from_ref(asset)),
             )
             .await;
             match probe {
@@ -471,9 +475,7 @@ impl SnapshotRefresher {
                     healthy.extend(prices);
                 }
                 // Dead-feed evidence: the call reverted on-chain.
-                Ok(Err(e)) if e.to_string().to_lowercase().contains("revert") => {
-                    dead.push(*asset)
-                }
+                Ok(Err(e)) if e.to_string().to_lowercase().contains("revert") => dead.push(*asset),
                 // Transport failure or probe timeout: no evidence, no quarantine.
                 Ok(Err(_)) | Err(_) => {}
             }
@@ -579,12 +581,7 @@ mod tests {
     impl ScriptedSource {
         fn new(prices: &[(Address, u64)]) -> Self {
             Self {
-                prices: Mutex::new(
-                    prices
-                        .iter()
-                        .map(|(a, p)| (*a, U256::from(*p)))
-                        .collect(),
-                ),
+                prices: Mutex::new(prices.iter().map(|(a, p)| (*a, U256::from(*p))).collect()),
                 fail: std::sync::atomic::AtomicBool::new(false),
             }
         }
@@ -618,8 +615,7 @@ mod tests {
         path: PathBuf,
     ) -> (SharedSnapshot, SnapshotRefresher) {
         let shared = SharedSnapshot::new(snapshot);
-        let refresher =
-            SnapshotRefresher::new(shared.clone(), source, path, 8453, 8);
+        let refresher = SnapshotRefresher::new(shared.clone(), source, path, 8453, 8);
         (shared, refresher)
     }
 
@@ -638,7 +634,11 @@ mod tests {
         assert_eq!(shared.apply_prices(&prices), 1);
         let snap = shared.snapshot();
         assert_eq!(snap.reserves[&a].price_usd, U256::from(150u64));
-        assert_eq!(snap.reserves[&b].price_usd, U256::from(200u64), "zero must not clobber");
+        assert_eq!(
+            snap.reserves[&b].price_usd,
+            U256::from(200u64),
+            "zero must not clobber"
+        );
     }
 
     #[test]
@@ -696,7 +696,9 @@ mod tests {
         assert!(refresher.reprice_due(epoch_now()));
 
         let now = epoch_now();
-        refresher.last_reprice_attempt_epoch.store(now, Ordering::Relaxed);
+        refresher
+            .last_reprice_attempt_epoch
+            .store(now, Ordering::Relaxed);
         // 0 failures: 8s interval.
         assert!(!refresher.reprice_due(now + 7));
         assert!(refresher.reprice_due(now + 8));
@@ -782,8 +784,14 @@ mod tests {
         assert!(refresher.quarantined.lock().contains_key(&dead));
         assert!(!refresher.quarantined.lock().contains_key(&healthy));
         // Healthy price applied; dead feed's stale price retained (never zeroed).
-        assert_eq!(shared.snapshot().reserves[&healthy].price_usd, U256::from(150u64));
-        assert_eq!(shared.snapshot().reserves[&dead].price_usd, U256::from(200u64));
+        assert_eq!(
+            shared.snapshot().reserves[&healthy].price_usd,
+            U256::from(150u64)
+        );
+        assert_eq!(
+            shared.snapshot().reserves[&dead].price_usd,
+            U256::from(200u64)
+        );
         assert_eq!(refresher.consecutive_failures.load(Ordering::Relaxed), 0);
 
         // With `dead` quarantined, the next batch is healthy-only and succeeds.
@@ -837,7 +845,10 @@ mod tests {
 
         let ok = refresher.reprice(&metrics, "base").await;
         assert!(ok);
-        assert!(refresher.quarantined.lock().is_empty(), "TTL must expire the entry");
+        assert!(
+            refresher.quarantined.lock().is_empty(),
+            "TTL must expire the entry"
+        );
         assert_eq!(shared.snapshot().reserves[&b].price_usd, U256::from(250u64));
     }
 
@@ -879,9 +890,22 @@ mod tests {
     }
 
     fn write_atomically(path: &Path, content: &str) {
+        // Linux file timestamps are coarse-clock granular (up to one jiffy), so
+        // consecutive rewrites inside a fast test get IDENTICAL mtimes and the
+        // refresher's mtime guard correctly treats the file as unchanged. Real
+        // generator rewrites are minutes apart; tests are not. Stamp each write
+        // with a strictly increasing mtime so every rewrite is its own version.
+        static MTIME_BUMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, content).unwrap();
         std::fs::rename(&tmp, path).unwrap();
+        let n = MTIME_BUMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() + std::time::Duration::from_secs(n))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -936,7 +960,9 @@ mod tests {
         write_atomically(&path, &snapshot_json(100, 2500.0));
 
         let boot = MarketSnapshot::load_from_file(&path).unwrap();
-        let weth: Address = "0x4200000000000000000000000000000000000006".parse().unwrap();
+        let weth: Address = "0x4200000000000000000000000000000000000006"
+            .parse()
+            .unwrap();
         let metrics = Metrics::new();
         let source = Arc::new(ScriptedSource::new(&[(weth, 260_000_000_000)])); // $2600 live
         let (shared, refresher) = refresher_over(boot, source, path.clone());
@@ -944,7 +970,10 @@ mod tests {
         // Tick 1: normal reprice applies the live price.
         let o1 = refresher.tick(&metrics, "base").await;
         assert!(o1.repriced);
-        assert_eq!(shared.snapshot().reserves[&weth].price_usd, U256::from(260_000_000_000u64));
+        assert_eq!(
+            shared.snapshot().reserves[&weth].price_usd,
+            U256::from(260_000_000_000u64)
+        );
 
         // Generator rewrites the file (older $2500 price baked in). The very next
         // tick — well inside the pacing interval — must reload AND reprice, so
@@ -973,7 +1002,11 @@ mod tests {
 
         write_atomically(&path, "{ this is not json");
         assert!(!refresher.check_reload(&metrics, "base"));
-        assert_eq!(shared.block_number(), 100, "corrupt file must not wipe snapshot");
+        assert_eq!(
+            shared.block_number(),
+            100,
+            "corrupt file must not wipe snapshot"
+        );
         assert_eq!(
             metrics
                 .snapshot_reload_total

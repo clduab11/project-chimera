@@ -283,12 +283,12 @@ where
             // round trip.
             let discovered = if has_code(db, debt_token) {
                 find_balance_slot(db, block, debt_token, liquidator).and_then(|balance_slot| {
-                    find_allowance_slot(db, block, debt_token, liquidator, pool).map(|allowance_slot| {
-                        TokenLayout {
+                    find_allowance_slot(db, block, debt_token, liquidator, pool).map(
+                        |allowance_slot| TokenLayout {
                             balance_slot,
                             allowance_slot,
-                        }
-                    })
+                        },
+                    )
                 })
             } else {
                 None
@@ -469,7 +469,10 @@ mod tests {
         // PUSH1 00 PUSH1 00 REVERT
         let mut db = db_with_token(token, "60006000fd");
 
-        assert_eq!(find_balance_slot(&mut db, &test_block(), token, holder), None);
+        assert_eq!(
+            find_balance_slot(&mut db, &test_block(), token, holder),
+            None
+        );
     }
 
     #[test]

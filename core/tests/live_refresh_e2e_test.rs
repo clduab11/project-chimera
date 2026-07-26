@@ -20,9 +20,9 @@ use async_trait::async_trait;
 use chimera_core::{
     config::{PacingConfig, RiskConfig, RoutingConfig, TradingPair, VenueEntry},
     detector::liquidation::{MarketSnapshot, ReserveData, UserPosition},
-    ChimeraError, CrossProcessPacing, JsonlPersistence, Metrics, Orchestrator,
-    OrchestratorConfig, PacingEngine, ReservePriceSource, RpcSubmitter, SignerRegistry,
-    SimulationResult, SnapshotRefresher,
+    ChimeraError, CrossProcessPacing, JsonlPersistence, Metrics, Orchestrator, OrchestratorConfig,
+    PacingEngine, ReservePriceSource, RpcSubmitter, SignerRegistry, SimulationResult,
+    SnapshotRefresher,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -336,8 +336,14 @@ async fn test_orchestrator_observes_hf_crossing_below_105_between_scans() {
     // SCAN 1 — the tick repriced from the live source ($4000: unchanged) and the
     // position is healthy (HF ≈ 1.138): zero candidates.
     let n1 = h.orchestrator.run_single_scan().await.unwrap();
-    assert_eq!(n1, 0, "healthy position (HF≈1.138) must produce zero candidates");
-    assert_eq!(h.metrics.candidates_seen.with_label_values(&["base"]).get(), 0);
+    assert_eq!(
+        n1, 0,
+        "healthy position (HF≈1.138) must produce zero candidates"
+    );
+    assert_eq!(
+        h.metrics.candidates_seen.with_label_values(&["base"]).get(),
+        0
+    );
     assert_eq!(h.metrics.sims_run.with_label_values(&["success"]).get(), 0);
     assert_eq!(
         h.metrics
@@ -355,7 +361,10 @@ async fn test_orchestrator_observes_hf_crossing_below_105_between_scans() {
 
     // SCAN 2 — same orchestrator, no reconstruction: observes the crossing.
     let n2 = h.orchestrator.run_single_scan().await.unwrap();
-    assert!(n2 >= 1, "post-refresh scan must observe the underwater position");
+    assert!(
+        n2 >= 1,
+        "post-refresh scan must observe the underwater position"
+    );
 
     // The shared snapshot the scan read reflects the repriced value.
     assert_eq!(
@@ -365,7 +374,11 @@ async fn test_orchestrator_observes_hf_crossing_below_105_between_scans() {
 
     // The candidate is the repriced position, with HF in the crossed band.
     let captured = h.captured.lock().unwrap();
-    assert_eq!(captured.len(), n2.min(5), "mock sim must have seen each candidate");
+    assert_eq!(
+        captured.len(),
+        n2.min(5),
+        "mock sim must have seen each candidate"
+    );
     let (user, hf) = captured[0];
     assert_eq!(user, USER);
     let (lo, hi) = crossed_band();
@@ -489,7 +502,10 @@ async fn test_snapshot_reload_swaps_between_scans() {
     write_atomically(&path, &generator_json(101, 3400.0));
     let n2 = h.orchestrator.run_single_scan().await.unwrap();
     assert!(n2 >= 1, "reloaded snapshot must produce the candidate");
-    assert_eq!(h.orchestrator.shared_snapshot().snapshot().block_number, 101);
+    assert_eq!(
+        h.orchestrator.shared_snapshot().snapshot().block_number,
+        101
+    );
     assert_eq!(
         h.metrics
             .snapshot_reload_total
@@ -525,8 +541,14 @@ async fn test_live_mode_staleness_halt_skips_emission() {
     );
 
     let n = h.orchestrator.run_single_scan().await.unwrap();
-    assert_eq!(n, 0, "stale prices in live mode must skip candidate emission");
-    assert_eq!(h.metrics.candidates_seen.with_label_values(&["base"]).get(), 0);
+    assert_eq!(
+        n, 0,
+        "stale prices in live mode must skip candidate emission"
+    );
+    assert_eq!(
+        h.metrics.candidates_seen.with_label_values(&["base"]).get(),
+        0
+    );
     assert_eq!(
         h.metrics
             .scans_skipped_stale_price
@@ -534,7 +556,10 @@ async fn test_live_mode_staleness_halt_skips_emission() {
             .get(),
         1
     );
-    assert!(h.captured.lock().unwrap().is_empty(), "no candidate may reach the sim");
+    assert!(
+        h.captured.lock().unwrap().is_empty(),
+        "no candidate may reach the sim"
+    );
 }
 
 /// Concurrent snapshot writes vs scans: no deadlock, no torn reads. Every scan
@@ -568,7 +593,10 @@ async fn test_concurrent_refresh_and_scan_no_deadlock_or_torn_reads() {
         .await
         .expect("scan deadlocked against concurrent snapshot writes")
         .unwrap();
-        assert!(n <= 1, "single-user snapshot can never yield more than one candidate");
+        assert!(
+            n <= 1,
+            "single-user snapshot can never yield more than one candidate"
+        );
     }
     writer.await.unwrap();
 

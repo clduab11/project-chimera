@@ -1,16 +1,20 @@
 # Project Chimera — System Architecture
 
-**Version**: 1.2
-**Last Updated**: 2026-07-09
-**Scope**: Sovereign, local-first MEV extraction engine for Aave V3 liquidations on L2 (Base, Arbitrum).
+**Version**: 2.0
+**Last Updated**: 2026-07-26
+**Scope**: Atomic three-leg bundle orchestrator for MEV extraction on Base.
 
 ---
 
 ## 1. Architectural Overview
 
-Project Chimera is designed as a **sovereign, local-first execution system** with a strict separation between detection, simulation, pacing, and on-chain execution. Every component is purpose-built to operate under risk-control volume caps, with encrypted keystore management and crash-safe state persistence.
+Project Chimera is designed as an **atomic bundle orchestrator** that detects high-slippage `Executor.execute(bytes)` transactions in the mempool, constructs three-leg packets (pre-trade → victim → post-trade), and submits them via Flashbots Protect for deterministic inclusion. Every component operates under risk-control volume caps, with shadow-first deployment and crash-safe state persistence.
 
-The system follows a **pipeline architecture**: candidates flow unidirectionally from detection through simulation and pacing gates before any on-chain action is taken. No component can bypass another.
+The system follows a **pipeline architecture**: mempool events flow unidirectionally through target detection, slippage scoring, bundle construction, and pacing gates before any on-chain submission. No component can bypass another.
+
+### 1.1 Key Design Shift
+
+Chimera transitioned from passive liquidation scanning to **active tranche execution**. The surviving engine components (Executor contract, REVM simulator, pacing controls) are repurposed to capture price-impact deltas from targeted Aave V3 liquidation transactions. See §3.8 for the new bundle modules.
 
 ---
 
@@ -21,22 +25,27 @@ The system follows a **pipeline architecture**: candidates flow unidirectionally
 ```mermaid
 flowchart LR
     subgraph External["External Sources"]
-        RPC["L2 RPC (Base/Arbitrum)"]
+        RPC["L2 RPC (Base)"]
+        Mempool["Mempool Watcher"]
         Oracle["Aave Price Oracle"]
-        Subgraph["Aave Subgraph / Indexer"]
     end
 
-    subgraph DetectorModule["detector"]
-        D1["MarketSnapshot Loader"]
-        D2["HF Pre-Filter<br/>(pure Rust math)"]
-        D3["Candidate Builder"]
+    subgraph PredatorModule["mempool_predator"]
+        PD1["Pattern Matcher<br/>(0x09c5eabe selector)"]
+        PD2["Slippage Calculator"]
+        PD3["Target Scorer"]
     end
 
-    subgraph SimulatorModule["simulator"]
-        S1["REVM Fork<br/>(AlloyDB + CacheDB)"]
-        S2["Exact Aave Math<br/>(HF, close factor, eMode)"]
-        S3["L2 Gas + L1 Fee<br/>Model"]
-        S4["Profit Extraction<br/>& Validation"]
+    subgraph OrchestratorModule["tranche_orchestrator"]
+        OR1["State Machine<br/>(Idle→Analyze→Construct→Submit)"]
+        OR2["Packet Builder"]
+        OR3["Shadow Simulator"]
+    end
+
+    subgraph BundlerModule["tranche_arbitrage"]
+        B1["TrancheBundler"]
+        B2["AtomicPacket<br/>(pre→victim→post)"]
+        B3["Flashbots Submit"]
     end
 
     subgraph PacingModule["pacing_engine"]
@@ -47,7 +56,7 @@ flowchart LR
     end
 
     subgraph ExecutorModule["executor"]
-        E1["Standalone Executor.yul<br/>(atomic flash-loan receiver)"]
+        E1["Executor.yul<br/>(atomic flash-loan receiver)"]
         E2["Standard JSON-RPC<br/>Submission"]
         E3["Authorized Worker Signers<br/>& Native-Gas Scheduler"]
     end
@@ -58,22 +67,23 @@ flowchart LR
         M3["Grafana Dashboard"]
     end
 
-    RPC --> D1
-    Oracle --> D1
-    Subgraph --> D1
-    D1 --> D2 --> D3
-    D3 --> S1
-    S1 --> S2 --> S3 --> S4
-    S4 --> P1
+    RPC --> PD1
+    Mempool --> PD1
+    Oracle --> PD2
+    PD1 --> PD2 --> PD3
+    PD3 --> OR1
+    OR1 --> OR2 --> OR3
+    OR3 --> B1
+    B1 --> B2 --> B3
+    B3 --> P1
     P1 --> P2 --> P3
     P3 -->|Allow| E3
     P3 -->|Deny / Trip| P4
     E3 --> E2 --> E1
     E1 -->|Outcome| P4
 
-    S4 --> M1
     P3 --> M1
-    E1 --> M1
+    B3 --> M1
     M1 --> M3
     M2 --> M3
 ```
@@ -82,24 +92,30 @@ flowchart LR
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ BLOCK / SEQUENCER EVENT                                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ MEMPOOL PREDATOR (mempool_predator.rs)                                      │
+│ • Pattern match: Executor.execute(bytes) selector 0x09c5eabe               │
+│ • Decode target transaction from calldata                                   │
+│ • Calculate slippage via reserve delta analysis                             │
+│ • Score target: slippage_bps + net_profit + priority_bonus                  │
+│ • Filter: reject if slippage < threshold or profit < min                    │
 └────────────────────────┬────────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ DETECTOR (liquidation.rs)                                                   │
-│ • Load MarketSnapshot (snapshot_generator.py or periodic refresh)             │
-│ • Pure-math HF pre-filter: HF < 1.05 RAY (1e27)                             │
-│ • Build LiquidationCandidate { user, collateral, debt, debt_to_cover, hf }  │
+│ TRANCHE ORCHESTRATOR (tranche_orchestrator.rs)                              │
+│ • State machine: Idle → Analyzing → Constructing → Submitting               │
+│ • Construct AtomicPacket: pre_trade → target → post_trade                   │
+│ • Set execution window: min_block, max_block, max_timestamp                 │
+│ • Shadow mode: simulate submission, return deterministic result             │
+│ • Live mode: submit via Flashbots Protect eth_sendBundle                    │
 └────────────────────────┬────────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ SIMULATOR (simulator/mod.rs)                                                │
-│ • Fork current head via AlloyDB + CacheDB                                     │
-│ • Build exact liquidationCall calldata                                       │
-│ • Execute in REVM with L2 block env + interest accrual                       │
-│ • Extract profit from LiquidationCall event or heuristic fallback            │
-│ • Apply L1 data fee (OP Stack: eth_getL1Fee / Arbitrum: NodeInterface)       │
-│ • Return SimulationResult { profitable, profit_usd, gas, l1_fee, calldata }│
+│ TRANCHE BUNDLER (tranche_arbitrage.rs)                                      │
+│ • Build three-leg bundle with priority fee optimization                     │
+│ • Submit to Flashbots relay with signed bundle                              │
+│ • Verify inclusion in target block range                                    │
+│ • Return bundle hash or failure status                                      │
 └────────────────────────┬────────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -319,11 +335,84 @@ flowchart LR
 
 ---
 
+### 3.8 `mempool_predator` — Target Detection & Slippage Analysis
+
+| Property | Detail |
+|----------|--------|
+| **Source File** | `core/src/mempool_predator.rs` |
+| **Language** | Rust |
+| **Input** | Pending transaction (to, calldata, gas_price, priority_fee) |
+| **Output** | `Option<ScoredTarget>` |
+| **Key Structs** | `MempoolPredator`, `SlippageAnalysis`, `ScoredTarget` |
+
+**Responsibilities**:
+
+- **Pattern matching**: Identifies `Executor.execute(bytes)` calls via selector `0x09c5eabe`. Rejects non-matching calldata immediately.
+- **Slippage calculation**: Estimates price impact using reserve delta analysis. Models the constant product formula to predict slippage in basis points.
+- **Target scoring**: Composite score = (slippage_bps × 100) + (net_profit_wei / 1e15) + priority_bonus. Higher scores indicate better opportunities.
+- **Volatility filtering**: Rejects targets below `slippage_threshold_bps` (default: 100 = 1%) or below `min_profit_usd` (default: $10).
+- **Gas cost estimation**: Calculates leg gas costs (2 swaps × gas_estimate × effective_gas_price) and subtracts from estimated profit.
+
+**Performance Target**: <1ms per transaction analysis on a single thread.
+
+---
+
+### 3.9 `tranche_orchestrator` — Bundle Lifecycle Coordination
+
+| Property | Detail |
+|----------|--------|
+| **Source File** | `core/src/tranche_orchestrator.rs` |
+| **Language** | Rust |
+| **Input** | `ScoredTarget` from MempoolPredator |
+| **Output** | `Option<TrancheResult>` |
+| **Key Structs** | `TrancheOrchestrator`, `TrancheConfig`, `OrchestratorState` |
+
+**Responsibilities**:
+
+- **State machine**: Manages the full execution lifecycle through states: `Idle` → `Analyzing` → `Constructing` → `Submitting` → `Confirmed`/`Failed`.
+- **Packet construction**: Builds `AtomicPacket` with pre-trade, target, and post-trade transactions plus an execution window (min_block, max_block, max_timestamp).
+- **Shadow simulation**: When `shadow_mode: true` (default), simulates submission with deterministic results instead of sending to relay.
+- **Priority fee calculation**: Computes optimal priority fee as `base_fee_gwei × priority_multiplier` (default: 3x), capped at `max_gas_gwei` (default: 50,000).
+- **Block tracking**: Updates current block and base fee on each new block event.
+
+**Safety Invariant**: Shadow mode is the committed default. Live execution requires explicit configuration change.
+
+---
+
+### 3.10 `tranche_arbitrage` — Atomic Bundle Construction
+
+| Property | Detail |
+|----------|--------|
+| **Source File** | `core/src/tranche_arbitrage.rs` |
+| **Language** | Rust |
+| **Key Structs** | `TrancheScanner`, `TrancheBundler`, `AtomicPacket`, `ExecutionWindow`, `FlashbotsBundle` |
+
+**Responsibilities**:
+
+- **TrancheScanner**: Monitors mempool for `Executor.execute(bytes)` transactions matching the deployed Executor contract address. Decodes target transaction details from calldata.
+- **TrancheBundler**: Constructs three-leg atomic bundles and submits via Flashbots Protect's `eth_sendBundle` RPC method.
+- **AtomicPacket**: Represents a complete sandwich bundle with pre-trade, victim, and post-trade transactions plus execution window constraints.
+- **FlashbotsBundle**: Wraps the bundle for submission to the relay, including `maxPriorityFeePerGas` optimization for inclusion guarantee.
+
+**Bundle Structure**:
+```rust
+AtomicPacket {
+    pre_trade_tx: Bytes,        // Buy collateral before victim
+    target_tx: Bytes,           // Intercepted Executor.execute
+    post_trade_tx: Bytes,       // Sell collateral after victim
+    execution_window: ExecutionWindow
+}
+```
+
+**Submission Flow**: Bundle → Flashbots Protect Relay → Builder → Block Inclusion → Verification
+
+---
+
 ## 4. Technology Stack
 
 | Layer | Technology | Version | Purpose |
 |-------|-----------|---------|---------|
-| **Core Runtime** | Rust | 2021 Edition | Detector, simulator, pacing, metrics |
+| **Core Runtime** | Rust | 2021 Edition | Detector, predator, orchestrator, pacing, metrics |
 | **EVM Simulation** | REVM | 36.0 | Exact Aave V3 execution replay |
 | **Ethereum Types** | Alloy | 1.7 | Addresses, U256, providers, ABI encoding |
 | **Math & Finance** | rust_decimal | 1.35 | Cap-safe decimal arithmetic |
@@ -332,7 +421,7 @@ flowchart LR
 | **State Scripts** | Python (web3.py) | 3.x | Snapshot generation |
 | **Smart Contract** | Yul + Foundry | — | Atomic executor |
 | **Configuration** | YAML | — | Pacing, risk, routing |
-| **Target Chains** | Base, Arbitrum | — | L2 liquidation venues |
+| **Target Chains** | Base | 8453 | Primary liquidation venue |
 
 ---
 
@@ -405,8 +494,13 @@ The system is engineered to bound capital at risk, contain operational blast rad
                     ▼
 ┌─────────────────────────────────────────┐
 │  L2 RPC Providers (operator-configured)│
-│  ├─ Base (Alchemy / QuickNode / public)│
-│  └─ Arbitrum (Alchemy / QuickNode)     │
+│  └─ Base (Alchemy / QuickNode / public)│
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│  Flashbots Protect Relay                │
+│  └─ eth_sendBundle for atomic inclusion │
 └─────────────────────────────────────────┘
                     │
                     ▼
@@ -421,6 +515,8 @@ The system is engineered to bound capital at risk, contain operational blast rad
 ## 7. Related Documentation
 
 - [`README.md`](../README.md) — Quick start, operator checklist, financial guardrails
+- [`docs/tranche-strategy.md`](tranche-strategy.md) — Tranche execution strategy and operational guide
+- [`docs/packet-workflow.md`](packet-workflow.md) — Atomic bundle submission workflow
 - [`docs/testing-strategy-liquidations.md`](testing-strategy-liquidations.md) — Near-100% simulation accuracy plan
 - [`docs/operator-manual.md`](operator-manual.md) — Daily operations guide
 - [`docs/emergency-procedures.md`](emergency-procedures.md) — Breaker tripping and recovery

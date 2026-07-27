@@ -513,8 +513,7 @@ impl LiquidationDetector {
     fn apply_close_factor(&self, hf: U256, user_reserve_debt: U256) -> U256 {
         let ray = ray();
         // CLOSE_FACTOR_HF_THRESHOLD = 0.95 in RAY scale.
-        let close_factor_hf_threshold =
-            U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
+        let close_factor_hf_threshold = U256::from(950_000_000_000_000_000_000_000_000u128); // 0.95e27
 
         // HF >= 1.0: not liquidatable.
         if hf >= ray {
@@ -531,7 +530,7 @@ impl LiquidationDetector {
         // (because 0.5e27 / 0.05e27 = 10)
         let default_close = ray / U256::from(2); // 0.5e27 (50%)
         let hf_above_threshold = ray - hf; // (1.0 - HF) in RAY
-        // Extra close factor = 10 * (1.0 - HF) in RAY, clamped to [0, 0.5e27]
+                                           // Extra close factor = 10 * (1.0 - HF) in RAY, clamped to [0, 0.5e27]
         let extra_factor = hf_above_threshold * U256::from(10);
         let close_factor_ray = default_close + extra_factor;
 
@@ -1179,10 +1178,8 @@ mod tests {
         );
 
         let detector = LiquidationDetector::new(snap, 8453);
-        let (_, _, _, hf) = detector.calculate_user_account_data(
-            &user,
-            detector.snapshot.users.get(&user).unwrap(),
-        );
+        let (_, _, _, hf) = detector
+            .calculate_user_account_data(&user, detector.snapshot.users.get(&user).unwrap());
         assert!(
             hf > ray() && hf < detector.hf_liquidation_threshold,
             "fixture must sit in the pre-flag band (1.0 < HF < 1.01); got {hf}"

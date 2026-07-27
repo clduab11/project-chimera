@@ -6,11 +6,13 @@ pub mod detector;
 pub mod error;
 pub mod executor;
 pub mod mempool;
+pub mod mempool_predator;
 pub mod metrics;
 pub mod oracle;
 pub mod orchestrator;
 pub mod pacing_engine;
 pub mod routing;
+pub mod tranche_orchestrator;
 pub mod signer_registry;
 pub mod simulator;
 pub mod snapshot_refresh;
@@ -30,6 +32,7 @@ pub use executor::{
     BuiltTransaction, CalldataBuilder, RpcSubmitter, SubmissionReceipt, TransactionExecutor,
 };
 pub use mempool::{BlockWatch, MempoolWatcher, SequencerFeed, WatchEvent};
+pub use mempool_predator::{MempoolPredator, ScoredTarget, SlippageAnalysis};
 pub use metrics::{start_metrics_server, Metrics};
 pub use oracle::{AaveOracle, ChainlinkOracle, OraclePrice, PriceOracle};
 pub use orchestrator::{Orchestrator, OrchestratorConfig};
@@ -37,6 +40,7 @@ pub use pacing_engine::{
     BreakerReason, CrossProcessPacing, Opportunity, PacingDecision, PacingEngine,
 };
 pub use routing::{ResolvedV2Route, RoutingResolver, NO_SWAP_VENUE};
+pub use tranche_orchestrator::{TrancheConfig, TrancheOrchestrator, OrchestratorState};
 pub use signer_registry::{ManagedSigner, SignerRegistry};
 pub use simulator::{L2ChainType, LiquidationCandidate, LiquidationSimulator, SimulationResult};
 pub use snapshot_refresh::{RefreshOutcome, ReservePriceSource, SharedSnapshot, SnapshotRefresher};
@@ -44,6 +48,7 @@ pub use state::{JsonlPersistence, ReservationRecord, ReservationStatus, StatePer
 pub use strategy::assembler::StrategyAssembler;
 pub use sweep_scheduler::SweepScheduler;
 pub use tranche_arbitrage::{
-    FlashbotsBundle, TrancheBundler, TrancheResult, TrancheScanner, TrancheStatus, TrancheTarget,
-    EXECUTOR_EXECUTE_SELECTOR, FLASHBOTS_RELAY_DEFAULT,
+    AtomicPacket, ExecutionWindow, FlashbotsBundle, TrancheBundler,
+    TrancheResult, TrancheScanner, TrancheStatus, TrancheTarget, EXECUTOR_EXECUTE_SELECTOR,
+    FLASHBOTS_RELAY_DEFAULT,
 };

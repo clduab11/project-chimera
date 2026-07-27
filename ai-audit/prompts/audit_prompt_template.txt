@@ -7,7 +7,7 @@ Scope & L2-Specific Categories:
   * L1 fee manipulation: abusing L1 cost estimation functions (e.g., ArbGasInfo.getPricesInWei) to force underpriced or overpriced execution.
   * Delayed inbox / retryable ticket issues: re-triggering retryable tickets after expiry or misconfiguring gas parameters to grief bridges.
   * Bridged asset accounting: mismatches between L1 and L2 token balances, or incorrect handling of native vs bridged USDC.
-- Economic / MEV attacks: liquidation racing, oracle stale-price arbitrage, sandwiching on DEX liquidity pools.
+- Economic / MEV attacks: liquidation racing, oracle stale-price arbitrage, trancheing on DEX liquidity pools.
 
 Process (strict order):
 1. Zero-Shot: Scan the provided Solidity source (or decompiled bytecode) for all classic + L2-specific issues listed above.

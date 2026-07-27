@@ -80,8 +80,8 @@ pub struct PacingConfig {
     #[serde(default)]
     pub tranche_enabled: bool,
     /// Maximum gas price (gwei) for tranche bundle transactions.
-    #[serde(default = "default_tranche_max_gas_gwei")]
-    pub tranche_max_gas_gwei: u64,
+    #[serde(default = "default_tranche_gas_gwei")]
+    pub tranche_gas_gwei: u64,
     /// Minimum expected profit in USD to submit a tranche bundle.
     #[serde(default = "default_tranche_min_profit_usd")]
     pub tranche_min_profit_usd: Decimal,
@@ -91,6 +91,23 @@ pub struct PacingConfig {
     /// Maximum seconds to wait for bundle inclusion.
     #[serde(default = "default_tranche_bundle_timeout_secs")]
     pub tranche_bundle_timeout_secs: u64,
+
+    // --- Atomic Bundle configuration ---
+    /// Priority fee multiplier for inclusion guarantee (default: 3x).
+    #[serde(default = "default_atomic_priority_multiplier")]
+    pub atomic_priority_multiplier: u64,
+    /// Maximum gas price willing to pay for atomic bundle legs (gwei).
+    #[serde(default = "default_atomic_gas_gwei")]
+    pub atomic_gas_gwei: u64,
+    /// Minimum slippage threshold in basis points for target selection.
+    #[serde(default = "default_atomic_min_slippage_bps")]
+    pub atomic_min_slippage_bps: u32,
+    /// Maximum blocks to wait for bundle inclusion.
+    #[serde(default = "default_atomic_max_wait_blocks")]
+    pub atomic_max_wait_blocks: u64,
+    /// Estimated gas per swap leg for atomic bundle execution.
+    #[serde(default = "default_atomic_swap_gas_estimate")]
+    pub atomic_swap_gas_estimate: u64,
 }
 
 fn default_chain_id() -> u64 {
@@ -137,10 +154,53 @@ fn default_router_compatibility() -> String {
 fn default_min_profit_fraction() -> Decimal {
     Decimal::from_str("0.8").expect("valid literal")
 }
-fn default_flashbots_relay() -> String {
-    "https://rpc.flashbots.net".into()
+/// Whether this build can execute the Bespoke Tranche Opportunity path.
+///
+/// Kept as a code constant, not a config field, so that arming the path takes a
+/// deliberate source change reviewed alongside the capabilities it asserts —
+/// `tranche_enabled` alone must never be sufficient. Flipping this to `true`
+/// does not open the gate on its own: the relay/chain and bound checks in
+/// [`PacingConfig::validate_tranche_preconditions`] still have to pass.
+///
+/// Do not flip this until all of the following hold:
+///   1. A bundle relay that actually serves `chain_id` is configured, and the
+///      submitter signs each bundle. `TrancheBundler::submit_bundle` sends only
+///      `Content-Type`, so `eth_sendBundle` returns -32600 "signature is required".
+///   2. The simulator models the full bundle — flash loan, `liquidationCall`,
+///      and the collateral->debt swap's price impact — so the pacing gate
+///      decides on a simulated figure rather than an assumed one.
+///   3. The strategy has a demonstrated positive gross edge. As of 2026-07-26 it
+///      does not; see `docs/decision-2026-07-26-tranche-venue.md`.
+const TRANCHE_EXECUTION_SUPPORTED: bool = false;
+
+/// Slippage ceiling for the tranche legs, matching the 200bps ceiling
+/// `RiskConfig::validate` applies to `slippage_max_bps`.
+const MAX_TRANCHE_SLIPPAGE_BPS: u32 = 200;
+
+/// Relay hosts that serve Ethereum L1 only. `rpc.flashbots.net` is the Protect
+/// user RPC (`eth_chainId` = 0x1) and `relay.flashbots.net` is the bundle relay;
+/// Flashbots documents `eth_sendBundle` for Mainnet and Sepolia only. None of
+/// these serve Base, which has a single sequencer and no bundle market.
+const ETHEREUM_L1_ONLY_RELAY_HOSTS: &[&str] = &[
+    "rpc.flashbots.net",
+    "relay.flashbots.net",
+    "protect.flashbots.net",
+];
+
+/// True if `url` points at a relay host known to serve Ethereum L1 only.
+fn is_ethereum_l1_only_relay(url: &str) -> bool {
+    let lowered = url.to_ascii_lowercase();
+    ETHEREUM_L1_ONLY_RELAY_HOSTS
+        .iter()
+        .any(|host| lowered.contains(host))
 }
-fn default_tranche_max_gas_gwei() -> u64 {
+
+fn default_flashbots_relay() -> String {
+    // Deliberately empty: no bundle relay serves Base (8453), so there is no
+    // correct default. A wrong-chain default reads as a vetted venue choice.
+    String::new()
+}
+fn default_tranche_gas_gwei() -> u64 {
     50
 }
 fn default_tranche_min_profit_usd() -> Decimal {
@@ -151,6 +211,22 @@ fn default_tranche_max_slippage_bps() -> u32 {
 }
 fn default_tranche_bundle_timeout_secs() -> u64 {
     60
+}
+
+fn default_atomic_priority_multiplier() -> u64 {
+    3
+}
+fn default_atomic_gas_gwei() -> u64 {
+    50_000
+}
+fn default_atomic_min_slippage_bps() -> u32 {
+    100
+}
+fn default_atomic_max_wait_blocks() -> u64 {
+    6
+}
+fn default_atomic_swap_gas_estimate() -> u64 {
+    150_000
 }
 
 impl Default for PacingConfig {
@@ -190,10 +266,15 @@ impl Default for PacingConfig {
             ws_endpoint: String::new(),
             flashbots_relay: default_flashbots_relay(),
             tranche_enabled: false,
-            tranche_max_gas_gwei: default_tranche_max_gas_gwei(),
+            tranche_gas_gwei: default_tranche_gas_gwei(),
             tranche_min_profit_usd: default_tranche_min_profit_usd(),
             tranche_max_slippage_bps: default_tranche_max_slippage_bps(),
             tranche_bundle_timeout_secs: default_tranche_bundle_timeout_secs(),
+            atomic_priority_multiplier: default_atomic_priority_multiplier(),
+            atomic_gas_gwei: default_atomic_gas_gwei(),
+            atomic_min_slippage_bps: default_atomic_min_slippage_bps(),
+            atomic_max_wait_blocks: default_atomic_max_wait_blocks(),
+            atomic_swap_gas_estimate: default_atomic_swap_gas_estimate(),
         }
     }
 }
@@ -261,7 +342,69 @@ impl PacingConfig {
             self.validate_live_fields()?;
             self.validate_live_paths()?;
         }
+        if self.tranche_enabled {
+            self.validate_tranche_preconditions()?;
+        }
         Ok(())
+    }
+
+    /// Fail closed on `tranche_enabled`.
+    ///
+    /// Called from [`PacingConfig::validate`], so it gates `load`,
+    /// `load_with_env`, the startup path in `main.rs`, and every SIGHUP reload.
+    /// A single environment variable therefore cannot arm the tranche path.
+    ///
+    /// The unmet reasons are collected rather than short-circuited so an
+    /// operator who tries to enable this sees everything that is wrong at once.
+    fn validate_tranche_preconditions(&self) -> Result<(), ChimeraError> {
+        let mut unmet: Vec<String> = Vec::new();
+
+        if !TRANCHE_EXECUTION_SUPPORTED {
+            unmet.push(
+                "the tranche execution path is not supported in this build: bundle submission \
+                 sends no signature header, the swap leg that is the strategy's entire claimed \
+                 profit source is unsimulated, and no call-site wires the module into the \
+                 orchestrator"
+                    .into(),
+            );
+        }
+
+        let relay = self.flashbots_relay.trim();
+        if relay.is_empty() {
+            unmet.push("flashbots_relay is empty".into());
+        } else if self.chain_id != 1 && is_ethereum_l1_only_relay(relay) {
+            unmet.push(format!(
+                "flashbots_relay {relay:?} serves Ethereum L1 but chain_id is {}; no Flashbots \
+                 bundle relay serves Base (8453)",
+                self.chain_id
+            ));
+        }
+
+        if self.tranche_min_profit_usd <= Decimal::ZERO {
+            unmet.push(format!(
+                "tranche_min_profit_usd must be > 0; got {}",
+                self.tranche_min_profit_usd
+            ));
+        }
+        if self.tranche_max_slippage_bps > MAX_TRANCHE_SLIPPAGE_BPS {
+            unmet.push(format!(
+                "tranche_max_slippage_bps {} exceeds the {MAX_TRANCHE_SLIPPAGE_BPS} bps ceiling",
+                self.tranche_max_slippage_bps
+            ));
+        }
+        if self.tranche_bundle_timeout_secs == 0 {
+            unmet.push("tranche_bundle_timeout_secs must be > 0".into());
+        }
+
+        if unmet.is_empty() {
+            return Ok(());
+        }
+        Err(ChimeraError::ConfigError(format!(
+            "tranche_enabled=true refused with {} unmet precondition(s): {}. See \
+             docs/decision-2026-07-26-tranche-venue.md. Set CHIMERA_TRANCHE_ENABLED=false to start.",
+            unmet.len(),
+            unmet.join("; ")
+        )))
     }
 
     /// Validate live-only values without touching the filesystem. Keeping this
@@ -493,13 +636,53 @@ impl PacingConfig {
         if let Ok(v) = std::env::var("CHIMERA_FLASHBOTS_RELAY") {
             self.flashbots_relay = v;
         }
-        if let Ok(v) = std::env::var("CHIMERA_TRANCHE_ENABLED") {
-            self.tranche_enabled = v.parse::<bool>().unwrap_or(false);
-        }
-        override_parse!("CHIMERA_TRANCHE_MAX_GAS_GWEI", self.tranche_max_gas_gwei, u64);
-        override_decimal!("CHIMERA_TRANCHE_MIN_PROFIT_USD", self.tranche_min_profit_usd);
-        override_parse!("CHIMERA_TRANCHE_MAX_SLIPPAGE_BPS", self.tranche_max_slippage_bps, u32);
-        override_parse!("CHIMERA_TRANCHE_BUNDLE_TIMEOUT_SECS", self.tranche_bundle_timeout_secs, u64);
+        override_parse!("CHIMERA_TRANCHE_ENABLED", self.tranche_enabled, bool);
+        override_parse!(
+            "CHIMERA_ATOMIC_MAX_GAS_GWEI",
+            self.tranche_gas_gwei,
+            u64
+        );
+        override_decimal!(
+            "CHIMERA_TRANCHE_MIN_PROFIT_USD",
+            self.tranche_min_profit_usd
+        );
+        override_parse!(
+            "CHIMERA_TRANCHE_MAX_SLIPPAGE_BPS",
+            self.tranche_max_slippage_bps,
+            u32
+        );
+        override_parse!(
+            "CHIMERA_TRANCHE_BUNDLE_TIMEOUT_SECS",
+            self.tranche_bundle_timeout_secs,
+            u64
+        );
+
+        // Atomic bundle overrides
+        override_parse!(
+            "CHIMERA_ATOMIC_PRIORITY_MULTIPLIER",
+            self.atomic_priority_multiplier,
+            u64
+        );
+        override_parse!(
+            "CHIMERA_ATOMIC_GAS_GWEI",
+            self.atomic_gas_gwei,
+            u64
+        );
+        override_parse!(
+            "CHIMERA_ATOMIC_MIN_SLIPPAGE_BPS",
+            self.atomic_min_slippage_bps,
+            u32
+        );
+        override_parse!(
+            "CHIMERA_ATOMIC_MAX_WAIT_BLOCKS",
+            self.atomic_max_wait_blocks,
+            u64
+        );
+        override_parse!(
+            "CHIMERA_ATOMIC_SWAP_GAS_ESTIMATE",
+            self.atomic_swap_gas_estimate,
+            u64
+        );
 
         Ok(())
     }
@@ -547,14 +730,19 @@ mod tests {
         "CHIMERA_RECENT_OUTCOMES_CAPACITY",
         "CHIMERA_SWEEP_MIN_KEEP_ETH",
         "CHIMERA_SWEEP_TOKENS",
-    "CHIMERA_WS_ENDPOINT",
-    "CHIMERA_FLASHBOTS_RELAY",
-    "CHIMERA_TRANCHE_ENABLED",
-    "CHIMERA_TRANCHE_MAX_GAS_GWEI",
-    "CHIMERA_TRANCHE_MIN_PROFIT_USD",
-    "CHIMERA_TRANCHE_MAX_SLIPPAGE_BPS",
-    "CHIMERA_TRANCHE_BUNDLE_TIMEOUT_SECS",
-];
+        "CHIMERA_WS_ENDPOINT",
+        "CHIMERA_FLASHBOTS_RELAY",
+        "CHIMERA_TRANCHE_ENABLED",
+        "CHIMERA_TRANCHE_GAS_GWEI",
+        "CHIMERA_TRANCHE_MIN_PROFIT_USD",
+        "CHIMERA_TRANCHE_MAX_SLIPPAGE_BPS",
+        "CHIMERA_TRANCHE_BUNDLE_TIMEOUT_SECS",
+        "CHIMERA_ATOMIC_PRIORITY_MULTIPLIER",
+        "CHIMERA_ATOMIC_GAS_GWEI",
+        "CHIMERA_ATOMIC_MIN_SLIPPAGE_BPS",
+        "CHIMERA_ATOMIC_MAX_WAIT_BLOCKS",
+        "CHIMERA_ATOMIC_SWAP_GAS_ESTIMATE",
+    ];
 
     struct PacingEnvGuard {
         _lock: MutexGuard<'static, ()>,
@@ -626,10 +814,15 @@ sweep_min_keep_eth: 0.001
 ws_endpoint: \"\"
 flashbots_relay: \"https://rpc.flashbots.net\"
 tranche_enabled: false
-tranche_max_gas_gwei: 50
+tranche_gas_gwei: 50
 tranche_min_profit_usd: 1.00
 tranche_max_slippage_bps: 100
 tranche_bundle_timeout_secs: 60
+atomic_priority_multiplier: 3
+atomic_gas_gwei: 50000
+atomic_min_slippage_bps: 100
+atomic_max_wait_blocks: 6
+atomic_swap_gas_estimate: 150000
 "
         .to_string()
     }
@@ -703,6 +896,87 @@ tranche_bundle_timeout_secs: 60
         let cfg = PacingConfig::load_with_env(tmp.path()).unwrap();
         assert_eq!(cfg.max_weekly_net_usd, Decimal::from(4999));
         assert_eq!(cfg.chain_id, 1);
+    }
+
+    #[test]
+    fn test_tranche_disabled_is_the_committed_default() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_yaml()).unwrap();
+        let cfg = PacingConfig::load(tmp.path()).unwrap();
+        assert!(!cfg.tranche_enabled);
+    }
+
+    /// The tranche path must be unreachable by configuration alone. This is the
+    /// startup guard: `validate` runs on `load`, `load_with_env`, the `main.rs`
+    /// startup path, and every SIGHUP reload.
+    #[test]
+    fn test_rejects_tranche_enabled() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let yaml = valid_yaml().replace("tranche_enabled: false", "tranche_enabled: true");
+        writeln!(tmp, "{}", yaml).unwrap();
+        let err = PacingConfig::load(tmp.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("tranche_enabled=true refused"),
+            "unexpected error: {err}"
+        );
+        // The wrong-chain relay must be named, not just the build-support refusal:
+        // valid_yaml() pairs chain_id 8453 with the L1 Flashbots endpoint.
+        assert!(
+            err.contains("serves Ethereum L1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `CHIMERA_TRANCHE_ENABLED=true` must not slip past the guard either — the
+    /// env override is the documented activation path.
+    #[test]
+    fn test_rejects_tranche_enabled_via_env() {
+        let _guard = PacingEnvGuard::new();
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_yaml()).unwrap();
+        std::env::set_var("CHIMERA_TRANCHE_ENABLED", "true");
+        let err = PacingConfig::load_with_env(tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tranche_enabled=true refused"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A non-bool value previously resolved to `false` via `unwrap_or`, so an
+    /// operator writing `=1` got silent disagreement with their intent. Fail loudly.
+    #[test]
+    fn test_tranche_enabled_rejects_non_bool_env_value() {
+        let _guard = PacingEnvGuard::new();
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "{}", valid_yaml()).unwrap();
+        for value in ["1", "TRUE", "yes"] {
+            std::env::set_var("CHIMERA_TRANCHE_ENABLED", value);
+            let err = PacingConfig::load_with_env(tmp.path())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("CHIMERA_TRANCHE_ENABLED"),
+                "value {value:?} gave unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_l1_only_relay_detection() {
+        assert!(is_ethereum_l1_only_relay("https://rpc.flashbots.net"));
+        assert!(is_ethereum_l1_only_relay("https://RPC.FlashBots.NET/fast"));
+        assert!(is_ethereum_l1_only_relay("https://relay.flashbots.net"));
+        assert!(!is_ethereum_l1_only_relay("https://mainnet.base.org"));
+        assert!(!is_ethereum_l1_only_relay(""));
+    }
+
+    /// No bundle relay serves Base, so there is no correct default. A wrong-chain
+    /// default reads as a vetted venue choice to whoever finds it next.
+    #[test]
+    fn test_flashbots_relay_default_is_empty() {
+        assert!(default_flashbots_relay().is_empty());
     }
 
     #[test]
@@ -903,7 +1177,7 @@ pub struct RiskConfig {
     pub min_profit: Decimal,
     /// Fraction of expected profit enforced as the on-chain `min_profit` gate.
     /// Range 0.0–1.0. Default 0.8 requires 80% of simulated expected profit to be
-    /// retained on-chain, protecting against sandwich attacks while leaving a buffer
+    /// retained on-chain, protecting against tranche attacks while leaving a buffer
     /// for gas/slippage variance.
     ///
     /// The orchestrator converts `expected_profit_usd → debt‑token wei` using the

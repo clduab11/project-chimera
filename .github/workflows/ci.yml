@@ -145,3 +145,13 @@ jobs:
           if grep -RInE 'execute_mode:\s*["'\'']?live' config/ core/tests/ 2>/dev/null; then
             echo "ERROR: execute_mode: live found in committed config/fixtures"; exit 1; fi
           echo "OK: no committed live execute_mode"
+      - name: Forbid tranche_enabled true in committed config/fixtures
+        run: |
+          if grep -RInE 'tranche_enabled:\s*["'\'']?true' config/ core/tests/ 2>/dev/null; then
+            echo "ERROR: tranche_enabled: true found in committed config/fixtures"; exit 1; fi
+          echo "OK: no committed tranche_enabled true"
+      - name: Forbid an Ethereum L1 bundle relay in committed config/fixtures
+        run: |
+          if grep -RInE '(rpc|relay|protect)\.flashbots\.net' config/ 2>/dev/null; then
+            echo "ERROR: L1 Flashbots relay found in committed config/ — no bundle relay serves Base (8453)"; exit 1; fi
+          echo "OK: no committed L1 relay endpoint"

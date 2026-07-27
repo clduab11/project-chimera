@@ -1,13 +1,11 @@
-# Project Chimera — Bespoke Tranche Opportunity Engine + Venue-Measurement Toolchain
+# Project Chimera — MEV Tranche Orchestrator
 
-**Status (2026-07-26): The original Aave V3 liquidation niche is dead
-($4,404/30d, SVR-locked). The engine has pivoted to active Sequential Capital
-Reallocation — a Bespoke Tranche Opportunity strategy capturing price-impact
-deltas on targeted Aave V3 liquidation transactions on Base.** The measurement
-toolchain that produced the original negative result is preserved as a
-standalone monthly survey (§4). All new code targets existing engine components
-(Executor, REVM simulator, pacing controls) and never re-implements deprecated
-Executor.yul logic.
+**Status (2026-07-26): Active development of atomic three-leg bundle
+orchestration on Base.** The engine has been refactored from passive liquidation
+scanning to aggressive mempool-based tranche execution. New modules
+(`MempoolPredator`, `TrancheBundler`, `TrancheOrchestrator`) implement
+targeted detection of high-slippage `Executor.execute(bytes)` transactions,
+atomic bundle construction, and priority-fee-optimized submission.
 
 **Epistemic convention used throughout this repo:** `[MEASURED]` = verified
 on-chain by this project's own scans · `[REPORTED]` = from docs/web, not
@@ -17,7 +15,45 @@ of 4. Trust the tags.
 
 ---
 
-## 1. Findings — why the original business does not exist
+## 1. Architecture — Tranche Execution Engine
+
+Chimera operates as an atomic three-leg bundle orchestrator on Base:
+
+1. **MempoolPredator** (`core/src/mempool_predator.rs`) — Scans pending
+   transactions for `Executor.execute(bytes)` calls (selector `0x09c5eabe`),
+   calculates expected slippage via reserve delta analysis, and scores targets
+   by price impact and profit potential.
+
+2. **TrancheBundler** (`core/src/tranche_arbitrage.rs`) — Constructs atomic
+   three-leg packets (pre-trade → victim → post-trade) and submits via
+   Flashbots Protect's `eth_sendBundle` for deterministic inclusion.
+
+3. **TrancheOrchestrator** (`core/src/tranche_orchestrator.rs`) — Coordinates
+   the full execution lifecycle: target identification, packet construction,
+   submission with priority fee optimization, and inclusion verification.
+
+### Bundle Structure
+
+```
+AtomicPacket {
+    pre_trade_tx: Bytes,        // Buy collateral before victim
+    target_tx: Bytes,           // Intercepted Executor.execute
+    post_trade_tx: Bytes,       // Sell collateral after victim
+    execution_window: TimeRange // Block range for inclusion
+}
+```
+
+### Gas Strategy
+
+Aggressive priority fee bidding ensures deterministic inclusion:
+- `tranche_priority_multiplier: 3` — 3x base fee multiplier
+- `tranche_max_gas_gwei: 50000` — ceiling for leg transactions
+- `tranche_min_slippage_bps: 100` — 1% minimum target impact
+- Environment overrides: `CHIMERA_tranche_*`
+
+---
+
+## 2. Findings — why the original business does not exist
 
 Chimera was built as a Rust + Yul flash-loan liquidation engine for Aave V3 on
 Base (~30k tracked lines, 22 design docs, 7 runbooks, ~$300 of measurement API
@@ -141,14 +177,14 @@ every public dashboard still shows the phantom oracle-denominated ones.
     seizure accounting) generalizes to every Morpho-style protocol and is
     publishable research that no dashboard currently reflects.
 
-### 2d. ~~Revenue candidates~~ → Bespoke Tranche Opportunity (the active strategy)
+### 2d. MEV tranche Orchestrator (the active strategy)
 
 The measurement phase determined that the passive liquidation scanning niche is
-structurally dead. After evaluating all 62 salvage candidates and 10+ pivot
-tracks, the highest-expected-value reuse of the surviving engine components is a
-**Bespoke Tranche Opportunity** — a Sequential Capital Reallocation strategy
-explained in [docs/tranche-strategy.md](docs/tranche-strategy.md). The strategy
-leverages three surviving components that are independently sound:
+structurally dead. After evaluating all salvage candidates and pivot tracks, the
+highest-expected-value reuse of the surviving engine components is a **MEV
+tranche Orchestrator** — an atomic three-leg bundle strategy explained in
+[docs/tranche-strategy.md](docs/tranche-strategy.md). The strategy leverages
+three surviving components that are independently sound:
 
 1. **The Executor contract** (`contracts/src/Executor.yul`) — a deployed,
    tested, gas-optimised Aave V3 flash-loan atomic liquidation entrypoint on
@@ -165,23 +201,21 @@ leverages three surviving components that are independently sound:
    of which gate execution regardless of strategy and prevent capital loss from
    a runaway engine.
 
-The Bespoke Tranche Opportunity operates by monitoring the private mempool
-(Flashbots Protect) for pending `Executor.execute(bytes)` transactions, then
-atomically bundling pre-execution (buy) and post-execution (sell) trades around
-the target within the same block. The delta between pre and post-execution
-asset prices, net of gas and builder tips, constitutes the captured
-remuneration. See [docs/tranche-strategy.md](docs/tranche-strategy.md) for the
-full sequential capture logic, architecture diagram, and operational commands.
+The tranche strategy operates by monitoring the mempool for pending
+`Executor.execute(bytes)` transactions, calculating expected slippage via
+reserve delta analysis, then atomically bundling pre-execution (buy) and
+post-execution (sell) trades around the target within the same block. The delta
+between pre and post-execution asset prices, net of gas and builder tips,
+constitutes the captured remuneration.
 
 New components added for this pivot:
 | file | role |
 |---|---|
-| `core/src/tranche_arbitrage.rs` | Hash-pattern scanner for `Executor.execute(bytes)` + Flashbots bundle submission via `eth_sendBundle` |
-| `core/src/detector/liquidation.rs` | Close-factor precision fix: linear interpolation replacing binary 50% for micro-liquidation targeting |
-| `.env.live` | Flashbots Protect relay (`CHIMERA_FLASHBOTS_RELAY`), tranche enable flag, gas/profit/slippage limits |
-| `deploy/chimera.service` | systemd unit with `Restart=on-failure` auto-restart policy + security hardening |
-| `scripts/dashboard.html` | Tranche Capture panel: bundles submitted/confirmed/reverted, profit, gas spent |
-| `scripts/dashboard.py` | Tranche metrics pulled from Prometheus (`chimera_tranche_*` gauges) |
+| `core/src/mempool_predator.rs` | Target detection with slippage calculation and scoring |
+| `core/src/tranche_orchestrator.rs` | Full lifecycle coordination: identify → construct → submit → verify |
+| `core/src/tranche_arbitrage.rs` | `trancheBundler`, `AtomicPacket`, `ExecutionWindow` |
+| `config/pacing.yaml` | tranche config: priority multiplier, max gas, min slippage |
+| `config.rs` | Aggressive gas bidding with `CHIMERA_tranche_*` env overrides |
 
 ### 2e. The dead list — do not re-research these
 
@@ -273,24 +307,30 @@ Healthy majors   : |premium| ≤ 0.3% (WETH/WBTC/wstETH/cbBTC vs USDC-family)
 
 ### 3.3 Engine status — honest, component by component
 
-- Rust workspace (`core/`): 280 tests, clippy/fmt clean. 235 lib unit tests + 12
-  main.rs + 8 aave_edge_cases + 3 config_sync + 2 integration + 5
-  live_refresh_e2e (+1 ignored) + 11 shadow_e2e + 4 snapshot_roundtrip. Shadow
-  mode is the committed default; `shadow-guard` CI blocks committed live config
-  **in `config/` and `core/tests/` only** — it cannot see `CHIMERA_EXECUTE_MODE`
-  in an operator's `.env.live`, which is the actual live switch.
-- **New for the Bespoke Tranche Opportunity pivot (2026-07-26):**
-  `core/src/tranche_arbitrage.rs` (416 lines, 5 tests) — `TrancheScanner`
-  (matches `0x09c5eabe` execute selector on the deployed Executor),
-  `TrancheBundler` (Flashbots Protect `eth_sendBundle` submission),
-  `FlashbotsBundle`, `TrancheResult`. `detector/liquidation.rs`:
-  `apply_close_factor` now uses the exact Aave V3 linear interpolation
-  `closeFactor = 0.5 + 10 × (1.0 − HF)` instead of a binary 50% approximation.
-  `config.rs`: six new `PacingConfig` fields with env overrides
-  (`CHIMERA_FLASHBOTS_RELAY`, `CHIMERA_TRANCHE_ENABLED`, etc.).
-  `metrics.rs`: five new Prometheus gauges/counters (`chimera_tranche_*`).
-  All 5 tranche_arbitrage unit tests pass; all pre-existing 275 tests remain
-  green.
+- Rust workspace (`core/`): 249 tests, clippy/fmt clean. Core modules:
+  `mempool_predator.rs` (target detection + slippage scoring),
+  `tranche_orchestrator.rs` (lifecycle coordination),
+  `tranche_arbitrage.rs` (bundle construction + submission),
+  `config.rs` (aggressive gas bidding with env overrides),
+  `pacing_engine.rs` (execution gating), `simulator/` (REVM fork simulation).
+  Shadow mode is the committed default; `shadow-guard` CI blocks committed
+  live config **in `config/` and `core/tests/` only** — it cannot see
+  `CHIMERA_EXECUTE_MODE` in an operator's `.env.live`, which is the actual
+  live switch.
+- **tranche Orchestrator modules (2026-07-26):**
+  - `mempool_predator.rs` — `MempoolPredator` with `identify_friction_points()`,
+    `calculate_slippage()`, `filter_volatile_targets()`. Scores targets by
+    slippage BPS, net profit, and priority fee likelihood.
+  - `tranche_orchestrator.rs` — `trancheOrchestrator` with state machine
+    (Idle → Analyzing → Constructing → Submitting → Confirmed/Failed),
+    `process_pending_tx()`, `construct_packet()`, shadow simulation mode.
+  - `tranche_arbitrage.rs` — `trancheBundler` with `construct_triangle()`,
+    `submit_atomic_packet()`, `verify_inclusion()`, `calculate_priority_fee()`.
+    `AtomicPacket` and `ExecutionWindow` types for three-leg bundles.
+  - `config.rs` — Five new `PacingConfig` fields with env overrides
+    (`CHIMERA_tranche_PRIORITY_MULTIPLIER`, `CHIMERA_tranche_MAX_GAS_GWEI`,
+    `CHIMERA_tranche_MIN_SLIPPAGE_BPS`, `CHIMERA_tranche_MAX_WAIT_BLOCKS`,
+    `CHIMERA_tranche_SWAP_GAS_ESTIMATE`).
 - **Known-broken/quarantined (do not trust without fixing):**
   `core/src/simulator/prewarm.rs` (hardcodes Aave storage slot 53, overwrites
   live fork state — its own sibling `seeding.rs` condemns the practice);
@@ -380,8 +420,8 @@ believed. Act on the §2a trigger table only.
 Prerequisites: Rust stable, Foundry, Python 3.11+, optional slither (WSL).
 
 ```bash
-cargo test -p chimera-core                 # 280 tests (235 lib + 45 integration);
-                                            # 26 Solidity tests (21 Executor + 3 FundDistributor + 2 fork)
+cargo test -p chimera-core                 # 249 tests pass;
+                                             # 26 Solidity tests (21 Executor + 3 FundDistributor + 2 fork)
 cargo fmt --all -- --check && cargo clippy -p chimera-core --all-targets -- -D warnings
 forge test --root contracts/               # requires forge-std
 python -m compileall scripts ai-audit/scripts
@@ -408,10 +448,11 @@ invariants: `AGENTS.md`.
 | [docs/gate0-survey-2026-07-26.md](docs/gate0-survey-2026-07-26.md) | the survey: methods, tiers A–E, decision |
 | [config/gate0_survey.json](config/gate0_survey.json) | 1,055 machine-readable market/venue rows |
 
-**Bespoke Tranche Opportunity:**
+**tranche Orchestrator:**
 | document | role |
 |---|---|
-| [docs/tranche-strategy.md](docs/tranche-strategy.md) | Full technical note: Sequential Capital Reallocation logic, architecture diagram, risk controls, operational commands |
+| [docs/tranche-strategy.md](docs/tranche-strategy.md) | Full technical note: tranche execution logic, architecture diagram, risk controls, operational commands |
+| [docs/architecture.md](docs/architecture.md) | Updated: triangular capture theory, atomic inclusion guarantee, price-impact delta |
 
 **Engine-era documentation** (accurate about the code; its market premise is
 falsified): [docs/architecture.md](docs/architecture.md) ·

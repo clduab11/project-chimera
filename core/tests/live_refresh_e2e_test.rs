@@ -143,10 +143,15 @@ fn test_pacing_config(eoa_pool_path: &str) -> PacingConfig {
         ws_endpoint: String::new(),
         flashbots_relay: "https://rpc.flashbots.net".to_string(),
         tranche_enabled: false,
-        tranche_max_gas_gwei: 50,
+        tranche_gas_gwei: 50,
         tranche_min_profit_usd: Decimal::new(1, 0),
         tranche_max_slippage_bps: 100,
         tranche_bundle_timeout_secs: 60,
+        atomic_priority_multiplier: 3,
+        atomic_gas_gwei: 50000,
+        atomic_min_slippage_bps: 100,
+        atomic_max_wait_blocks: 6,
+        atomic_swap_gas_estimate: 150000,
     }
 }
 

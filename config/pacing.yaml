@@ -54,3 +54,15 @@ refund_topup_eth: 0.01
 sweep_tokens: []
 sweep_min_keep_eth: 0.001
 ws_endpoint: ""
+
+# --- Atomic Bundle configuration ---
+# Priority fee multiplier for deterministic inclusion (default: 3x base fee)
+atomic_priority_multiplier: 3
+# Maximum gas price willing to pay for atomic bundle legs (gwei)
+atomic_max_gas_gwei: 50000
+# Minimum slippage threshold in basis points for target selection (100 = 1%)
+atomic_min_slippage_bps: 100
+# Maximum blocks to wait for bundle inclusion
+atomic_max_wait_blocks: 6
+# Estimated gas per swap leg for atomic bundle execution
+atomic_swap_gas_estimate: 150000

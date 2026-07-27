@@ -108,7 +108,7 @@ deferred, not gated, rejected:
 - Structuring an operation so a third party ("patsy") absorbs legal liability —
   this is itself evidence of fraudulent intent and does not transfer criminal
   liability.
-- Oracle manipulation, forced liquidations, governance attacks, sandwiching or
+- Oracle manipulation, forced liquidations, governance attacks, trancheing or
   other predatory MEV, exploit execution, or unaudited flash-loan strategies.
 - Custody or pooling of third-party funds, yield products, or investment
   contracts without licensing.

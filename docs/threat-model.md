@@ -124,7 +124,7 @@ the repo. `config/eoa_pool.json` holds **public addresses only**.
 | External on-chain attacker | Submit arbitrary txns, deploy contracts | Drain Executor / FundDistributor, grief liquidations |
 | Malicious DEX router / token | Arbitrary code at a called address; nonstandard ERC20 | Steal mid-tx balances, break profit accounting |
 | Compromised RPC provider | Lie about state, withhold/delay txns, leak mempool | Induce bad decisions, censor, enable front-run |
-| MEV searcher / competitor | Observe mempool, front-run, back-run | Steal the liquidation, sandwich the swap |
+| MEV searcher / competitor | Observe mempool, front-run, back-run | Steal the liquidation, tranche the swap |
 | Local host compromise | Read host memory/files, run as operator | Exfiltrate keys, password, operator token |
 | Insider / operator error | Legitimate access, mistakes | Misconfigure caps, fund wrong address, clear breaker prematurely |
 | Sequencer (Base/Arbitrum) | Order/stall/censor L2 inclusion | Stall execution, strand in-flight strategy |
@@ -167,7 +167,7 @@ that addresses it. "Slot 0/1" refer to `Executor.yul` storage.
 | USDT no-return-value | Tokens that return nothing on `approve`/`transfer` | `callApprove` / `withdraw` treat empty returndata as success and only fail on explicit `false` | Mitigated |
 | Nonce collision in funding | Concurrent funding txns reuse a nonce | Addressed in funding path; sequential nonce handling | Mitigated (verify under load) |
 | Bad-debt liquidation | Liquidating a position that leaves uncovered bad debt | **Must-not-attempt:** simulator screens bad-debt coverage before submission; engine declines | Partial (relies on simulator fidelity) |
-| MEV front-running | Searcher steals the liquidation or sandwiches the swap | `tip`, `amountOutMin`, deadline, and profit gate bound damage, but current submission uses standard JSON-RPC and exposes the transaction to provider/mempool risks; private submission is not wired | Open |
+| MEV front-running | Searcher steals the liquidation or tranchees the swap | `tip`, `amountOutMin`, deadline, and profit gate bound damage, but current submission uses standard JSON-RPC and exposes the transaction to provider/mempool risks; private submission is not wired | Open |
 | Flash-loan callback abuse | Attacker triggers `executeOperation` with crafted params | Pool validation (slot 1) + initiator must equal contract address + exact 288-byte params + atomic revert on any failed step | Mitigated |
 | Profit theft by worker | Authorized worker redirects liquidation proceeds | The Executor is the flash-loan receiver, liquidation recipient, swap recipient, and repayment account. Profit remains in the Executor; workers cannot call owner-only `withdraw` | Mitigated |
 

@@ -195,19 +195,36 @@ impl Metrics {
         r.register(Box::new(scans_skipped_stale_price.clone())).ok();
 
         let tranche_bundles_total = IntCounterVec::new(
-            Opts::new("chimera_tranche_bundles_total", "Total tranche bundles submitted"),
+            Opts::new(
+                "chimera_tranche_bundles_total",
+                "Total tranche bundles submitted",
+            ),
             &["chain"],
-        ).unwrap();
+        )
+        .unwrap();
         let tranche_bundles_confirmed = IntCounterVec::new(
-            Opts::new("chimera_tranche_bundles_confirmed_total", "Confirmed tranche bundles"),
+            Opts::new(
+                "chimera_tranche_bundles_confirmed_total",
+                "Confirmed tranche bundles",
+            ),
             &["chain"],
-        ).unwrap();
+        )
+        .unwrap();
         let tranche_bundles_reverted = IntCounterVec::new(
-            Opts::new("chimera_tranche_bundles_reverted_total", "Reverted tranche bundles"),
+            Opts::new(
+                "chimera_tranche_bundles_reverted_total",
+                "Reverted tranche bundles",
+            ),
             &["chain"],
-        ).unwrap();
-        let tranche_profit_wei = Gauge::new("chimera_tranche_profit_wei", "Last tranche profit in wei").unwrap();
-        let tranche_gas_spent_wei = Gauge::new("chimera_tranche_gas_spent_wei", "Last tranche gas spent in wei").unwrap();
+        )
+        .unwrap();
+        let tranche_profit_wei =
+            Gauge::new("chimera_tranche_profit_wei", "Last tranche profit in wei").unwrap();
+        let tranche_gas_spent_wei = Gauge::new(
+            "chimera_tranche_gas_spent_wei",
+            "Last tranche gas spent in wei",
+        )
+        .unwrap();
 
         r.register(Box::new(tranche_bundles_total.clone())).ok();
         r.register(Box::new(tranche_bundles_confirmed.clone())).ok();
@@ -344,12 +361,16 @@ impl Metrics {
 
     /// Record a confirmed tranche bundle.
     pub fn observe_tranche_confirmed(&self, chain: &str) {
-        self.tranche_bundles_confirmed.with_label_values(&[chain]).inc();
+        self.tranche_bundles_confirmed
+            .with_label_values(&[chain])
+            .inc();
     }
 
     /// Record a reverted tranche bundle.
     pub fn observe_tranche_reverted(&self, chain: &str) {
-        self.tranche_bundles_reverted.with_label_values(&[chain]).inc();
+        self.tranche_bundles_reverted
+            .with_label_values(&[chain])
+            .inc();
     }
 
     /// Set the last tranche profit in wei.

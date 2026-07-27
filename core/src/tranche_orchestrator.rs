@@ -131,7 +131,11 @@ impl TrancheOrchestrator {
 
         // Step 1: Identify friction point
         let scored = self.predator.identify_friction_points(
-            to, calldata, tx_hash, gas_price_wei, max_priority_fee,
+            to,
+            calldata,
+            tx_hash,
+            gas_price_wei,
+            max_priority_fee,
         )?;
 
         // Step 2: Construct and submit packet

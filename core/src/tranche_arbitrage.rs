@@ -12,7 +12,7 @@
 //! 2. [`TrancheBundler`] — builds a three-transaction atomic bundle: pre-trade
 //!    buy → Executor.execute liquidation → post-trade sell, submitted via
 //!    `eth_sendBundle` to a Flashbots Protect relay.
-//! 3. [`trancheBundler`] — orchestrates triangular capture sequences with
+//! 3. [`AtomicPacketBundler`] — orchestrates triangular capture sequences with
 //!    deterministic inclusion via priority fee optimization.
 //!
 //! Safety invariant: `CHIMERA_TRANCHE_ENABLED` must be `true` before any
@@ -30,7 +30,15 @@ use std::str::FromStr;
 /// keccak256("execute(bytes)") first 4 bytes = 0x09c5eabe
 pub const EXECUTOR_EXECUTE_SELECTOR: [u8; 4] = [0x09, 0xc5, 0xea, 0xbe];
 
-/// Default Flashbots Protect relay for Base mainnet.
+/// The Flashbots Protect **user RPC**, which serves Ethereum L1 (chain 1).
+///
+/// It is **not** a default for Base and **not** a bundle relay. Every clause of
+/// this constant's former doc comment ("Default Flashbots Protect relay for Base
+/// mainnet") was wrong: `eth_chainId` here returns `0x1`, bundle submission
+/// belongs to `relay.flashbots.net`, and `eth_sendBundle` is documented for
+/// Mainnet and Sepolia only. Retained solely so existing imports keep compiling;
+/// `PacingConfig::default_flashbots_relay()` deliberately returns an empty
+/// string instead, because there is no correct default for Base.
 pub const FLASHBOTS_RELAY_DEFAULT: &str = "https://rpc.flashbots.net";
 
 // ---------------------------------------------------------------------------
@@ -373,7 +381,11 @@ pub struct AtomicPacket {
 ///
 /// Extends [`TrancheBundler`] with priority fee optimization and collision
 /// exclusion for competitive mempool environments.
-pub struct trancheBundler {
+///
+/// **Not reachable.** Nothing constructs this type; see the call-site census in
+/// `docs/decision-2026-07-26-tranche-venue.md` §4. Retained pending the
+/// withdraw/proceed decision in §9.1, not because it is wired.
+pub struct AtomicPacketBundler {
     /// Underlying bundler for transaction construction.
     pub bundler: TrancheBundler,
     /// Priority fee multiplier for inclusion guarantee.
@@ -382,7 +394,7 @@ pub struct trancheBundler {
     pub max_gas_gwei: u64,
 }
 
-impl trancheBundler {
+impl AtomicPacketBundler {
     /// Create a new tranche bundler.
     pub fn new(
         chain_id: u64,
@@ -426,10 +438,7 @@ impl trancheBundler {
     /// Submit an atomic packet via Flashbots Protect.
     ///
     /// Returns the bundle hash on success.
-    pub async fn submit_atomic_packet(
-        &self,
-        packet: &AtomicPacket,
-    ) -> Result<B256, ChimeraError> {
+    pub async fn submit_atomic_packet(&self, packet: &AtomicPacket) -> Result<B256, ChimeraError> {
         let bundle = self.bundler.build_bundle(
             packet.pre_trade_tx.clone(),
             packet.target_tx.clone(),
@@ -443,17 +452,22 @@ impl trancheBundler {
 
     /// Verify inclusion of a submitted bundle.
     ///
-    /// Checks if the bundle was included in the target block range.
-    /// Returns `true` if confirmed, `false` if reverted or missed.
+    /// **Unimplemented, and deliberately errors rather than reporting a
+    /// result.** Inclusion verification requires a relay that serves this
+    /// chain; none serves Base (8453). Returning `Ok(false)` here — as this
+    /// previously did — is indistinguishable from "checked, and it was not
+    /// included", which would let a caller book an unverified outcome as a
+    /// confirmed miss. Fail loudly instead.
     pub async fn verify_inclusion(
         &self,
         bundle_hash: B256,
         target_block: u64,
     ) -> Result<bool, ChimeraError> {
-        // In a full implementation, this would query the relay or chain
-        // to verify bundle inclusion. For now, return placeholder.
-        let _ = (bundle_hash, target_block);
-        Ok(false)
+        Err(ChimeraError::RpcError(format!(
+            "bundle inclusion verification is not implemented: no relay serves \
+             chain {} (bundle {bundle_hash}, target block {target_block})",
+            self.bundler.chain_id
+        )))
     }
 
     /// Calculate optimal priority fee for inclusion.

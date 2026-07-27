@@ -637,11 +637,7 @@ impl PacingConfig {
             self.flashbots_relay = v;
         }
         override_parse!("CHIMERA_TRANCHE_ENABLED", self.tranche_enabled, bool);
-        override_parse!(
-            "CHIMERA_ATOMIC_MAX_GAS_GWEI",
-            self.tranche_gas_gwei,
-            u64
-        );
+        override_parse!("CHIMERA_ATOMIC_MAX_GAS_GWEI", self.tranche_gas_gwei, u64);
         override_decimal!(
             "CHIMERA_TRANCHE_MIN_PROFIT_USD",
             self.tranche_min_profit_usd
@@ -663,11 +659,7 @@ impl PacingConfig {
             self.atomic_priority_multiplier,
             u64
         );
-        override_parse!(
-            "CHIMERA_ATOMIC_GAS_GWEI",
-            self.atomic_gas_gwei,
-            u64
-        );
+        override_parse!("CHIMERA_ATOMIC_GAS_GWEI", self.atomic_gas_gwei, u64);
         override_parse!(
             "CHIMERA_ATOMIC_MIN_SLIPPAGE_BPS",
             self.atomic_min_slippage_bps,

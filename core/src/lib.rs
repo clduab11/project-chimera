@@ -12,7 +12,6 @@ pub mod oracle;
 pub mod orchestrator;
 pub mod pacing_engine;
 pub mod routing;
-pub mod tranche_orchestrator;
 pub mod signer_registry;
 pub mod simulator;
 pub mod snapshot_refresh;
@@ -20,6 +19,7 @@ pub mod state;
 pub mod strategy;
 pub mod sweep_scheduler;
 pub mod tranche_arbitrage;
+pub mod tranche_orchestrator;
 
 pub use simulator::golden;
 pub use simulator::prewarm;
@@ -39,8 +39,10 @@ pub use orchestrator::{Orchestrator, OrchestratorConfig};
 pub use pacing_engine::{
     BreakerReason, CrossProcessPacing, Opportunity, PacingDecision, PacingEngine,
 };
-pub use routing::{ResolvedV2Route, RoutingResolver, NO_SWAP_VENUE};
-pub use tranche_orchestrator::{TrancheConfig, TrancheOrchestrator, OrchestratorState};
+pub use routing::{
+    plan_split, plan_split_default, ResolvedV2Route, RoutingResolver, SplitLeg, SplitPlan,
+    VenueLiquidity, NO_SWAP_VENUE,
+};
 pub use signer_registry::{ManagedSigner, SignerRegistry};
 pub use simulator::{L2ChainType, LiquidationCandidate, LiquidationSimulator, SimulationResult};
 pub use snapshot_refresh::{RefreshOutcome, ReservePriceSource, SharedSnapshot, SnapshotRefresher};
@@ -48,7 +50,7 @@ pub use state::{JsonlPersistence, ReservationRecord, ReservationStatus, StatePer
 pub use strategy::assembler::StrategyAssembler;
 pub use sweep_scheduler::SweepScheduler;
 pub use tranche_arbitrage::{
-    AtomicPacket, ExecutionWindow, FlashbotsBundle, TrancheBundler,
-    TrancheResult, TrancheScanner, TrancheStatus, TrancheTarget, EXECUTOR_EXECUTE_SELECTOR,
-    FLASHBOTS_RELAY_DEFAULT,
+    AtomicPacket, ExecutionWindow, FlashbotsBundle, TrancheBundler, TrancheResult, TrancheScanner,
+    TrancheStatus, TrancheTarget, EXECUTOR_EXECUTE_SELECTOR, FLASHBOTS_RELAY_DEFAULT,
 };
+pub use tranche_orchestrator::{OrchestratorState, TrancheConfig, TrancheOrchestrator};

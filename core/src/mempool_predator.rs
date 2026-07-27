@@ -112,9 +112,9 @@ impl MempoolPredator {
         }
 
         // Step 2: Decode target transaction
-        let target = self
-            .scanner
-            .decode_target_tx(calldata, tx_hash, gas_price_wei, max_priority_fee)?;
+        let target =
+            self.scanner
+                .decode_target_tx(calldata, tx_hash, gas_price_wei, max_priority_fee)?;
 
         // Step 3: Calculate slippage
         let analysis = self.calculate_slippage(&target)?;
@@ -164,14 +164,9 @@ impl MempoolPredator {
 
         // Calculate leg gas costs (2 legs: pre-trade + post-trade)
         let leg_gas_cost_wei = U256::from(self.swap_gas_estimate * 2)
-            .checked_mul(U256::from(
-                self.base_fee_wei
-                    .saturating_add(
-                        self.max_priority_fee_wei
-                            .try_into()
-                            .unwrap_or(u128::MAX),
-                    ),
-            ))
+            .checked_mul(U256::from(self.base_fee_wei.saturating_add(
+                self.max_priority_fee_wei.try_into().unwrap_or(u128::MAX),
+            )))
             .unwrap_or(U256::ZERO);
 
         // Estimate profit from slippage capture
@@ -260,12 +255,12 @@ mod tests {
         let scanner = TrancheScanner::new(executor, 8453);
         MempoolPredator::new(
             scanner,
-            100,    // 1% slippage threshold
-            50_000_000_000u128, // 50 gwei max priority
-            Decimal::from(10),  // $10 min profit
+            100,                 // 1% slippage threshold
+            50_000_000_000u128,  // 50 gwei max priority
+            Decimal::from(10),   // $10 min profit
             Decimal::from(1800), // ETH price
-            150_000, // gas per swap
-            1_000_000_000u128, // 1 gwei base fee
+            150_000,             // gas per swap
+            1_000_000_000u128,   // 1 gwei base fee
         )
     }
 
@@ -285,7 +280,13 @@ mod tests {
         );
 
         // Should return None because calldata is all zeros (no real trade)
-        assert!(result.is_none() || result.as_ref().map(|s| !s.analysis.meets_threshold).unwrap_or(true));
+        assert!(
+            result.is_none()
+                || result
+                    .as_ref()
+                    .map(|s| !s.analysis.meets_threshold)
+                    .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -318,9 +319,12 @@ mod tests {
         let mut calldata = vec![0x09, 0xc5, 0xea, 0xbe];
         calldata.extend(vec![0u8; 416]);
 
-        let target = predator
-            .scanner
-            .decode_target_tx(&calldata, B256::ZERO, 1_000_000_000u128, 100_000_000u128);
+        let target = predator.scanner.decode_target_tx(
+            &calldata,
+            B256::ZERO,
+            1_000_000_000u128,
+            100_000_000u128,
+        );
 
         // Zero calldata should decode to zero amounts
         if let Some(t) = target {

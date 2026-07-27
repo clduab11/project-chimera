@@ -283,3 +283,107 @@ this branch. Fixed here.
    transactions and zero extra fee legs — strictly better than the tranche structure and available
    without any new venue. Worth its own work order. Keep the close-factor precision fix from PR #26
    too; it is independently correct.
+
+---
+
+## 10. Addendum — the falsification model now exists (2026-07-26)
+
+Open item §9.5 is closed. `core/tests/tranche_falsification_test.rs` implements the offline
+constant-product kill test: no chain access, no REVM, no relay, no keys, no capital. It is scoped as
+a kill test, not strategy enablement, and it reproduces §3 independently.
+
+Result on a 1e6/1e6 pool, liquidation 137, pre-trade 50 — `bundle − baseline`:
+
+| fee tier | delta |
+|---|---|
+| 0 bps | `0.00000000000000000000000000` |
+| 1 bps | `−0.00999763055198752427092466` |
+| 5 bps | `−0.04997815936644398853182531` |
+| 30 bps | `−0.29949420357655465613718168` |
+| 100 bps | `−0.99481630960524742017800586` |
+
+The zero-fee row is exact, not approximate: it is an endpoint argument. The collateral reserve ends at
+`x0 + liq` under both scenarios, so the debt tokens leaving the pool are identical and the round trip
+contributes nothing. Every non-zero row is the two extra fee crossings, before gas and tip.
+
+Seven assertions cover the sweep (3 pool shapes × 3 liquidation sizes × 3 pre-trade sizes × 4 fee
+tiers = 108 parameterisations): the loss deepens monotonically with both fee tier and pre-trade size,
+so "size it correctly" is not a fix; reversing the leg orientation does not beat baseline either; and
+the profit gate rejects all 108 candidates against a $1.00 threshold even with gas modelled at $0.05.
+
+**If any assertion in that file ever fails, this memo needs revisiting.** That is why it is kept.
+
+Three defects found while closing this item, fixed in the same change:
+
+- `pub struct trancheBundler` (`tranche_arbitrage.rs`) — the mechanical `Sandwich`→`tranche` rename in
+  `3adc7ca` collided with the real `TrancheBundler` and left a lowercase type, which failed
+  `cargo clippy -- -D warnings` **on `main`**. Renamed to `AtomicPacketBundler`. Zero call sites.
+- `AtomicPacketBundler::verify_inclusion` returned `Ok(false)` — indistinguishable from "checked, and
+  it was not included." A caller could book an unverified outcome as a confirmed miss. Now returns an
+  explicit error naming the chain.
+- `FLASHBOTS_RELAY_DEFAULT`'s doc comment still read "Default Flashbots Protect relay for Base
+  mainnet," the claim §2 refutes on every clause. Corrected in place.
+
+`cargo fmt --all --check` was also failing on `main` (drift in `config.rs`, `lib.rs`,
+`mempool_predator.rs`, `tranche_arbitrage.rs`, `tranche_orchestrator.rs` from `3adc7ca`). Fixed.
+Suite: 301 passing, 0 failing (291 before this change).
+
+### 10.1 Two corrections to this memo
+
+Adversarial re-verification refuted two of this document's own claims. Both are recorded here rather
+than silently edited above, because the conclusion survives them and the reasoning should be auditable.
+
+**§2 "the category is empty on Base today" is wrong.** Two venues route `eth_sendBundle` on chain
+8453, confirmed by live probe with controls:
+
+| endpoint | `eth_chainId` | fake-method control | `eth_sendBundle` |
+|---|---|---|---|
+| `base.rpc.blxrbdn.com` (bloXroute) | `0x2105` | `-32601 Method not found` | `-32602` — parses params |
+| `base.merkle.io/rpc` (Merkle) | `0x2105` | `-32600 Unsupported method … on BASE_MAINNET` | `-32600` — semantic validation |
+
+The controls matter: a fake method name is rejected, so the `eth_sendBundle` responses are genuine
+routing rather than a catch-all. The original survey checked only BlockRazor. **This does not change
+the verdict**, for three reasons: Merkle's own error reads `"must include user tx and at least one
+backrun"` — it is a backrun-only auction with no front-run slot, which is precisely the tranche shape
+it refuses; bloXroute's Base atomicity is unverified and questionable given one Coinbase sequencer
+ordering by priority fee in ~200ms Flashblocks; and §2's *other* half stands — `mainnet.base.org`
+returns `-32601` for `eth_subscribe('newPendingTransactions')`, so there is still no public pending-tx
+pool in which to find a third party.
+
+**§4's "can only ever surface transactions we signed ourselves" is imprecise.**
+`TrancheScanner::matches(to, calldata)` takes no `from`. Any third party *can* broadcast to the
+Executor address with selector `0x09c5eabe` and satisfy the filter; the Yul gate makes it revert
+**on-chain**, which does not stop it being matched and decoded. The scanner is not self-limited — it
+is unauthenticated, and would happily score transactions doomed to revert. The conclusion is unchanged
+but the mechanism is different from what §4 states.
+
+### 10.2 The trap this structure sets — the finding that most needed a test
+
+The pre-buy **genuinely does** raise the price the Executor sells into. In a Base-realistic model
+(1200 WETH / 3.6M USDC, 50k USDC `debtToCover`, 5% bonus, 30bps) leg B's swap output rises
+`51,592 → 61,335` USDC as the pre-trade grows `0 → 100` WETH, while bundle P&L *falls*
+`+1,567 → −211` USDC.
+
+So an operator instrumenting the Executor's own profit event (`Executor.yul:204-206`) watches the
+number climb while the account drains. The loss lives entirely in legs A and C, outside the contract
+and outside its telemetry. `executor_telemetry_rises_while_owner_loses` pins this.
+
+Worse, and now covered by `profit_gate_can_be_pushed_through_by_the_wrapper`: because the pre-buy
+inflates `balanceAfter`, it can push a liquidation that would have safely hit `ProfitGateFailed`
+(`Executor.yul:193-202`) *through* the gate. **The `minProfit` gate is not a defence against this
+structure** — wrapping a marginal liquidation makes it look healthier to the gate while making it
+worse for the owner.
+
+### 10.3 Scope note on §3
+
+§3's phrasing — "the profit source does not exist" — is imprecise if read literally. The *bundle*
+does earn the Aave liquidation bonus (+1,567 USDC in the model above); the bonus is oracle-priced via
+Chainlink (`core/src/oracle/aave.rs:29`), so it is an additive constant invariant to the outer legs.
+What is exactly zero gross and strictly negative net is the **incremental contribution of the two
+outer legs**. Nobody should read this memo as "liquidations don't work" — the plain liquidation is the
+profitable thing, and the wrapper is what destroys value.
+
+One genuine loophole exists and is worth naming so it is not rediscovered as a surprise: the proof
+depends on `seized` being oracle-priced. Against a protocol whose liquidation math read AMM spot or a
+short TWAP, the pre-buy *would* change the seized amount and the construction could pay. That is an
+oracle-manipulation attack, not a tranche, and it does not apply to Aave V3 on Base.

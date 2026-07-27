@@ -1,5 +1,5 @@
 requests>=2.31
 web3>=6.0
-PyYAML>=6.0
+PyYAML>=6.0.3
 pytest>=8.0
 rich>=13.0
